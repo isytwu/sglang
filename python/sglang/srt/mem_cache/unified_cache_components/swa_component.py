@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -100,6 +101,10 @@ class SWAComponent(TreeComponent):
             host_lru.remove_node(node)
         self.cache.lru_lists[ct].insert_mru(node)
         self.cache.component_evictable_size_[ct] += len(value)
+        # If this restore happens during an insert (overlap recovery /
+        # recover_after_unevict), the node just gained SWA on device and needs a
+        # fresh REPLACE store snapshot. No-op during load_back (no active insert).
+        self.cache._note_insert_store_node(node)
 
     def _restore_device_value_with_locked_full(
         self,
@@ -437,6 +442,9 @@ class SWAComponent(TreeComponent):
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
+                # FULL survives on this internal node; restate its (now
+                # SWA-less) GPU component set so consumers stop counting SWA.
+                self.cache._restate_component_placement(x, StorageMedium.GPU)
                 x = x_next
 
     def acquire_component_lock(
@@ -575,6 +583,9 @@ class SWAComponent(TreeComponent):
                     self.cache._evict_component_and_detach_lru(
                         cur, self, target=EvictLayer.DEVICE
                     )
+                    # SWA left this device leaf but FULL stays; restate its
+                    # (now SWA-less) GPU component set.
+                    self.cache._restate_component_placement(cur, StorageMedium.GPU)
 
             if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
                 break
@@ -868,4 +879,6 @@ class SWAComponent(TreeComponent):
                     x, self, target=EvictLayer.HOST, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
+                # FULL host survives; restate the reduced host component set.
+                self.cache._restate_component_placement(x, StorageMedium.CPU)
             x = x_next

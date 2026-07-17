@@ -477,6 +477,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         }
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        # Per-insert scratch: nodes to (re)emit a REPLACE store snapshot for
+        # once all components commit. None means no insert is in flight.
+        self._insert_store_nodes: Optional[list[UnifiedTreeNode]] = None
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -1073,6 +1076,113 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     continue
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
+    def _component_types_for_page(
+        self,
+        node: UnifiedTreeNode,
+        medium: StorageMedium,
+        page_index: int,
+        num_pages: int,
+    ) -> Optional[list[str]]:
+        """Report which KV components are actually resident on ``node`` at
+        ``medium`` for the page at ``page_index`` (REPLACE-semantics snapshot).
+
+        - Full-only trees return ``None`` so dense-model consumers keep the
+          legacy (component-less) wire format.
+        - Presence is read straight off the live tree state: device ==
+          ``value is not None``, host == ``host_value is not None``. This makes
+          SWA tombstones (both ``None``) and absent host pools (``host_value``
+          stays ``None``) naturally unreported.
+        - Mamba is a single per-leaf state, so it is anchored to the leaf's last
+          page (the block hash at the match boundary) and reported once.
+        """
+        if len(self.tree_components) <= 1:
+            return None
+
+        is_device = medium == StorageMedium.GPU
+        names: list[str] = []
+        for ct in self.tree_components:
+            cd = node.component_data[ct]
+            present = cd.value is not None if is_device else cd.host_value is not None
+            if not present:
+                continue
+            if ct == ComponentType.MAMBA and page_index != num_pages - 1:
+                continue
+            names.append(str(ct))
+        return names
+
+    def _note_insert_store_node(self, node: UnifiedTreeNode) -> None:
+        """Register a node that gained a component during the current insert so
+        a REPLACE GPU store event is (re)emitted for it once all components are
+        committed. No-op outside an active insert or when events are disabled.
+        """
+        if self._insert_store_nodes is not None:
+            self._insert_store_nodes.append(node)
+
+    def _flush_insert_store_events(
+        self,
+        target_node: UnifiedTreeNode,
+        insert_parent: UnifiedTreeNode,
+        is_new_leaf: bool,
+    ) -> None:
+        """Emit the deferred REPLACE GPU store snapshots for one insert.
+
+        Covers (a) matched nodes that gained a component during the walk/commit
+        (``self._insert_store_nodes``) and (b) the new-suffix chain from the leaf
+        up to ``insert_parent`` (leaf + any SWA-split tombstone parents). Nodes
+        that were merely re-partitioned by a prefix split are intentionally NOT
+        re-emitted -- their per-page component presence is unchanged.
+        """
+        if not self.enable_kv_cache_events:
+            return
+
+        emit_nodes: list[UnifiedTreeNode] = []
+        seen: set[int] = set()
+
+        def _add(n: Optional[UnifiedTreeNode]) -> None:
+            if n is None or n is self.root_node or id(n) in seen:
+                return
+            seen.add(id(n))
+            emit_nodes.append(n)
+
+        # Matched ancestors first (top-down), then the new descendant chain.
+        for n in self._insert_store_nodes or ():
+            _add(n)
+        if is_new_leaf:
+            chain: list[UnifiedTreeNode] = []
+            cur = target_node
+            while cur is not insert_parent and cur is not self.root_node:
+                chain.append(cur)
+                cur = cur.parent
+            for n in reversed(chain):
+                _add(n)
+
+        for n in emit_nodes:
+            self._record_store_event(n, medium=StorageMedium.GPU)
+
+    def _restate_component_placement(
+        self, node: UnifiedTreeNode, medium: StorageMedium
+    ) -> None:
+        """Re-emit a REPLACE store snapshot after an auxiliary component
+        (SWA/Mamba) is tombstoned on ``node`` while its base (FULL) component is
+        still resident at ``medium``.
+
+        This keeps stored/removed symmetric without ever emitting a
+        ``BlockRemoved`` for a partial eviction: the block is still present at
+        the tier (its base component remains), we just restate the now-smaller
+        component set. If FULL is gone the whole block has left the tier and the
+        caller emits a ``BlockRemoved`` instead, so this is a no-op.
+        """
+        if not self.enable_kv_cache_events:
+            return
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        base_present = (
+            cd.value is not None
+            if medium == StorageMedium.GPU
+            else cd.host_value is not None
+        )
+        if base_present:
+            self._record_store_event(node, medium=medium)
+
     def _add_new_node(
         self,
         parent: UnifiedTreeNode,
@@ -1091,7 +1201,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self._record_store_event(new_node)
+        # Defer the GPU store event to the end of _insert_helper: aux components
+        # (SWA / Mamba) are committed AFTER this node is created, so emitting
+        # here would report a FULL-only placement and miss SWA/Mamba.
+        self._note_insert_store_node(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1108,7 +1221,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self._record_store_event(node, medium=StorageMedium.GPU)
+        # Deferred: SWA recover_after_unevict may still add SWA to this node, so
+        # the final component snapshot is emitted at the end of _insert_helper.
+        self._note_insert_store_node(node)
 
     def _insert_helper(
         self,
@@ -1120,6 +1235,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         priority = params.priority
         if priority is None:
             priority = 0
+        # Collect nodes that gain a component during this insert so we can emit
+        # a single REPLACE store snapshot per node AFTER all components commit.
+        # None disables collection (and downstream event work) when events off.
+        prev_store_nodes = self._insert_store_nodes
+        self._insert_store_nodes = [] if self.enable_kv_cache_events else None
+        try:
+            return self._insert_helper_impl(node, key, value, params, priority)
+        finally:
+            self._insert_store_nodes = prev_store_nodes
+
+    def _insert_helper_impl(
+        self,
+        node: UnifiedTreeNode,
+        key: RadixKey,
+        value: torch.Tensor,
+        params: InsertParams,
+        priority: int,
+    ) -> InsertResult:
         self._touch_node(node)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
@@ -1177,6 +1310,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         is_new_leaf = False
+        # ``insert_parent`` is the last pre-existing node on the insert path.
+        # Every node created for the new suffix (the leaf plus any tombstone
+        # parents SWA splits off) lives strictly below it, so walking from the
+        # final leaf up to (but excluding) it enumerates exactly the new nodes.
+        insert_parent = node
         # Create new leaf for remaining suffix. A leaf survives on its Full
         # value alone; auxiliary components (SWA, Mamba) may legitimately hold
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
@@ -1208,6 +1346,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
+
+        self._flush_insert_store_events(target_node, insert_parent, is_new_leaf)
         return result
 
     def _insert_helper_host(
@@ -1656,6 +1796,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
+            # write_backup already committed host_value for the FULL main pool
+            # and every extra (SWA/Mamba) pool, so the CPU snapshot here reports
+            # each component that actually landed on host.
             self._record_store_event(node, medium=StorageMedium.CPU)
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
@@ -1776,14 +1919,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.LOAD_BACK,
             [kv_xfer],
         )
-        for node in kv_xfer.nodes_to_load or ():
-            self._record_store_event(node, medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 best_match_node,
                 CacheTransferPhase.LOAD_BACK,
                 xfers,
             )
+
+        # Emit REPLACE GPU store AFTER every component has restored its device
+        # value, so each node's snapshot reflects FULL plus any SWA/Mamba brought
+        # back in the same load (emitting before the aux commits would report a
+        # FULL-only placement). Union the nodes each component actually loaded.
+        if self.enable_kv_cache_events:
+            restored_nodes: list[UnifiedTreeNode] = []
+            seen_restored: set[int] = set()
+
+            def _collect_restored(nodes) -> None:
+                for n in nodes or ():
+                    if id(n) not in seen_restored:
+                        seen_restored.add(id(n))
+                        restored_nodes.append(n)
+
+            _collect_restored(kv_xfer.nodes_to_load)
+            for xfers in comp_xfers.values():
+                for x in xfers:
+                    _collect_restored(x.nodes_to_load)
+            for node in restored_nodes:
+                self._record_store_event(node, medium=StorageMedium.GPU)
 
         self._update_evictable_leaf_sets(best_match_node)
         self.ongoing_load_back[best_match_node.id] = _OngoingLoadBack(
