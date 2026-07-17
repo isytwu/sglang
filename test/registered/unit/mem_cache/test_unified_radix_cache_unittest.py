@@ -15,6 +15,9 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
+    KV_COMPONENT_FULL,
+    KV_COMPONENT_MAMBA,
+    KV_COMPONENT_SWA,
     BlockRemoved,
     BlockStored,
     StorageMedium,
@@ -632,6 +635,289 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(node.evicted)
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+
+    def test_full_only_store_events_omit_component_types(self):
+        # Full-only trees keep the legacy wire format: component_types stays
+        # None so dense-model consumers see byte-identical events.
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(stored), 2)
+        for event in stored:
+            self.assertIsNone(event.component_types)
+
+        cache.evict(EvictParams(num_tokens=4))
+        removed = self._removed_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(removed), 1)
+        self.assertIsNone(removed[0].component_types)
+
+
+class TestUnifiedRadixCacheComponentPlacementEvents(CustomTestCase):
+    """KV events must express per-component (FULL/SWA/MAMBA) GPU/CPU placement.
+
+    Uses focused snapshot assertions (deterministic, no HiCache plumbing) plus a
+    few fresh-insert integrations.
+    """
+
+    _rid = 0
+
+    def _make_node(self, cache, tokens, *, device=(), host=()):
+        """Synthetic node with the given components present on device / host."""
+        node = UnifiedTreeNode(cache.tree_components)
+        node.parent = cache.root_node
+        node.key = RadixKey(array("q", tokens))
+        dummy = torch.zeros(max(1, len(tokens)), dtype=torch.int64)
+        for ct in device:
+            node.component_data[ct].value = dummy
+        for ct in host:
+            node.component_data[ct].host_value = dummy
+        return node
+
+    def _make_mamba_req(self, req_to_token_pool):
+        sp = SamplingParams(temperature=0, max_new_tokens=1)
+        req = Req(
+            rid=self._rid,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=sp,
+        )
+        self._rid += 1
+        req_to_token_pool.alloc([req])
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        return req
+
+    # ---- Focused snapshot logic (no allocation / HiCache) ----
+
+    def test_full_only_snapshot_returns_none(self):
+        cfg = CacheConfig(page_size=1, components=(ComponentType.FULL,))
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        node = self._make_node(cache, [1, 2], device=(ComponentType.FULL,))
+        self.assertIsNone(
+            cache._component_types_for_page(node, StorageMedium.GPU, 0, 2)
+        )
+
+    def test_snapshot_reports_present_components_and_mamba_last_page(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(
+                ComponentType.FULL,
+                ComponentType.SWA,
+                ComponentType.MAMBA,
+            ),
+            sliding_window_size=128,
+            head_num=8,
+            num_layers=32,
+            full_attention_layer_ids=(7, 15, 23, 31),
+            kv_size=1024,
+            max_context_len=1024,
+        )
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+
+        node = self._make_node(
+            cache,
+            [1, 2, 3],
+            device=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        )
+        # FULL + SWA span every page; MAMBA is a single per-leaf state anchored
+        # to the last page only.
+        self.assertEqual(
+            cache._component_types_for_page(node, StorageMedium.GPU, 0, 3),
+            [KV_COMPONENT_FULL, KV_COMPONENT_SWA],
+        )
+        self.assertEqual(
+            cache._component_types_for_page(node, StorageMedium.GPU, 2, 3),
+            [KV_COMPONENT_FULL, KV_COMPONENT_SWA, KV_COMPONENT_MAMBA],
+        )
+
+    def test_snapshot_swa_tombstone_not_reported(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        # SWA tombstone: value None -> must not appear in the snapshot.
+        node = self._make_node(cache, [1, 2], device=(ComponentType.FULL,))
+        self.assertEqual(
+            cache._component_types_for_page(node, StorageMedium.GPU, 0, 2),
+            [KV_COMPONENT_FULL],
+        )
+
+    def test_snapshot_host_reports_extra_components(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+        )
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        # Host backup landed FULL + MAMBA; SWA host pool absent stays unreported.
+        node = self._make_node(
+            cache, [10, 11], host=(ComponentType.FULL, ComponentType.MAMBA)
+        )
+        self.assertEqual(
+            cache._component_types_for_page(node, StorageMedium.CPU, 0, 2),
+            [KV_COMPONENT_FULL],
+        )
+        self.assertEqual(
+            cache._component_types_for_page(node, StorageMedium.CPU, 1, 2),
+            [KV_COMPONENT_FULL, KV_COMPONENT_MAMBA],
+        )
+
+    def test_record_store_event_emits_host_component_types(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+        )
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        node = self._make_node(
+            cache, [10, 11], host=(ComponentType.FULL, ComponentType.MAMBA)
+        )
+        cache.take_events()
+        cache._record_store_event(node, medium=StorageMedium.CPU)
+        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored), 2)
+        self.assertTrue(all(e.medium == StorageMedium.CPU for e in stored))
+        self.assertEqual(stored[0].component_types, [KV_COMPONENT_FULL])
+        self.assertEqual(
+            stored[1].component_types, [KV_COMPONENT_FULL, KV_COMPONENT_MAMBA]
+        )
+
+    # ---- Fresh-insert integrations ----
+
+    def test_swa_fresh_insert_reports_swa_on_gpu(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, allocator, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        cache.take_events()
+
+        tokens = [1, 2, 3, 4]
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", tokens)), value=value[: len(tokens)])
+        )
+        stored = [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.GPU
+        ]
+        self.assertEqual(len(stored), len(tokens))
+        for event in stored:
+            self.assertIn(KV_COMPONENT_FULL, event.component_types)
+            self.assertIn(KV_COMPONENT_SWA, event.component_types)
+
+    def test_mamba_fresh_insert_reports_mamba_on_leaf_last_page(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+        )
+        cache, allocator, req_to_token_pool = build_fixture(
+            cfg, enable_kv_cache_events=True
+        )
+        cache.take_events()
+
+        tokens = [1, 2, 3]
+        req = self._make_mamba_req(req_to_token_pool)
+        value = allocator.alloc(len(tokens))
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value[: len(tokens)],
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        stored = [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.GPU
+        ]
+        self.assertEqual(len(stored), len(tokens))
+        for event in stored:
+            self.assertIn(KV_COMPONENT_FULL, event.component_types)
+        # Mamba is anchored to the leaf's last page only.
+        self.assertNotIn(KV_COMPONENT_MAMBA, stored[0].component_types)
+        self.assertNotIn(KV_COMPONENT_MAMBA, stored[1].component_types)
+        self.assertIn(KV_COMPONENT_MAMBA, stored[2].component_types)
+
+    # ---- Phase 2: internal aux-component tombstone stays symmetric ----
+
+    def test_restate_device_placement_after_swa_tombstone(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        node = self._make_node(
+            cache, [7, 8], device=(ComponentType.FULL, ComponentType.SWA)
+        )
+        cache.take_events()
+        # SWA tombstoned on an internal node; FULL stays resident on device.
+        node.component_data[ComponentType.SWA].value = None
+        cache._restate_component_placement(node, StorageMedium.GPU)
+        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored), 2)
+        for event in stored:
+            self.assertEqual(event.component_types, [KV_COMPONENT_FULL])
+            self.assertEqual(event.medium, StorageMedium.GPU)
+
+    def test_restate_is_noop_when_base_component_gone(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        # FULL absent -> whole block left the tier; restate must emit nothing
+        # (the caller is responsible for the BlockRemoved instead).
+        node = self._make_node(cache, [7, 8], device=(ComponentType.SWA,))
+        cache.take_events()
+        cache._restate_component_placement(node, StorageMedium.GPU)
+        self.assertEqual(cache.take_events(), [])
+
+    def test_restate_host_placement_after_mamba_tombstone(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+        )
+        cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        node = self._make_node(
+            cache, [7, 8], host=(ComponentType.FULL, ComponentType.MAMBA)
+        )
+        cache.take_events()
+        node.component_data[ComponentType.MAMBA].host_value = None
+        cache._restate_component_placement(node, StorageMedium.CPU)
+        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored), 2)
+        for event in stored:
+            self.assertEqual(event.component_types, [KV_COMPONENT_FULL])
+            self.assertEqual(event.medium, StorageMedium.CPU)
+
+    # ---- Local match safety: all component validators must still gate ----
+
+    def test_swa_validator_rejects_tombstone_boundary(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, _, _ = build_fixture(cfg)
+        swa = cache.components[ComponentType.SWA]
+
+        # A tombstoned node (FULL present, SWA absent) is not a valid SWA match
+        # boundary, so match_prefix cannot falsely reuse a missing component.
+        tombstone = self._make_node(cache, [1], device=(ComponentType.FULL,))
+        self.assertFalse(swa.create_match_validator()(tombstone))
+
+        # A node with SWA covering the window validates.
+        present = self._make_node(
+            cache, [1, 2, 3, 4], device=(ComponentType.FULL, ComponentType.SWA)
+        )
+        self.assertTrue(swa.create_match_validator()(present))
 
 
 class UnifiedRadixCacheSuite:
