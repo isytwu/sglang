@@ -1361,6 +1361,25 @@ class KVEventsSubscriber:
         if isinstance(event, BlockStored):
             hashes = [str(h) for h in event.block_hashes]
             tier = self._medium_to_tier(event.medium)
+            # LIMITATION: the mori/UMBP external-KV API
+            # (IUMBPClient::ReportExternalKvBlocks in
+            # dev/mori/src/pybind/pybind_umbp.cpp) is keyed only by (hashes,
+            # tier) and has no component dimension. SGLang now tags each event
+            # with ``component_types`` (which of FULL/SWA/MAMBA are resident),
+            # but we cannot forward that granularity to the master yet: the
+            # block is reported present at ``tier`` as long as its base/full
+            # component is there. A REPLACE-style restatement that only drops an
+            # auxiliary component (SWA/Mamba) therefore re-reports the same
+            # (hash, tier) as a no-op here. Surface the field for observability /
+            # future component-aware routing once the mori API grows one.
+            if event.component_types is not None:
+                logger.debug(
+                    "BlockStored: %d hashes tier=%s components=%s (component "
+                    "granularity not forwarded to UMBP master)",
+                    len(hashes),
+                    tier,
+                    event.component_types,
+                )
             ok = self._umbp_client.report_external_kv_blocks(hashes, tier)
             if not ok:
                 logger.warning(
@@ -1372,6 +1391,10 @@ class KVEventsSubscriber:
         elif isinstance(event, BlockRemoved):
             hashes = [str(h) for h in event.block_hashes]
             tier = self._medium_to_tier(event.medium)
+            # BlockRemoved is only emitted when the whole block leaves ``tier``
+            # (its base/full component is gone), so a plain tier-level revoke is
+            # correct even without component granularity. See the BlockStored
+            # branch above for the external-API limitation.
             ok = self._umbp_client.revoke_external_kv_blocks(hashes, tier)
             if not ok:
                 logger.warning(

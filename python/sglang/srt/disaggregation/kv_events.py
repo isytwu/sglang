@@ -88,6 +88,20 @@ class StorageMedium(str, enum.Enum):
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
+# Component-placement names carried in ``BlockStored.component_types`` /
+# ``BlockRemoved.component_types``. A single tree node in the unified radix
+# cache can hold several independent KV components (full attention, sliding
+# window, mamba state); these strings let a consumer distinguish which of them
+# is actually resident at a given ``medium``. The values MUST match
+# ``str(ComponentType)`` in
+# ``sglang.srt.mem_cache.unified_cache_components.tree_component`` (kept as
+# plain strings here to avoid importing the mem_cache layer into the event
+# schema and creating an import cycle).
+KV_COMPONENT_FULL = "full"
+KV_COMPONENT_SWA = "swa"
+KV_COMPONENT_MAMBA = "mamba"
+
+
 class OffloadedState:
     """
     OffloadedState represents the state of a KV cache block offloaded to the hicache.
@@ -112,11 +126,25 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    # Full snapshot (REPLACE semantics) of which KV components are resident for
+    # this block at ``medium`` as of this event, e.g. ``["full", "swa"]``.
+    # ``None`` means "unspecified" and MUST be treated by consumers as the whole
+    # block (legacy behaviour) -- dense / full-only caches leave it ``None`` so
+    # their wire format is byte-identical to before this field existed. Appended
+    # last so ``array_like`` + ``omit_defaults`` keeps old decoders compatible.
+    component_types: Optional[list[str]] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    # A ``BlockRemoved`` is only emitted when the whole block leaves ``medium``
+    # (its base/full component is gone), so ``component_types`` is informational
+    # only and normally ``None``. Partial component eviction (base still
+    # resident) is expressed as a ``BlockStored`` restating the reduced
+    # ``component_types`` set, never as a ``BlockRemoved`` -- this keeps legacy
+    # consumers (which ignore ``component_types``) from over-revoking.
+    component_types: Optional[list[str]] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
