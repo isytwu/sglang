@@ -231,8 +231,17 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
-def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
-    """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
+def build_fixture(
+    cfg: CacheConfig,
+    *,
+    enable_kv_cache_events: bool = False,
+    kv_events_component_types: bool = True,
+):
+    """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
+
+    ``kv_events_component_types`` defaults to ``True`` so the component-placement
+    tests exercise the component-aware path; the production default is ``False``.
+    """
     server_args = ServerArgs(
         model_path="dummy",
         page_size=cfg.page_size,
@@ -348,6 +357,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        kv_events_component_types=kv_events_component_types,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
     )
@@ -650,8 +660,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
 
     def test_full_only_store_events_omit_component_types(self):
-        # Full-only trees keep the legacy wire format: component_types stays
-        # None so dense-model consumers see byte-identical events.
+        # Full-only (dense) trees leave component_types None, so component-unaware
+        # consumers treat every block as a whole (legacy whole-block semantics).
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         cache.take_events()
 
@@ -707,6 +717,24 @@ class TestUnifiedRadixCacheComponentPlacementEvents(CustomTestCase):
         cfg = CacheConfig(page_size=1, components=(ComponentType.FULL,))
         cache, _, _ = build_fixture(cfg, enable_kv_cache_events=True)
         node = self._make_node(cache, [1, 2], device=(ComponentType.FULL,))
+        self.assertIsNone(
+            cache._component_types_for_page(node, StorageMedium.GPU, 0, 2)
+        )
+
+    def test_component_types_disabled_returns_none(self):
+        # With the kv_events_component_types switch off, even a multi-component
+        # tree omits the component dimension (the default wire behaviour).
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, _, _ = build_fixture(
+            cfg, enable_kv_cache_events=True, kv_events_component_types=False
+        )
+        node = self._make_node(
+            cache, [1, 2], device=(ComponentType.FULL, ComponentType.SWA)
+        )
         self.assertIsNone(
             cache._component_types_for_page(node, StorageMedium.GPU, 0, 2)
         )

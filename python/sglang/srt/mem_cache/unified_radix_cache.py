@@ -315,6 +315,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_kv_cache_events = params.enable_kv_cache_events
+        self.kv_events_component_types = params.kv_events_component_types
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
@@ -1086,8 +1087,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Report which KV components are actually resident on ``node`` at
         ``medium`` for the page at ``page_index`` (REPLACE-semantics snapshot).
 
-        - Full-only trees return ``None`` so dense-model consumers keep the
-          legacy (component-less) wire format.
+        - Returns ``None`` unless ``kv_events_component_types`` is enabled, so
+          the component dimension stays off the event wire by default.
+        - Full-only trees also return ``None`` (nothing to differentiate).
         - Presence is read straight off the live tree state: device ==
           ``value is not None``, host == ``host_value is not None``. This makes
           SWA tombstones (both ``None``) and absent host pools (``host_value``
@@ -1095,7 +1097,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         - Mamba is a single per-leaf state, so it is anchored to the leaf's last
           page (the block hash at the match boundary) and reported once.
         """
-        if len(self.tree_components) <= 1:
+        if not self.kv_events_component_types or len(self.tree_components) <= 1:
             return None
 
         is_device = medium == StorageMedium.GPU
