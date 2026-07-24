@@ -1520,6 +1520,15 @@ class ServerArgs:
         "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         NS("observability"),
     ] = None
+    enable_kv_events_component_types: A[
+        bool,
+        "Include the per-component (full/swa/mamba) placement snapshot in KV "
+        "events emitted via --kv-events-config. Disabled by default because it "
+        "appends a component_types field to the event wire; only enable it for "
+        "consumers that understand that field, as consumers decoding events "
+        "positionally may otherwise fail.",
+        NS("observability"),
+    ] = False
     enable_forward_pass_metrics: A[
         bool,
         "Enable per-iteration forward pass metrics via ZMQ IPC. External consumers (e.g. Dynamo planner) subscribe to the IPC endpoint exposed in server_args.forward_pass_metrics_ipc_name.",

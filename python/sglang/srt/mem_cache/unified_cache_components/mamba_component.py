@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -177,6 +178,10 @@ class MambaComponent(TreeComponent):
             )
             node.last_access_time = get_and_increase_time_counter()
             self._evict_excess_path_states(node)
+            # Existing (non-new-leaf) node just gained Mamba on device: re-emit
+            # its REPLACE store snapshot (after any excess-path eviction so the
+            # snapshot reflects the components that actually stayed resident).
+            self.cache._note_insert_store_node(node)
             return
         self.cache.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
@@ -289,6 +294,9 @@ class MambaComponent(TreeComponent):
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
+                # FULL survives on this internal node; restate its (now
+                # Mamba-less) GPU component set.
+                self.cache._restate_component_placement(x, StorageMedium.GPU)
                 x = x_next
 
     def acquire_component_lock(
@@ -716,4 +724,6 @@ class MambaComponent(TreeComponent):
                 )
                 self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
                 self.cache._update_evictable_leaf_sets(x)
+                # FULL host survives; restate the reduced host component set.
+                self.cache._restate_component_placement(x, StorageMedium.CPU)
             x = x_next
