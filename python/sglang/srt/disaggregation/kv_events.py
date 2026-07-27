@@ -126,6 +126,8 @@ class BlockStored(KVCacheEvent):
     lora_id: Optional[int]
     medium: Optional[str] = None
     # Components resident at ``medium`` (see KV_COMPONENT_*); ``None`` = whole block.
+    # Relies on ``omit_defaults``: when ``None`` this trailing field is dropped
+    # from the wire, keeping it byte-identical for legacy positional decoders.
     component_types: Optional[list[str]] = None
 
 

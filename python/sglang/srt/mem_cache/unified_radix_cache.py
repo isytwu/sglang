@@ -339,6 +339,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        # Per-component (FULL/SWA/MAMBA) placement events only matter on a
+        # multi-component tree with the feature on; otherwise KV events use the
+        # legacy whole-block path (wire stays byte-identical for e.g. dynamo).
+        self._emit_component_placement = (
+            self.enable_kv_cache_events
+            and self.enable_kv_events_component_types
+            and len(self.tree_components) > 1
+        )
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
@@ -1102,9 +1110,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Report which KV components are actually resident on ``node`` at
         ``medium`` for the page at ``page_index`` (REPLACE-semantics snapshot).
 
-        - Returns ``None`` unless ``enable_kv_events_component_types`` is set, so
-          the component dimension stays off the event wire by default.
-        - Full-only trees also return ``None`` (nothing to differentiate).
+        - Returns ``None`` unless ``_emit_component_placement`` (feature on +
+          multi-component tree), keeping the component dimension off the wire by
+          default and for full-only trees.
         - Presence is read straight off the live tree state: device ==
           ``value is not None``, host == ``host_value is not None``. This makes
           SWA tombstones (both ``None``) and absent host pools (``host_value``
@@ -1112,7 +1120,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         - Mamba is a single per-leaf state, so it is anchored to the leaf's last
           page (the block hash at the match boundary) and reported once.
         """
-        if not self.enable_kv_events_component_types or len(self.tree_components) <= 1:
+        if not self._emit_component_placement:
             return None
 
         is_device = medium == StorageMedium.GPU
@@ -1149,7 +1157,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         that were merely re-partitioned by a prefix split are intentionally NOT
         re-emitted -- their per-page component presence is unchanged.
         """
-        if not self.enable_kv_cache_events:
+        if not self._emit_component_placement:
             return
 
         emit_nodes: list[UnifiedTreeNode] = []
@@ -1188,8 +1196,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         the tier (its base component remains), we just restate the now-smaller
         component set. If FULL is gone the whole block has left the tier and the
         caller emits a ``BlockRemoved`` instead, so this is a no-op.
+
+        Gated off in legacy mode, which never restated on partial eviction.
         """
-        if not self.enable_kv_cache_events:
+        if not self._emit_component_placement:
             return
         cd = node.component_data[BASE_COMPONENT_TYPE]
         base_present = (
@@ -1218,10 +1228,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        # Defer the GPU store event to the end of _insert_helper: aux components
-        # (SWA / Mamba) are committed AFTER this node is created, so emitting
-        # here would report a FULL-only placement and miss SWA/Mamba.
-        self._note_insert_store_node(new_node)
+        # Component-placement mode defers this store to the end of _insert_helper
+        # (aux SWA/Mamba commit after this node, so emitting now would miss them).
+        # Legacy mode keeps the original immediate emit.
+        if self._emit_component_placement:
+            self._note_insert_store_node(new_node)
+        else:
+            self._record_store_event(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1238,9 +1251,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        # Deferred: SWA recover_after_unevict may still add SWA to this node, so
-        # the final component snapshot is emitted at the end of _insert_helper.
-        self._note_insert_store_node(node)
+        # Component-placement mode defers (SWA recover_after_unevict may still add
+        # SWA here); legacy mode emits immediately.
+        if self._emit_component_placement:
+            self._note_insert_store_node(node)
+        else:
+            self._record_store_event(node, medium=StorageMedium.GPU)
 
     def _insert_helper(
         self,
@@ -1254,7 +1270,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             priority = 0
         # Collect nodes that gain a component during this insert so we can emit
         # a single REPLACE store snapshot per node AFTER all components commit
-        # (``[]`` when events on, ``None`` to disable collection when off).
+        # (``[]`` in component-placement mode; ``None`` otherwise, where stores
+        # are emitted immediately instead of deferred).
         #
         # Inserts do not currently nest (the walk is a while loop, no component
         # callback re-enters insert), so ``saved_...`` is always None here and
@@ -1262,7 +1279,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # this back on exit: it must return to None so that _note_insert_store_node
         # calls outside an insert (e.g. load_back's SWA restore) stay no-ops.
         saved_pending_store_event_nodes = self._pending_store_event_nodes
-        self._pending_store_event_nodes = [] if self.enable_kv_cache_events else None
+        self._pending_store_event_nodes = (
+            [] if self._emit_component_placement else None
+        )
         try:
             return self._insert_helper_impl(node, key, value, params, priority)
         finally:
@@ -1949,11 +1968,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 xfers,
             )
 
-        # Emit REPLACE GPU store AFTER every component has restored its device
-        # value, so each node's snapshot reflects FULL plus any SWA/Mamba brought
-        # back in the same load (emitting before the aux commits would report a
-        # FULL-only placement). Union the nodes each component actually loaded.
-        if self.enable_kv_cache_events:
+        # Component-placement mode emits the store after all components restored,
+        # unioning each component's loaded nodes (FULL + any SWA/Mamba brought
+        # back in the same load). Legacy mode keeps the original FULL-only emit.
+        if self._emit_component_placement:
             restored_nodes: list[UnifiedTreeNode] = []
             seen_restored: set[int] = set()
 
@@ -1968,6 +1986,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 for x in xfers:
                     _collect_restored(x.nodes_to_load)
             for node in restored_nodes:
+                self._record_store_event(node, medium=StorageMedium.GPU)
+        elif self.enable_kv_cache_events:
+            for node in kv_xfer.nodes_to_load or ():
                 self._record_store_event(node, medium=StorageMedium.GPU)
 
         self._update_evictable_leaf_sets(best_match_node)

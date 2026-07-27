@@ -964,6 +964,56 @@ class TestUnifiedRadixCacheComponentPlacementEvents(CustomTestCase):
         )
         self.assertTrue(swa.create_match_validator()(present))
 
+    # ---- Legacy mode: flag off must match pre-feature wire behaviour ----
+
+    def test_flag_off_restate_is_noop(self):
+        # With component placement off, partial (SWA) eviction must NOT emit an
+        # extra restate store -- legacy subscribers never saw one.
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, _, _ = build_fixture(
+            cfg, enable_kv_cache_events=True, enable_kv_events_component_types=False
+        )
+        node = self._make_node(
+            cache, [7, 8], device=(ComponentType.FULL, ComponentType.SWA)
+        )
+        cache.take_events()
+        node.component_data[ComponentType.SWA].value = None
+        cache._restate_component_placement(node, StorageMedium.GPU)
+        self.assertEqual(cache.take_events(), [])
+
+    def test_flag_off_fresh_insert_omits_component_types(self):
+        # Fresh insert on a hybrid tree with the flag off still emits one store
+        # per page, but component_types stays None so the wire is unchanged for
+        # component-unaware subscribers.
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        cache, allocator, _ = build_fixture(
+            cfg, enable_kv_cache_events=True, enable_kv_events_component_types=False
+        )
+        cache.take_events()
+
+        tokens = [1, 2, 3, 4]
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", tokens)), value=value[: len(tokens)])
+        )
+        stored = [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.GPU
+        ]
+        self.assertEqual(len(stored), len(tokens))
+        for event in stored:
+            self.assertIsNone(event.component_types)
+
 
 class UnifiedRadixCacheSuite:
 
