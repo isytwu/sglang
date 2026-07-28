@@ -22,7 +22,8 @@ mod test_kv;
 
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvRequest, MatchExternalKvResponse,
+    GetExternalKvHitCountsRequest, HashSpec, MatchExternalKvPrefixRequest,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
 };
 use sgl_kv_indexer::{KvIndexerBackend, RedisKvIndexerBackend};
 use test_id::nanos;
@@ -79,6 +80,33 @@ fn match_req(hs: &[&str], count_as_hit: bool) -> MatchExternalKvRequest {
         hashes: hashes(hs),
         count_as_hit,
     }
+}
+
+/// A single HBM report, the shape most prefix tests need.
+fn report_at(worker: &str, addr: &str, seq: u64, hs: &[&str]) -> ApplyExternalKvBatchRequest {
+    apply_req(
+        worker,
+        addr,
+        seq,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), hs)],
+    )
+}
+
+fn prefix_req(hs: &[&str], spec: Option<HashSpec>) -> MatchExternalKvPrefixRequest {
+    MatchExternalKvPrefixRequest {
+        hashes: hashes(hs),
+        hash_spec: spec,
+        ..Default::default()
+    }
+}
+
+/// `(worker_id, matched_prefix_blocks)` in response order, which the server
+/// guarantees is longest-prefix first.
+fn prefixes(resp: &MatchExternalKvPrefixResponse) -> Vec<(String, u32)> {
+    resp.matches
+        .iter()
+        .map(|m| (m.worker_id.clone(), m.matched_prefix_blocks))
+        .collect()
 }
 
 /// Returns the tiers a worker holds a hash at, per the match response.
@@ -1032,6 +1060,319 @@ async fn deferred_backend_connects_lazily_and_serves() {
         resp.matches.iter().any(|m| m.worker_id == "wd"),
         "reported hashes must be matchable after a lazy connect"
     );
+}
+
+// --- prefix match --------------------------------------------------------
+//
+// The routing query. Where `match_external_kv` answers "who holds these
+// blocks", these answer "how much of this request can each worker serve from
+// cache", which is the question a router actually has.
+
+itest!(prefix_reports_per_worker_contiguous_lengths, b, {
+    // w1 holds the whole chain; w2 only the first block.
+    b.apply_external_kv_batch(report_at("w1", "http://w1:30000", 1, &["1", "2", "3"]))
+        .await
+        .unwrap();
+    b.apply_external_kv_batch(report_at("w2", "http://w2:30000", 1, &["1"]))
+        .await
+        .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1", "2", "3"], None))
+        .await
+        .unwrap();
+    assert_eq!(resp.best_prefix_blocks, 3);
+    assert_eq!(
+        prefixes(&resp),
+        vec![("w1".to_string(), 3), ("w2".to_string(), 1)],
+        "matches must be ordered longest prefix first"
+    );
+    assert_eq!(resp.matches[0].address, "http://w1:30000");
+});
+
+// The property that makes the answer safe to route on: a hole truncates the
+// prefix. Holding a later block is worthless if the blocks before it are gone,
+// because the request cannot skip ahead to it.
+itest!(prefix_stops_at_the_first_gap, b, {
+    b.apply_external_kv_batch(report_at("w1", "http://w1:30000", 1, &["1", "2", "4"]))
+        .await
+        .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1", "2", "3", "4"], None))
+        .await
+        .unwrap();
+    assert_eq!(resp.best_prefix_blocks, 2);
+    assert_eq!(prefixes(&resp), vec![("w1".to_string(), 2)]);
+});
+
+// A cold first block settles the whole query, so a miss costs one read no
+// matter how long the request is.
+itest!(prefix_miss_on_the_first_block_reads_once, b, {
+    let long: Vec<String> = (0..500).map(|i| format!("cold-{i}")).collect();
+    let refs: Vec<&str> = long.iter().map(String::as_str).collect();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&refs, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.best_prefix_blocks, 0);
+    assert!(resp.matches.is_empty());
+    assert_eq!(
+        resp.queried_blocks, 1,
+        "a first-block miss must not read the rest of the request"
+    );
+});
+
+// The scan's cost tracks the prefix that exists, not the request's length.
+itest!(prefix_scan_terminates_early_on_a_short_prefix, b, {
+    let mut query: Vec<String> = vec!["1".to_string(), "2".to_string()];
+    query.extend((0..500).map(|i| format!("absent-{i}")));
+    let refs: Vec<&str> = query.iter().map(String::as_str).collect();
+    b.apply_external_kv_batch(report_at("w1", "http://w1:30000", 1, &["1", "2"]))
+        .await
+        .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&refs, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.best_prefix_blocks, 2);
+    assert!(
+        resp.queried_blocks < 100,
+        "a 2-block prefix in a {}-block request must not read it all; read {}",
+        refs.len(),
+        resp.queried_blocks
+    );
+});
+
+// A worker with no address cannot be routed to, so reporting it would only
+// invite the caller to pick something it cannot use.
+itest!(prefix_omits_workers_without_an_address, b, {
+    b.apply_external_kv_batch(report_at("w-anon", "", 1, &["1", "2"]))
+        .await
+        .unwrap();
+    b.apply_external_kv_batch(report_at("w1", "http://w1:30000", 1, &["1"]))
+        .await
+        .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1", "2"], None))
+        .await
+        .unwrap();
+    assert_eq!(prefixes(&resp), vec![("w1".to_string(), 1)]);
+});
+
+// Reuse does not care which tier a block sits in, so the prefix spans them and
+// the response reports the union it crossed.
+itest!(prefix_spans_tiers_and_reports_their_union, b, {
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "http://w1:30000",
+        1,
+        vec![
+            action(ExternalKvActionType::ActionReport, hbm(), &["1"]),
+            action(ExternalKvActionType::ActionReport, dram(), &["2"]),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1", "2"], None))
+        .await
+        .unwrap();
+    assert_eq!(resp.best_prefix_blocks, 2);
+    assert_eq!(resp.matches[0].tiers, vec![hbm(), dram()]);
+});
+
+// Without the spec check this looks exactly like a cold cache: no matches, no
+// error, nothing to alert on. The count is what tells the two apart.
+itest!(prefix_drops_workers_with_a_mismatched_hash_spec, b, {
+    b.apply_external_kv_batch(test_kv::apply_request_with_spec(
+        "w1",
+        "http://w1:30000",
+        1,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        HashSpec::sglang(64, false),
+    ))
+    .await
+    .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1"], Some(HashSpec::sglang(32, false))))
+        .await
+        .unwrap();
+    assert!(resp.matches.is_empty());
+    assert_eq!(resp.best_prefix_blocks, 0);
+    assert_eq!(resp.spec_mismatched_workers, 1);
+});
+
+itest!(prefix_matches_a_worker_with_an_agreeing_hash_spec, b, {
+    b.apply_external_kv_batch(test_kv::apply_request_with_spec(
+        "w1",
+        "http://w1:30000",
+        1,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        HashSpec::sglang(64, true),
+    ))
+    .await
+    .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1"], Some(HashSpec::sglang(64, true))))
+        .await
+        .unwrap();
+    assert_eq!(prefixes(&resp), vec![("w1".to_string(), 1)]);
+    assert_eq!(resp.spec_mismatched_workers, 0);
+});
+
+// A worker that never declared a spec stays unchecked, so a deployment can
+// adopt spec checking on the query side before every publisher reports one.
+itest!(prefix_leaves_a_specless_worker_unchecked, b, {
+    b.apply_external_kv_batch(report_at("w1", "http://w1:30000", 1, &["1"]))
+        .await
+        .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1"], Some(HashSpec::sglang(64, false))))
+        .await
+        .unwrap();
+    assert_eq!(prefixes(&resp), vec![("w1".to_string(), 1)]);
+    assert_eq!(resp.spec_mismatched_workers, 0);
+});
+
+itest!(prefix_reports_the_worker_dp_rank, b, {
+    b.apply_external_kv_batch(ApplyExternalKvBatchRequest {
+        dp_rank: 3,
+        ..report_at("w1", "http://w1:30000", 1, &["1"])
+    })
+    .await
+    .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1"], None))
+        .await
+        .unwrap();
+    assert_eq!(resp.matches[0].dp_rank, 3);
+    assert_eq!(
+        resp.matches[0].address, "http://w1:30000",
+        "the rank distinguishes streams that share one address, so both travel together"
+    );
+});
+
+// A restarted worker's pre-restart placement must not extend a prefix: the
+// blocks are gone from its cache even though the entries linger.
+itest!(prefix_ignores_stale_generation_placements, b, {
+    b.apply_external_kv_batch(apply_req_inc(
+        "w1",
+        "http://w1:30000",
+        "inc-a",
+        1,
+        vec![action(
+            ExternalKvActionType::ActionReport,
+            hbm(),
+            &["1", "2"],
+        )],
+    ))
+    .await
+    .unwrap();
+    // A new incarnation retires the old generation and re-reports only "1".
+    b.apply_external_kv_batch(apply_req_inc(
+        "w1",
+        "http://w1:30000",
+        "inc-b",
+        1,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+    ))
+    .await
+    .unwrap();
+
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["1", "2"], None))
+        .await
+        .unwrap();
+    assert_eq!(prefixes(&resp), vec![("w1".to_string(), 1)]);
+});
+
+// Hit counts drive cache analytics, so they must describe reuse. Only the
+// prefix a caller could actually serve counts; a block stranded behind a gap
+// does not.
+itest!(prefix_counts_hits_only_for_the_reusable_prefix, b, {
+    b.apply_external_kv_batch(report_at("w1", "http://w1:30000", 1, &["1", "2", "4"]))
+        .await
+        .unwrap();
+
+    let request = MatchExternalKvPrefixRequest {
+        count_as_hit: true,
+        ..prefix_req(&["1", "2", "3", "4"], None)
+    };
+    let resp = b.match_external_kv_prefix(request).await.unwrap();
+    assert_eq!(resp.best_prefix_blocks, 2);
+
+    let counts = b
+        .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
+            hashes: hashes(&["1", "2", "4"]),
+        })
+        .await
+        .unwrap();
+    let by_hash: Vec<(String, u64)> = counts
+        .entries
+        .into_iter()
+        .map(|e| (e.hash, e.hit_count_total))
+        .collect();
+    assert!(by_hash.contains(&("1".to_string(), 1)));
+    assert!(by_hash.contains(&("2".to_string(), 1)));
+    assert!(
+        !by_hash.iter().any(|(hash, _)| hash == "4"),
+        "block 4 sits behind a gap and was never reusable, so it must not count as a hit: {by_hash:?}"
+    );
+});
+
+itest!(prefix_top_k_keeps_the_longest_matches, b, {
+    for worker in ["w1", "w2", "w3"] {
+        b.apply_external_kv_batch(report_at(
+            worker,
+            &format!("http://{worker}:30000"),
+            1,
+            &["1"],
+        ))
+        .await
+        .unwrap();
+    }
+    b.apply_external_kv_batch(report_at("w1", "http://w1:30000", 2, &["2"]))
+        .await
+        .unwrap();
+
+    let request = MatchExternalKvPrefixRequest {
+        top_k: 1,
+        ..prefix_req(&["1", "2"], None)
+    };
+    let resp = b.match_external_kv_prefix(request).await.unwrap();
+    assert_eq!(prefixes(&resp), vec![("w1".to_string(), 2)]);
+    assert_eq!(
+        resp.best_prefix_blocks, 2,
+        "best_prefix_blocks describes the whole result, not the truncated page"
+    );
+});
+
+/// The service layer rejects an empty query, but the backend trait is public
+/// and its default implementation answers one. Pointing this at an unreachable
+/// Redis proves the override agrees without touching the store — if it indexed
+/// into the empty slice it would panic, and if it queried it would error.
+#[tokio::test]
+async fn prefix_match_on_an_empty_query_answers_without_touching_redis() {
+    let b = RedisKvIndexerBackend::connect_single_deferred(
+        "redis://127.0.0.1:6399",
+        "itest:prefix_empty",
+    );
+    let resp = b
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest::default())
+        .await
+        .expect("an empty query is answerable, not an error");
+    assert!(resp.matches.is_empty());
+    assert_eq!(resp.best_prefix_blocks, 0);
+    assert_eq!(resp.queried_blocks, 0);
 }
 
 /// A deferred backend pointed at an unreachable Redis must fail requests with an

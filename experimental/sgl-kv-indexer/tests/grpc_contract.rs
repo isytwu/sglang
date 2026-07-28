@@ -28,7 +28,8 @@ use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvRequest,
+    GetExternalKvHitCountsRequest, HashAlgorithm, HashSpec, MatchExternalKvPrefixRequest,
+    MatchExternalKvRequest,
 };
 use sgl_kv_indexer::{KvIndexerService, RedisKvIndexerBackend};
 use test_id::nanos;
@@ -454,13 +455,12 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
     let bad = ApplyExternalKvBatchRequest {
         worker_id: "w".into(),
         seq: 1,
-        worker_address: String::new(),
         actions: vec![ExternalKvAction {
             r#type: 999,
             tier: hbm(),
             hashes: vec!["h".into()],
         }],
-        incarnation: String::new(),
+        ..Default::default()
     };
     let err = c
         .apply_external_kv_batch(bad)
@@ -489,4 +489,151 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         Code::InvalidArgument,
         "bad tier -> InvalidArgument"
     );
+
+    // A spec that names an algorithm but no block size would disable checking
+    // while looking configured, which is the failure the spec exists to catch.
+    let err = c
+        .apply_external_kv_batch(ApplyExternalKvBatchRequest {
+            hash_spec: Some(HashSpec {
+                block_size: 0,
+                algo: HashAlgorithm::HashAlgoSha256ChainUnigram as i32,
+                ..Default::default()
+            }),
+            ..apply_report("w", "addr", 1, hbm(), &["h"])
+        })
+        .await
+        .expect_err("half-specified hash spec rejected");
+    assert_eq!(
+        err.code(),
+        Code::InvalidArgument,
+        "block_size 0 with a declared algorithm -> InvalidArgument"
+    );
+}
+
+fn prefix_req(hashes: &[&str]) -> MatchExternalKvPrefixRequest {
+    MatchExternalKvPrefixRequest {
+        hashes: hashes.iter().map(|h| (*h).to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn prefix_match_over_grpc_reports_reusable_lengths() {
+    let Some(mut c) = start("prefix_match").await else {
+        return;
+    };
+    let id = nanos();
+    let (h0, h1) = (format!("{id}-0"), format!("{id}-1"));
+    c.apply_external_kv_batch(apply_report("w1", "http://w1:30000", 1, hbm(), &[&h0, &h1]))
+        .await
+        .expect("apply w1");
+    c.apply_external_kv_batch(apply_report("w2", "http://w2:30000", 1, hbm(), &[&h0]))
+        .await
+        .expect("apply w2");
+
+    let resp = c
+        .match_external_kv_prefix(prefix_req(&[&h0, &h1]))
+        .await
+        .expect("prefix match")
+        .into_inner();
+    assert_eq!(resp.best_prefix_blocks, 2);
+    assert_eq!(
+        resp.matches
+            .iter()
+            .map(|m| (m.address.as_str(), m.matched_prefix_blocks))
+            .collect::<Vec<_>>(),
+        vec![("http://w1:30000", 2), ("http://w2:30000", 1)]
+    );
+}
+
+/// `max_blocks` is the caller's cost bound, applied before the backend sees the
+/// request so `queried_blocks` is measured against the same input everywhere.
+#[tokio::test]
+async fn prefix_match_honors_max_blocks_over_grpc() {
+    let Some(mut c) = start("prefix_max_blocks").await else {
+        return;
+    };
+    let id = nanos();
+    let hs: Vec<String> = (0..4).map(|i| format!("{id}-{i}")).collect();
+    let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
+    c.apply_external_kv_batch(apply_report("w1", "http://w1:30000", 1, hbm(), &refs))
+        .await
+        .expect("apply w1");
+
+    let resp = c
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            max_blocks: 2,
+            ..prefix_req(&refs)
+        })
+        .await
+        .expect("prefix match")
+        .into_inner();
+    assert_eq!(
+        resp.best_prefix_blocks, 2,
+        "the answer is capped at the blocks the caller asked about"
+    );
+    assert!(resp.queried_blocks <= 2);
+}
+
+/// Two encodings of the same 64-bit block must land on the same entry.
+/// SGLang only ever emits the signed form, but a publisher that emits the
+/// unsigned equivalent must not create a second, invisible placement.
+#[tokio::test]
+async fn hashes_are_normalized_to_the_signed_form_over_grpc() {
+    let Some(mut c) = start("hash_normalization").await else {
+        return;
+    };
+    // Same 64 bits, written both ways.
+    let signed = "-1";
+    let unsigned = "18446744073709551615";
+    c.apply_external_kv_batch(apply_report("w1", "http://w1:30000", 1, hbm(), &[unsigned]))
+        .await
+        .expect("apply unsigned");
+
+    let resp = c
+        .match_external_kv_prefix(prefix_req(&[signed]))
+        .await
+        .expect("prefix match")
+        .into_inner();
+    assert_eq!(
+        resp.best_prefix_blocks, 1,
+        "a block reported as u64 must be findable by its i64 form"
+    );
+
+    // Counters are keyed by the stored form too, so a caller must be able to
+    // read them back under either encoding.
+    c.match_external_kv(MatchExternalKvRequest {
+        hashes: vec![unsigned.to_string()],
+        count_as_hit: true,
+    })
+    .await
+    .expect("match ok");
+    let counts = c
+        .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
+            hashes: vec![signed.to_string()],
+        })
+        .await
+        .expect("hit counts")
+        .into_inner();
+    assert_eq!(
+        counts
+            .entries
+            .iter()
+            .map(|e| (e.hash.as_str(), e.hit_count_total))
+            .collect::<Vec<_>>(),
+        vec![(signed, 1)],
+        "a hit counted under the unsigned encoding must be readable by the signed one"
+    );
+}
+
+#[tokio::test]
+async fn prefix_match_rejects_an_empty_query_over_grpc() {
+    let Some(mut c) = start("prefix_validation").await else {
+        return;
+    };
+    let err = c
+        .match_external_kv_prefix(prefix_req(&[]))
+        .await
+        .expect_err("empty hashes must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument);
 }
