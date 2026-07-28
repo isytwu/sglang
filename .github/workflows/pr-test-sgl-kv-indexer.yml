@@ -82,6 +82,22 @@ jobs:
       - name: Run tests without optional features
         run: cargo test
 
+      # The slice a routing client depends on: generated types and the gRPC
+      # client, with no ZMQ, msgpack, or Redis. Nothing else builds this
+      # combination, so without it the client could acquire a dependency on the
+      # event follower and no job would notice.
+      - name: Run Clippy with the client-only feature set
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Assert the client-only build pulls in no follower or store deps
+        run: |
+          leaked=$(cargo tree --no-default-features -e normal | grep -cE 'zeromq|rmpv|^\s*\|?-* ?redis ' || true)
+          if [ "$leaked" -ne 0 ]; then
+            cargo tree --no-default-features -e normal | grep -E 'zeromq|rmpv|redis '
+            echo "::error::client-only build must not depend on the event follower or the store"
+            exit 1
+          fi
+
   test:
     name: fmt, clippy, and Redis tests
     runs-on: ubuntu-latest

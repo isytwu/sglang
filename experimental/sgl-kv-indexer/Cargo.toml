@@ -15,7 +15,11 @@ name = "sgl_kv_indexer"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["bridge"]
+# The SGLang event follower. On by default so the standard build still produces
+# both binaries; a routing client turns it off to depend on the gRPC client and
+# generated types without ZMQ and msgpack.
+bridge = ["dep:rmpv", "dep:zeromq"]
 # Enables the Redis storage backend. Kept off by default so the standard build
 # does not pull the redis client and its transitive deps.
 redis-backend = ["dep:redis", "dep:futures"]
@@ -27,6 +31,7 @@ path = "src/bin/kv-indexer-server.rs"
 [[bin]]
 name = "kv-indexer-bridge"
 path = "src/bin/kv-indexer-bridge.rs"
+required-features = ["bridge"]
 
 [dependencies]
 bytes = "1"
@@ -37,14 +42,14 @@ redis = { version = "0.27", optional = true, features = [
     "cluster-async",
     "connection-manager",
 ] }
-rmpv = "1.3.1"
+rmpv = { version = "1.3.1", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-health = "0.14"
 tonic-prost = "0.14.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-zeromq = "0.6.0"
+zeromq = { version = "0.6.0", optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

@@ -18,6 +18,7 @@
 //!
 //! No Redis required: the capturing backend implements `KvIndexerBackend`
 //! directly, so this runs in the default `cargo test`.
+#![cfg(feature = "bridge")]
 
 #[path = "common/net.rs"]
 mod test_net;
