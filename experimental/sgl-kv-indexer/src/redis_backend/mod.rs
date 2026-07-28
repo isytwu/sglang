@@ -32,7 +32,7 @@ mod conn;
 mod schema;
 mod scripts;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -42,10 +42,11 @@ use tonic::Status;
 
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
-    ExternalKvNodeMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
-    HitCountEntry, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
+    ExternalKvNodeMatch, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
+    GetExternalKvHitCountsResponse, HashSpec, HitCountEntry, MatchExternalKvPrefixRequest,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
 };
-use crate::service::KvIndexerBackend;
+use crate::service::{prefix_response, KvIndexerBackend};
 
 use conn::{ClusterConn, RedisConn, SingleConn};
 use schema::{
@@ -68,6 +69,29 @@ const REDIS_FANOUT_CHUNK: usize = 256;
 /// `COUNT` hint for reverse-index `SSCAN` iteration. Sized to match the fanout
 /// chunk so one scanned page turns into one round of concurrent cleanup.
 const REVERSE_SCAN_PAGE: usize = 256;
+/// First look-ahead window of the prefix scan, doubling up to
+/// [`REDIS_FANOUT_CHUNK`] as the prefix proves itself.
+///
+/// The window trades over-reading against round trips. Reading the whole
+/// request at once wastes work on the common case of a short shared prefix;
+/// reading one block at a time turns a long prefix into hundreds of sequential
+/// round trips. Doubling from a small window keeps the over-read below one
+/// window for short prefixes and the round trips logarithmic for long ones.
+const PREFIX_SCAN_CHUNK: usize = 32;
+/// How far a prefix scan will read before answering with what it has.
+///
+/// A routing query runs on a millisecond budget and only needs enough of the
+/// prefix to rank workers; resolving a 16k-block prefix exactly would cost
+/// dozens of serial Redis rounds to sharpen a decision that was already made.
+/// At SGLang's usual page sizes this covers a context far larger than any real
+/// request, and `queried_blocks` reports when the cap was reached.
+const PREFIX_SCAN_MAX_BLOCKS: usize = 2_048;
+/// How many leading blocks a hit-counted prefix query credits.
+///
+/// Hit counts are popularity telemetry, and the head of a prefix is what
+/// carries the signal. Crediting every block of a long match would turn the
+/// cheapest read in the system into its largest write.
+const PREFIX_HIT_MAX_BLOCKS: usize = 256;
 
 /// Resolved connection target parsed from the environment.
 enum Target {
@@ -78,6 +102,33 @@ enum Target {
 struct WorkerTouch {
     reset_needed: bool,
     generation: i64,
+}
+
+/// One worker's entry in a block hash's placement hash.
+struct PlacementOwner {
+    worker: String,
+    generation: i64,
+    mask: i64,
+}
+
+/// A worker's durable registry entry, as read for a match.
+struct WorkerView {
+    address: String,
+    alive: bool,
+    generation: i64,
+    /// Encoded hash spec, empty when the worker never reported one.
+    spec: String,
+    dp_rank: u32,
+}
+
+/// A worker still being extended (or already stalled) by the prefix scan.
+struct PrefixCandidate {
+    worker: String,
+    address: String,
+    dp_rank: u32,
+    generation: i64,
+    tiers: BTreeSet<i32>,
+    matched: usize,
 }
 
 struct ReverseMember {
@@ -253,9 +304,7 @@ impl RedisKvIndexerBackend {
 
         // Every accepted apply proves liveness and checks whether its incarnation
         // owes a new or previously interrupted reset.
-        let touch = self
-            .touch_meta(&meta_key, &req.worker_address, &req.incarnation)
-            .await?;
+        let touch = self.touch_meta(&meta_key, &req).await?;
         if touch.reset_needed {
             // Reset is idempotent; reset_pending clears only after full success.
             self.reset_worker(worker, &meta_key, touch.generation)
@@ -342,22 +391,31 @@ impl RedisKvIndexerBackend {
         })
     }
 
-    /// Refreshes liveness and records address/incarnation. The returned generation
-    /// fences mutations; `reset_needed` also survives interrupted resets.
+    /// Refreshes liveness and records address, incarnation, hash spec and DP
+    /// rank. The returned generation fences mutations; `reset_needed` also
+    /// survives interrupted resets.
     async fn touch_meta(
         &self,
         meta_key: &str,
-        addr: &str,
-        incarnation: &str,
+        req: &ApplyExternalKvBatchRequest,
     ) -> Result<WorkerTouch, Status> {
         let ttl_ms = self.worker_ttl.map(|d| d.as_millis() as u64).unwrap_or(0);
         // Empty incarnation is retained for wire compatibility but participates
         // in fencing as one stable legacy token.
-        let incarnation = if incarnation.is_empty() {
+        let incarnation = if req.incarnation.is_empty() {
             "__legacy__"
         } else {
-            incarnation
+            req.incarnation.as_str()
         };
+        // An unset spec leaves the stored one alone rather than clearing it, so
+        // a heartbeat from a publisher that does not report one cannot silently
+        // disable spec checking for a worker that does.
+        let spec = req
+            .hash_spec
+            .as_ref()
+            .filter(|spec| spec.block_size > 0)
+            .map(encode_hash_spec)
+            .unwrap_or_default();
         let v = self
             .conn
             .invoke(
@@ -366,8 +424,10 @@ impl RedisKvIndexerBackend {
                 vec![
                     now_ms().to_string(),
                     ttl_ms.to_string(),
-                    addr.to_string(),
+                    req.worker_address.clone(),
                     incarnation.to_string(),
+                    spec,
+                    req.dp_rank.to_string(),
                 ],
             )
             .await
@@ -593,6 +653,278 @@ impl RedisKvIndexerBackend {
 
     // --- read path ----------------------------------------------------------
 
+    /// Reads one block hash's placement hash. Legacy values that carry only a
+    /// bitmask are interpreted as generation zero.
+    async fn read_placement(&self, hash: &str) -> Result<Vec<PlacementOwner>, Status> {
+        let value = self
+            .conn
+            .invoke(&MATCH_HASH, vec![placement_key(&self.ns, hash)], Vec::new())
+            .await
+            .map_err(to_status)?;
+        let flat = Vec::<String>::from_redis_value(&value).map_err(to_status)?;
+        Ok(flat
+            .chunks(2)
+            .filter(|pair| pair.len() == 2)
+            .map(|pair| {
+                let (generation, mask) = parse_placement_value(&pair[1]);
+                PlacementOwner {
+                    worker: pair[0].clone(),
+                    generation,
+                    mask,
+                }
+            })
+            .collect())
+    }
+
+    /// [`Self::read_placement`] over a slice, concurrent within a bounded chunk
+    /// so one request cannot create unbounded in-flight work against Redis.
+    async fn read_placements(&self, hashes: &[String]) -> Result<Vec<Vec<PlacementOwner>>, Status> {
+        let mut out = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
+            out.extend(try_join_all(chunk.iter().map(|hash| self.read_placement(hash))).await?);
+        }
+        Ok(out)
+    }
+
+    /// Reads the durable registry entry for each worker, in the order given.
+    async fn read_worker_views(&self, workers: &[String]) -> Result<Vec<WorkerView>, Status> {
+        let ttl_flag = if self.worker_ttl.is_some() { "1" } else { "0" };
+        let now_ms = now_ms().to_string();
+        let mut views = Vec::with_capacity(workers.len());
+        for chunk in workers.chunks(REDIS_FANOUT_CHUNK) {
+            let values = try_join_all(chunk.iter().map(|worker| {
+                let now_ms = now_ms.clone();
+                async move {
+                    let v = self
+                        .conn
+                        .invoke(
+                            &WORKER_VIEW,
+                            vec![worker_meta_key(&self.ns, worker)],
+                            vec![now_ms, ttl_flag.to_string()],
+                        )
+                        .await?;
+                    let (address, alive, generation, spec, dp_rank): (
+                        String,
+                        i64,
+                        i64,
+                        String,
+                        u32,
+                    ) = <(String, i64, i64, String, u32)>::from_redis_value(&v)?;
+                    Ok::<_, redis::RedisError>(WorkerView {
+                        address,
+                        alive: alive == 1,
+                        generation,
+                        spec,
+                        dp_rank,
+                    })
+                }
+            }))
+            .await
+            .map_err(to_status)?;
+            views.extend(values);
+        }
+        Ok(views)
+    }
+
+    /// Prefix-aware routing query.
+    ///
+    /// Three phases, arranged so the cost tracks the prefix that actually
+    /// exists rather than the length of the request:
+    ///
+    /// 1. Read the first block. Only workers holding it can hold any prefix, so
+    ///    a miss here answers the whole query in one round trip.
+    /// 2. Read the registry once, for exactly those workers. The candidate set
+    ///    only ever shrinks from here, so no later block needs a registry read.
+    /// 3. Walk forward in growing chunks. A candidate drops out at its first
+    ///    gap, and the scan stops as soon as none are left.
+    ///
+    /// The number of block hashes read is therefore bounded by roughly twice
+    /// the real prefix length plus one chunk, independent of how many blocks
+    /// the caller asked about, and never exceeds
+    /// [`PREFIX_SCAN_MAX_BLOCKS`].
+    ///
+    /// The registry read in step 2 is a snapshot. A worker that restarts
+    /// *during* the scan can still contribute placement its new incarnation has
+    /// not yet erased, so its prefix may be reported longer than it can serve.
+    /// The reverse cannot happen: the snapshot's generation rejects the new
+    /// incarnation's entries, which can only shorten a prefix. Re-reading the
+    /// registry per block would remove the window at the cost of the property
+    /// that makes this query cheap, and the index is advisory — a stale
+    /// candidate costs one cache miss, which the worker then recomputes.
+    async fn do_match_prefix(
+        &self,
+        req: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        // The service layer rejects an empty query, but the trait is public and
+        // its default implementation answers one, so this must too rather than
+        // indexing into nothing.
+        let Some(first) = req.hashes.first() else {
+            return Ok(prefix_response(Vec::new(), req.top_k, 0, 0));
+        };
+        let hashes = &req.hashes;
+        let required_spec = req
+            .hash_spec
+            .as_ref()
+            .filter(|spec| spec.block_size > 0)
+            .map(encode_hash_spec);
+
+        let first_owners = self.read_placement(first).await?;
+        if first_owners.is_empty() {
+            return Ok(prefix_response(Vec::new(), req.top_k, 1, 0));
+        }
+
+        let worker_ids: Vec<String> = first_owners
+            .iter()
+            .map(|owner| owner.worker.clone())
+            .collect();
+        let views = self.read_worker_views(&worker_ids).await?;
+
+        let mut spec_mismatched_workers = 0u32;
+        let mut extending: Vec<PrefixCandidate> = Vec::with_capacity(first_owners.len());
+        for (owner, view) in first_owners.into_iter().zip(views) {
+            // An empty address is unroutable, so the worker is invisible to a
+            // router no matter how much of the prefix it holds.
+            if !view.alive || view.address.is_empty() || owner.generation != view.generation {
+                continue;
+            }
+            // A worker that never reported a spec is unchecked rather than
+            // rejected. Publishers and routers upgrade independently, and
+            // dropping every silent worker the moment a router starts sending
+            // specs would take out routing for the length of the rollout.
+            if let Some(required) = &required_spec {
+                if !view.spec.is_empty() && &view.spec != required {
+                    spec_mismatched_workers += 1;
+                    continue;
+                }
+            }
+            extending.push(PrefixCandidate {
+                worker: owner.worker,
+                address: view.address,
+                dp_rank: view.dp_rank,
+                generation: view.generation,
+                tiers: tiers_from_mask(owner.mask).into_iter().collect(),
+                matched: 1,
+            });
+        }
+        if extending.is_empty() {
+            return Ok(prefix_response(
+                Vec::new(),
+                req.top_k,
+                1,
+                spec_mismatched_workers,
+            ));
+        }
+
+        let scan_limit = hashes.len().min(PREFIX_SCAN_MAX_BLOCKS);
+        let mut stalled: Vec<PrefixCandidate> = Vec::new();
+        let mut queried = 1usize;
+        let mut chunk = PREFIX_SCAN_CHUNK;
+        while queried < scan_limit && !extending.is_empty() {
+            let end = (queried + chunk).min(scan_limit);
+            let rows = self.read_placements(&hashes[queried..end]).await?;
+            // Count the whole chunk: it was read, even if the prefix broke part
+            // way through it. Reporting less would hide the scan's real cost.
+            queried = end;
+            for owners in rows {
+                let owned: HashMap<&str, &PlacementOwner> = owners
+                    .iter()
+                    .map(|owner| (owner.worker.as_str(), owner))
+                    .collect();
+                let mut still = Vec::with_capacity(extending.len());
+                for mut candidate in extending.drain(..) {
+                    match owned.get(candidate.worker.as_str()) {
+                        Some(owner) if owner.generation == candidate.generation => {
+                            candidate.tiers.extend(tiers_from_mask(owner.mask));
+                            candidate.matched += 1;
+                            still.push(candidate);
+                        }
+                        _ => stalled.push(candidate),
+                    }
+                }
+                extending = still;
+                if extending.is_empty() {
+                    break;
+                }
+            }
+            chunk = chunk.saturating_mul(2).min(REDIS_FANOUT_CHUNK);
+        }
+        stalled.append(&mut extending);
+
+        if req.count_as_hit {
+            // The answer is already computed, and this is telemetry. Failing
+            // the query here would turn a counter write into a routing outage:
+            // the caller reads that as an unreachable index and, after a few
+            // such queries, trips its breaker and stops asking at all.
+            if let Err(error) = self.bump_prefix_hits(hashes, &stalled).await {
+                tracing::warn!(%error, "prefix hit counting failed; returning the match anyway");
+            }
+        }
+
+        let matches = stalled
+            .into_iter()
+            .map(|candidate| ExternalKvPrefixMatch {
+                worker_id: candidate.worker,
+                address: candidate.address,
+                dp_rank: candidate.dp_rank,
+                matched_prefix_blocks: candidate.matched as u32,
+                tiers: candidate.tiers.into_iter().collect(),
+            })
+            .collect();
+        Ok(prefix_response(
+            matches,
+            req.top_k,
+            queried as u32,
+            spec_mismatched_workers,
+        ))
+    }
+
+    /// Credits a hit to every block a returned worker can actually reuse.
+    ///
+    /// Unlike [`Self::do_match`], which counts any matched hash, this counts
+    /// only the contiguous prefix the caller can serve from that worker — the
+    /// blocks a routing decision based on this response would really reuse —
+    /// and only the first [`PREFIX_HIT_MAX_BLOCKS`] of it.
+    async fn bump_prefix_hits(
+        &self,
+        hashes: &[String],
+        candidates: &[PrefixCandidate],
+    ) -> Result<(), Status> {
+        let now = now_ms().to_string();
+        let best = candidates
+            .iter()
+            .map(|candidate| candidate.matched)
+            .max()
+            .unwrap_or(0)
+            .min(PREFIX_HIT_MAX_BLOCKS);
+        let bumps: Vec<(&String, Vec<&PrefixCandidate>)> = (0..best)
+            .map(|index| {
+                let owners = candidates
+                    .iter()
+                    .filter(|candidate| candidate.matched > index)
+                    .collect();
+                (&hashes[index], owners)
+            })
+            .collect();
+        for chunk in bumps.chunks(REDIS_FANOUT_CHUNK) {
+            try_join_all(chunk.iter().map(|(hash, owners)| {
+                let mut args = Vec::with_capacity(1 + owners.len() * 2);
+                args.push(now.clone());
+                for owner in owners {
+                    args.push(owner.worker.clone());
+                    args.push(owner.generation.to_string());
+                }
+                self.conn.invoke(
+                    &HIT_BUMP,
+                    vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
+                    args,
+                )
+            }))
+            .await
+            .map_err(to_status)?;
+        }
+        Ok(())
+    }
+
     async fn do_match(
         &self,
         req: MatchExternalKvRequest,
@@ -601,77 +933,36 @@ impl RedisKvIndexerBackend {
 
         // Per-hash placement read, preserving hash order. Hit counting happens
         // after worker liveness and generation have been validated.
-        let mut per_hash = Vec::with_capacity(hashes.len());
-        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
-            let values = try_join_all(chunk.iter().map(|hash| async move {
-                let v = self
-                    .conn
-                    .invoke(&MATCH_HASH, vec![placement_key(&self.ns, hash)], Vec::new())
-                    .await?;
-                let flat: Vec<String> = Vec::<String>::from_redis_value(&v)?;
-                Ok::<_, redis::RedisError>(flat)
-            }))
-            .await
-            .map_err(to_status)?;
-            per_hash.extend(values);
-        }
+        let per_hash = self.read_placements(&hashes).await?;
 
         // Keep the placement generation alongside each candidate. Legacy
         // numeric values are generation zero.
         let mut worker_order: Vec<String> = Vec::new();
         let mut by_worker: HashMap<String, Vec<(String, i64, i64)>> = HashMap::new();
-        for (hash, flat) in hashes.iter().zip(per_hash) {
-            for pair in flat.chunks(2) {
-                if pair.len() != 2 {
-                    continue;
-                }
-                let worker = &pair[0];
-                let (generation, mask) = parse_placement_value(&pair[1]);
-                let entry = by_worker.entry(worker.clone()).or_insert_with(|| {
-                    worker_order.push(worker.clone());
+        for (hash, owners) in hashes.iter().zip(per_hash) {
+            for owner in owners {
+                let entry = by_worker.entry(owner.worker.clone()).or_insert_with(|| {
+                    worker_order.push(owner.worker.clone());
                     Vec::new()
                 });
-                entry.push((hash.clone(), generation, mask));
+                entry.push((hash.clone(), owner.generation, owner.mask));
             }
         }
 
         // Fetch each matched worker's `addr` (for routing) and liveness. The
         // durable meta hash stores `live_until_ms`; stale workers are dropped so
         // `match` never routes to a dead node while placement entries linger.
-        let ttl_flag = if self.worker_ttl.is_some() { "1" } else { "0" };
-        let view_now_ms = now_ms().to_string();
-        let mut metas = Vec::with_capacity(worker_order.len());
-        for chunk in worker_order.chunks(REDIS_FANOUT_CHUNK) {
-            let values = try_join_all(chunk.iter().map(|worker| {
-                let view_now_ms = view_now_ms.clone();
-                async move {
-                    let v = self
-                        .conn
-                        .invoke(
-                            &WORKER_VIEW,
-                            vec![worker_meta_key(&self.ns, worker)],
-                            vec![view_now_ms, ttl_flag.to_string()],
-                        )
-                        .await?;
-                    let (addr, alive, generation): (String, i64, i64) =
-                        <(String, i64, i64)>::from_redis_value(&v)?;
-                    Ok::<_, redis::RedisError>((addr, alive == 1, generation))
-                }
-            }))
-            .await
-            .map_err(to_status)?;
-            metas.extend(values);
-        }
+        let metas = self.read_worker_views(&worker_order).await?;
 
         let mut matches = Vec::new();
         let mut matched_hashes: HashMap<String, Vec<(String, i64)>> = HashMap::new();
-        for (worker, (address, alive, current_generation)) in worker_order.into_iter().zip(metas) {
-            if !alive {
+        for (worker, view) in worker_order.into_iter().zip(metas) {
+            if !view.alive {
                 continue;
             }
             let mut by_tier: BTreeMap<i32, Vec<String>> = BTreeMap::new();
             for (hash, generation, mask) in by_worker.remove(&worker).unwrap_or_default() {
-                if generation != current_generation {
+                if generation != view.generation {
                     continue;
                 }
                 for tier in tiers_from_mask(mask) {
@@ -680,18 +971,19 @@ impl RedisKvIndexerBackend {
                 matched_hashes
                     .entry(hash)
                     .or_default()
-                    .push((worker.clone(), current_generation));
+                    .push((worker.clone(), view.generation));
             }
             if by_tier.is_empty() {
                 continue;
             }
             matches.push(ExternalKvNodeMatch {
                 worker_id: worker,
-                address,
+                address: view.address,
                 hashes_by_tier: by_tier
                     .into_iter()
                     .map(|(tier, hashes)| TierHashes { tier, hashes })
                     .collect(),
+                dp_rank: view.dp_rank,
             });
         }
 
@@ -770,6 +1062,13 @@ impl KvIndexerBackend for RedisKvIndexerBackend {
         self.do_match(request).await
     }
 
+    async fn match_external_kv_prefix(
+        &self,
+        request: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        self.do_match_prefix(request).await
+    }
+
     async fn get_external_kv_hit_counts(
         &self,
         request: GetExternalKvHitCountsRequest,
@@ -806,6 +1105,18 @@ fn require_current(status: i64, message: &'static str) -> Result<(), Status> {
     (status >= 0)
         .then_some(())
         .ok_or_else(|| Status::failed_precondition(message))
+}
+
+/// Encodes a hash spec into the single string stored on the worker.
+///
+/// Only ever compared for equality, never parsed back, so the encoding just has
+/// to be injective: `namespace` goes last because it is the one field that may
+/// contain the separator.
+fn encode_hash_spec(spec: &HashSpec) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        spec.block_size, spec.algo, spec.version, spec.namespace
+    )
 }
 
 fn parse_placement_value(value: &str) -> (i64, i64) {

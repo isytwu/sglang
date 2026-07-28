@@ -41,7 +41,13 @@ impl std::ops::Deref for RedisScript {
 /// meta hash, and reports whether a restart reset is owed.
 ///
 /// KEYS: `[worker_meta_key]`
-/// ARGV: `[now_ms, ttl_ms, addr, incarnation]`
+/// ARGV: `[now_ms, ttl_ms, addr, incarnation, spec, dp_rank]`
+///
+/// `spec` and `dp_rank` are recorded for routing queries. An empty `spec`
+/// leaves the stored one alone, so a publisher that does not report one never
+/// disables spec checking for a worker that does. `dp_rank` has no such
+/// sentinel — the proto cannot distinguish rank 0 from an absent rank — so it
+/// is written on every call.
 ///
 /// The durable meta hash (`seq`, `incarnation`, `addr`, `reset_pending`) never
 /// expires. Liveness is a `live_until_ms` field; retired incarnations are
@@ -80,6 +86,10 @@ end
 if ARGV[3] ~= '' then
   redis.call('HSET', KEYS[1], 'addr', ARGV[3])
 end
+if ARGV[5] ~= '' then
+  redis.call('HSET', KEYS[1], 'spec', ARGV[5])
+end
+redis.call('HSET', KEYS[1], 'dp_rank', ARGV[6])
 if tonumber(ARGV[2]) > 0 then
   redis.call('HSET', KEYS[1], 'live_until_ms', tonumber(ARGV[1]) + tonumber(ARGV[2]))
 else
@@ -93,11 +103,13 @@ return {0, generation}
     )
 });
 
-/// Reads a worker's routing address and liveness for `match`.
+/// Reads a worker's routing address, liveness, hash spec and DP rank for
+/// `match`.
 ///
 /// KEYS: `[worker_meta_key]`
 /// ARGV: `[now_ms, ttl_enabled ("0"|"1")]`
-/// Returns `{addr, alive, generation}`.
+/// Returns `{addr, alive, generation, spec, dp_rank}`. `spec` is empty for a
+/// worker that never reported one, which the caller reads as "unchecked".
 /// `alive` is `0` when a restart reset is still pending (`reset_pending=1`) — the
 /// worker's placement is being wiped and must not be routed to, regardless of the
 /// TTL setting — or, when liveness is enabled, when `live_until_ms` is in the
@@ -107,16 +119,19 @@ pub static WORKER_VIEW: LazyLock<RedisScript> = LazyLock::new(|| {
         r#"
 local addr = redis.call('HGET', KEYS[1], 'addr')
 if not addr then addr = '' end
+local spec = redis.call('HGET', KEYS[1], 'spec')
+if not spec then spec = '' end
+local dp_rank = tonumber(redis.call('HGET', KEYS[1], 'dp_rank')) or 0
 local generation = tonumber(redis.call('HGET', KEYS[1], 'generation')) or 0
 if redis.call('HGET', KEYS[1], 'reset_pending') == '1' then
-  return {addr, 0, generation}
+  return {addr, 0, generation, spec, dp_rank}
 end
 local alive = 1
 if ARGV[2] == '1' then
   local live_until_ms = tonumber(redis.call('HGET', KEYS[1], 'live_until_ms')) or 0
   if live_until_ms < tonumber(ARGV[1]) then alive = 0 end
 end
-return {addr, alive, generation}
+return {addr, alive, generation, spec, dp_rank}
 "#,
     )
 });

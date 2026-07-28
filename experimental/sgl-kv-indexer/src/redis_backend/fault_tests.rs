@@ -122,8 +122,7 @@ fn batch(worker: &str, seq: u64, kind: ExternalKvActionType) -> ApplyExternalKvB
             tier: crate::pb::TierType::TierHbm as i32,
             hashes: vec!["hash-a".to_string()],
         }],
-        worker_address: String::new(),
-        incarnation: String::new(),
+        ..Default::default()
     }
 }
 
@@ -146,10 +145,8 @@ fn report(worker: &str, seq: u64, incarnation: &str) -> ApplyExternalKvBatchRequ
 fn heartbeat(worker: &str, incarnation: &str) -> ApplyExternalKvBatchRequest {
     ApplyExternalKvBatchRequest {
         worker_id: worker.to_string(),
-        seq: 0,
-        actions: Vec::new(),
-        worker_address: String::new(),
         incarnation: incarnation.to_string(),
+        ..Default::default()
     }
 }
 
@@ -309,7 +306,7 @@ async fn late_concurrent_reset_cannot_delete_current_generation_state() {
     apply_ok(&backend, report(worker, 9, "inc-a")).await;
     let meta = worker_meta_key(&backend.ns, worker);
     let touch = backend
-        .touch_meta(&meta, "", "inc-b")
+        .touch_meta(&meta, &heartbeat(worker, "inc-b"))
         .await
         .expect("touch generation B");
     assert!(touch.reset_needed);
