@@ -6,6 +6,13 @@ syntax = "proto3";
 package kv_indexer.v1;
 
 // Storage tier for externally managed KV cache blocks.
+//
+// Every tier here is storage a single worker owns, because placement is
+// recorded per (block, worker). SGLang's `StorageMedium.EXTERNAL` — a shared
+// remote pool — deliberately has no tier: its contents are equally reachable
+// from every worker, so attributing them to whichever worker happened to write
+// them would claim an affinity that does not exist. Indexing a shared pool
+// needs a cluster-level record, not a worker's tier bit.
 enum TierType {
   TIER_UNKNOWN = 0;
   TIER_HBM = 1;
@@ -13,10 +20,44 @@ enum TierType {
   TIER_SSD = 3;
 }
 
+// How a publisher derived the block hashes it reports. Two publishers that
+// disagree on this produce disjoint hash spaces for the same tokens, so a
+// query against the wrong spec silently matches nothing. Recording it lets the
+// indexer surface the mismatch instead of returning a plausible empty result.
+enum HashAlgorithm {
+  HASH_ALGO_UNSPECIFIED = 0;
+  // SGLang `radix_cache.hash_page`: per-page SHA256 chained on the parent
+  // page's full digest, truncated to a signed 64-bit integer.
+  HASH_ALGO_SHA256_CHAIN_UNIGRAM = 1;
+  // The same chaining over overlapping (t_i, t_i+1) token bigrams, used by
+  // EAGLE-family models.
+  HASH_ALGO_SHA256_CHAIN_BIGRAM = 2;
+}
+
+// Identifies the hash space a set of block hashes belongs to.
+//
+// Checking is skipped whenever either side is silent: an unset spec
+// (block_size == 0) on a query checks nothing, and a worker that never reported
+// one is never rejected. Publishers and routers upgrade independently, so a
+// stricter rule would take routing out for the length of a rollout.
+message HashSpec {
+  // Tokens per block, as published by the worker.
+  uint32 block_size = 1;
+  HashAlgorithm algo = 2;
+  // Reserved for future algorithm revisions; 0 is the current definition.
+  uint32 version = 3;
+  // Reserved for partitioning by SGLang's radix-cache `extra_key` (LoRA id,
+  // cache salt). SGLang does not currently fold that key into the block digest,
+  // so hashes collide across adapters; this field is where that would be
+  // disambiguated without a breaking change.
+  string namespace = 4;
+}
+
 message MatchExternalKvRequest {
   // MVP semantics: these are block-level hashes to match against placement
   // metadata. The indexer returns block placement matches and does not compute
-  // the longest reusable prefix.
+  // the longest reusable prefix. Use MatchExternalKvPrefix for prefix-aware
+  // routing queries.
   repeated string hashes = 1;
 
   // When true, only hashes that are actually matched should increase hit
@@ -47,9 +88,11 @@ message ApplyExternalKvBatchRequest {
   // whose seq is <= the stored value is treated as a duplicate and skipped.
   uint64 seq = 2;
   repeated ExternalKvAction actions = 3;
-  // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
-  // Supplied by the bridge; may be empty, in which case matches for this worker
-  // carry an empty address.
+  // The worker's routing identity, not its KV-transfer address. A router
+  // intersects this with the worker URLs it registered itself, so the two must
+  // agree byte for byte. Supplied by the bridge; may be empty, in which case the
+  // worker is still indexed but omitted from prefix queries, which cannot
+  // forward to an address they do not have.
   string worker_address = 4;
   // Opaque per-lifetime token identifying the worker's current incarnation
   // (e.g. bridge process start id). When it changes for a worker, the indexer
@@ -58,6 +101,18 @@ message ApplyExternalKvBatchRequest {
   // sequence is accepted instead of being skipped as a duplicate. Empty
   // disables the behavior (backward compatible).
   string incarnation = 5;
+  // The hash space these hashes belong to. Recorded on the worker and compared
+  // against the spec a prefix query carries. Unset leaves the worker unchecked.
+  HashSpec hash_spec = 6;
+  // The publisher's DP rank, so a router can distinguish the several event
+  // streams that share one worker address.
+  //
+  // Zero and "not reported" are the same value here. Proto3 field presence
+  // would separate them, but it needs protoc 3.15 and the deployment images
+  // ship 3.12, which is not a build requirement worth adding for a diagnostic
+  // field. The consequence is bounded: a bridge that has not yet seen a batch
+  // records rank 0, and corrects itself on the first one.
+  uint32 dp_rank = 7;
 }
 
 message ApplyExternalKvBatchResponse {
@@ -83,10 +138,61 @@ message ExternalKvNodeMatch {
   string worker_id = 1;
   string address = 2;
   repeated TierHashes hashes_by_tier = 3;
+  uint32 dp_rank = 4;
 }
 
 message MatchExternalKvResponse {
   repeated ExternalKvNodeMatch matches = 1;
+}
+
+// A prefix-aware routing query. Unlike MatchExternalKvRequest the hashes are
+// ordered: `hashes[0]` must be the request's first block, because the indexer
+// reports how far each worker can serve the request from its own cache.
+message MatchExternalKvPrefixRequest {
+  repeated string hashes = 1;
+  // Unset (block_size == 0) skips spec checking entirely.
+  HashSpec hash_spec = 2;
+  // Stop after this many blocks so a caller on a latency budget can bound the
+  // work it asks for. 0 means "all supplied hashes".
+  uint32 max_blocks = 3;
+  // Return at most this many matches, longest prefix first. 0 means "all".
+  uint32 top_k = 4;
+  // Bump hit counters for the winning prefix. Off by default: routing queries
+  // run on a latency budget and hit counting costs an extra write round.
+  bool count_as_hit = 5;
+}
+
+message ExternalKvPrefixMatch {
+  string worker_id = 1;
+  // The worker's routing identity, as reported on its apply batches. A router
+  // matches this against its own registered worker URL, so the two must agree
+  // byte for byte. Workers with an empty address are omitted: they cannot be
+  // routed to.
+  string address = 2;
+  uint32 dp_rank = 3;
+  // The largest n for which this worker holds hashes[0..n) contiguously, with
+  // tiers unioned. This is deliberately stricter than "holds the deepest
+  // matched block": a gap truncates the prefix, so the value never overstates
+  // what the worker can actually reuse. The server also caps its scan, so a
+  // longer match is reported at that cap; queried_blocks shows where it stopped.
+  uint32 matched_prefix_blocks = 4;
+  // The tiers the matched prefix spans, ascending.
+  repeated TierType tiers = 5;
+}
+
+message MatchExternalKvPrefixResponse {
+  // Ordered by matched_prefix_blocks, descending.
+  repeated ExternalKvPrefixMatch matches = 1;
+  // The longest prefix any returned worker holds; 0 when nothing matched.
+  uint32 best_prefix_blocks = 2;
+  // How many block hashes were actually read. Well below the request size when
+  // the scan terminated early, which is what makes this query cheap.
+  uint32 queried_blocks = 3;
+  // Workers that held the first block but were dropped because their recorded
+  // hash spec disagrees with the request's. A response with no matches and a
+  // nonzero count here means the caller is hashing differently from the
+  // workers, which would otherwise look identical to a cold cache.
+  uint32 spec_mismatched_workers = 4;
 }
 
 message HitCountEntry {
@@ -107,5 +213,11 @@ service KVIndexer {
   rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
 
   rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
+
+  // Prefix-aware variant for routing. Returns per-worker reusable prefix
+  // lengths rather than raw placement sets, and stops reading as soon as no
+  // worker can extend its prefix.
+  rpc MatchExternalKvPrefix(MatchExternalKvPrefixRequest) returns (MatchExternalKvPrefixResponse);
+
   rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);
 }

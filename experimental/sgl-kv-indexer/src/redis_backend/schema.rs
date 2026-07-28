@@ -31,9 +31,10 @@ pub fn worker_blocks_key(ns: &str, worker_id: &str) -> String {
 }
 
 /// Durable registry for a worker: HASH with fields `addr`, `seq`,
-/// `incarnation`, `generation`, `reset_pending`, `live_until_ms`, and
-/// `retired:<incarnation>`. Never expires. Keeping worker metadata in one key
-/// lets heartbeat Lua remain valid during Redis Cluster slot migration.
+/// `incarnation`, `generation`, `reset_pending`, `live_until_ms`, `spec`,
+/// `dp_rank`, and `retired:<incarnation>`. Never expires. Keeping worker
+/// metadata in one key lets heartbeat Lua remain valid during Redis Cluster
+/// slot migration.
 pub fn worker_meta_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:meta")
 }
@@ -43,10 +44,14 @@ pub fn tier_bit(tier: i32) -> i64 {
     1i64 << tier
 }
 
-/// Decodes the tiers present in a placement bitmask, ascending. Only valid tiers
-/// (HBM=1, DRAM=2, SSD=3) are considered.
+/// Decodes the tiers present in a placement bitmask, ascending. Bits outside
+/// the valid tier range are ignored, so this must stay in step with
+/// [`crate::service::MAX_TIER`]: a tier the writer can set but this cannot
+/// decode would silently drop the placement from every match response.
 pub fn tiers_from_mask(mask: i64) -> Vec<i32> {
-    (1..=3).filter(|t| mask & (1i64 << t) != 0).collect()
+    (1..=crate::service::MAX_TIER)
+        .filter(|t| mask & (1i64 << t) != 0)
+        .collect()
 }
 
 #[cfg(test)]
@@ -81,5 +86,19 @@ mod tests {
             tiers_from_mask(tier_bit(1) | tier_bit(2) | tier_bit(3)),
             vec![1, 2, 3]
         );
+    }
+
+    /// Every tier the service layer accepts must survive the bitmask round
+    /// trip. A tier that can be written but not decoded disappears from match
+    /// responses with no error anywhere.
+    #[test]
+    fn every_accepted_tier_round_trips() {
+        for tier in 1..=crate::service::MAX_TIER {
+            assert_eq!(
+                tiers_from_mask(tier_bit(tier)),
+                vec![tier],
+                "tier {tier} is accepted by validate_tier but lost by tiers_from_mask",
+            );
+        }
     }
 }
