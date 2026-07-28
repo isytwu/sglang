@@ -15,7 +15,10 @@ use tracing::{debug, info, warn};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
-use crate::pb::{ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType};
+use crate::pb::{
+    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, HashAlgorithm, HashSpec,
+    TierType,
+};
 
 /// Backoff bounds for the reconnect supervisor loop.
 const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(500);
@@ -70,7 +73,6 @@ impl BridgeConfig {
         let incarnation_prefix = std::env::var("KV_INDEXER_WORKER_INCARNATION").ok();
         let incarnation =
             load_or_create_incarnation(&incarnation_path, incarnation_prefix.as_deref());
-
         Ok(Self {
             worker_id,
             worker_address,
@@ -249,9 +251,124 @@ enum Action {
     ClearAll,
 }
 
+/// One SGLang event batch, reduced to the mutations it implies plus whatever it
+/// revealed about the publisher itself.
 #[derive(Debug, Default)]
-struct EventActions {
+struct DecodedBatch {
     actions: Vec<Action>,
+    /// Largest `BlockStored.block_size` in the batch. SGLang reports the length
+    /// of each page, so a node's trailing partial page understates the
+    /// configured page size.
+    block_size: u32,
+    /// Whether the batch's pages were bigram-shaped, or `None` when it carried
+    /// no `BlockStored` to judge from.
+    bigram: Option<bool>,
+    /// The batch's `attn_dp_rank`, when the publisher supplied one.
+    dp_rank: Option<u32>,
+    /// Events dropped because their storage medium is not one this index
+    /// tracks. Counted rather than silently discarded so the bridge can say so.
+    unindexed_medium_events: usize,
+}
+
+/// What the event stream has revealed about the hash space the publisher
+/// reports in, accumulated across reconnects.
+///
+/// Derived from the stream rather than configured. sgl-router learned this the
+/// hard way: a statically configured block size that nothing reconciles against
+/// the worker's real page size silently produces hashes that match nothing, and
+/// the only symptom is a cache hit rate of zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PublisherProfile {
+    /// Largest page length observed; converges on the worker's page size after
+    /// the first full page. Until then a spec derived from a short page reads as
+    /// a mismatch, which drops the worker from routing queries and shows up in
+    /// `spec_mismatched_workers` — a visible, self-correcting degradation rather
+    /// than a silent wrong answer.
+    block_size: u32,
+    bigram: Option<bool>,
+    /// `None` until a batch carries one, so the first observation can be told
+    /// apart from a genuine rank 0 and pinned. The wire form has no such
+    /// distinction, so an unobserved rank is reported as 0.
+    dp_rank: Option<u32>,
+    /// These facts recur on every batch, and one report each is the whole
+    /// signal; the rest is a log flood at the publisher's event rate.
+    shape_conflict_logged: bool,
+    rank_conflict_logged: bool,
+    unindexed_medium_logged: bool,
+}
+
+impl PublisherProfile {
+    fn observe(&mut self, batch: &DecodedBatch) {
+        self.block_size = self.block_size.max(batch.block_size);
+        if let Some(bigram) = batch.bigram {
+            match self.bigram {
+                None => self.bigram = Some(bigram),
+                Some(known) if known != bigram => {
+                    if !self.shape_conflict_logged {
+                        self.shape_conflict_logged = true;
+                        warn!(
+                            established_bigram = known,
+                            batch_bigram = bigram,
+                            "SGLang page shape changed mid-stream; keeping the established \
+                             hashing mode"
+                        );
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(rank) = batch.dp_rank {
+            match self.dp_rank {
+                None => self.dp_rank = Some(rank),
+                // One bridge follows one publisher, so the rank is fixed for
+                // the stream's lifetime. A change means this bridge is seeing
+                // more than one rank's events; adopting the new value would
+                // just make the recorded rank flap, so keep the first.
+                Some(known) if known != rank => {
+                    if !self.rank_conflict_logged {
+                        self.rank_conflict_logged = true;
+                        warn!(
+                            established = known,
+                            observed = rank,
+                            "SGLang attn_dp_rank changed on one event stream; check that the \
+                             bridge subscribes to exactly one publisher port"
+                        );
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        if batch.unindexed_medium_events > 0 && !self.unindexed_medium_logged {
+            self.unindexed_medium_logged = true;
+            warn!(
+                events = batch.unindexed_medium_events,
+                "SGLang reported KV blocks in a storage medium this index does not track; \
+                 those blocks are absent from routing queries. A shared pool (EXTERNAL) has \
+                 no per-worker tier by design."
+            );
+        }
+    }
+
+    /// The spec to report, or `None` while the stream has not yet carried a
+    /// `BlockStored` to derive one from. `None` leaves the worker unchecked,
+    /// which is the behavior of a publisher that never reports a spec at all.
+    fn hash_spec(&self) -> Option<HashSpec> {
+        let bigram = self.bigram?;
+        if self.block_size == 0 {
+            return None;
+        }
+        let algo = if bigram {
+            HashAlgorithm::HashAlgoSha256ChainBigram
+        } else {
+            HashAlgorithm::HashAlgoSha256ChainUnigram
+        };
+        Some(HashSpec {
+            block_size: self.block_size,
+            algo: algo as i32,
+            version: 0,
+            namespace: String::new(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -260,7 +377,34 @@ struct RawBatch {
     payload: Vec<u8>,
 }
 
-impl EventActions {
+/// Bridge state that must outlive any single connection, so the supervisor owns
+/// it and each session borrows it.
+struct SessionState {
+    next_seq: Option<u64>,
+    pending_batch: Option<RawBatch>,
+    incarnation: String,
+    profile: PublisherProfile,
+}
+
+impl SessionState {
+    /// Starts a new publisher lifetime: mints an incarnation and drops the
+    /// state that described the old one.
+    ///
+    /// The profile has to go with it. It is derived from the publisher's
+    /// events, and a publisher that restarted may have restarted with a
+    /// different page size or hashing mode. Carrying the old values forward
+    /// would keep reporting a hash spec the worker no longer publishes in, and
+    /// the indexer would drop that worker from every routing query until the
+    /// bridge process itself restarted.
+    fn rotate_publisher(&mut self, config: &BridgeConfig) {
+        rotate_incarnation(config, &mut self.incarnation);
+        self.next_seq = None;
+        self.pending_batch = None;
+        self.profile = PublisherProfile::default();
+    }
+}
+
+impl DecodedBatch {
     /// Append a store, coalescing only with an immediately-preceding store to
     /// the same tier. Coalescing never crosses a revoke/clear, so ordering (and
     /// therefore the final per-hash state) is preserved.
@@ -336,13 +480,25 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
         "starting SGLang KV event bridge"
     );
 
+    if config.worker_address.is_empty() {
+        warn!(
+            worker_id = %config.worker_id,
+            "KV_INDEXER_WORKER_ADDRESS is unset: this worker will be indexed but omitted from \
+             routing queries, which cannot forward to an address they do not have. Set it to the \
+             exact worker URL the router registers."
+        );
+    }
+
     // Supervisor loop: (re)connect to both the indexer and the ZMQ publisher,
     // run until a connection-level error, then back off and retry. Decode-level
     // problems are handled inside the session and never tear down the bridge.
     let mut delay = RECONNECT_MIN_DELAY;
-    let mut next_seq: Option<u64> = None;
-    let mut pending_batch: Option<RawBatch> = None;
-    let mut incarnation = config.incarnation.clone();
+    let mut state = SessionState {
+        next_seq: None,
+        pending_batch: None,
+        incarnation: config.incarnation.clone(),
+        profile: PublisherProfile::default(),
+    };
     if config.heartbeat_interval.is_some() && config.event_replay_endpoint.is_none() {
         warn!(
             "periodic liveness heartbeat disabled: configure \
@@ -353,16 +509,7 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
         match connect(&config).await {
             Ok((client, subscriber)) => {
                 delay = RECONNECT_MIN_DELAY;
-                match run_session(
-                    &config,
-                    client,
-                    subscriber,
-                    &mut next_seq,
-                    &mut pending_batch,
-                    &mut incarnation,
-                )
-                .await
-                {
+                match run_session(&config, client, subscriber, &mut state).await {
                     Ok(()) => {
                         info!("bridge shut down cleanly");
                         return Ok(());
@@ -410,14 +557,13 @@ async fn connect(
 /// from the authoritative position rather than the locally observed seq.
 async fn commit_batch(
     config: &BridgeConfig,
-    incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
     batch: &RawBatch,
-    pending_batch: &mut Option<RawBatch>,
+    state: &mut SessionState,
 ) -> Result<u64, BridgeError> {
-    *pending_batch = Some(batch.clone());
-    let last_applied_seq = forward_raw_batch(config, incarnation, client, batch).await?;
-    *pending_batch = None;
+    state.pending_batch = Some(batch.clone());
+    let last_applied_seq = forward_raw_batch(config, client, batch, state).await?;
+    state.pending_batch = None;
     Ok(last_applied_seq)
 }
 
@@ -428,18 +574,16 @@ async fn run_session(
     config: &BridgeConfig,
     mut client: KvIndexerClient<Channel>,
     mut subscriber: SubSocket,
-    next_seq: &mut Option<u64>,
-    pending_batch: &mut Option<RawBatch>,
-    incarnation: &mut String,
+    state: &mut SessionState,
 ) -> Result<(), BridgeError> {
     // Only a response from the worker-owned replay endpoint proves that SGLang
     // is alive. Announce/refresh the incarnation immediately after that proof.
     if config.event_replay_endpoint.is_some() {
         match probe_publisher(config).await {
             Ok(()) => {
-                let checkpoint = send_heartbeat(config, incarnation, &mut client).await?;
-                if next_seq.is_none() {
-                    *next_seq = checkpoint.and_then(|seq| seq.checked_add(1));
+                let checkpoint = send_heartbeat(config, state, &mut client).await?;
+                if state.next_seq.is_none() {
+                    state.next_seq = checkpoint.and_then(|seq| seq.checked_add(1));
                 }
             }
             Err(error) => {
@@ -451,10 +595,9 @@ async fn run_session(
     // A batch left pending by the previous disconnect is re-driven once before
     // consuming new events. It can only be set at session entry: every in-loop
     // commit either clears it or returns an error that ends the session.
-    if let Some(batch) = pending_batch.clone() {
-        let last_applied_seq =
-            commit_batch(config, incarnation, &mut client, &batch, pending_batch).await?;
-        *next_seq = last_applied_seq.checked_add(1);
+    if let Some(batch) = state.pending_batch.clone() {
+        let last_applied_seq = commit_batch(config, &mut client, &batch, state).await?;
+        state.next_seq = last_applied_seq.checked_add(1);
     }
 
     // Liveness heartbeat: an empty-actions apply that refreshes the worker's
@@ -478,7 +621,7 @@ async fn run_session(
             {
                 match probe_publisher(config).await {
                     Ok(()) => {
-                        send_heartbeat(config, incarnation, &mut client).await?;
+                        send_heartbeat(config, state, &mut client).await?;
                     }
                     Err(error) => {
                         warn!(%error, "publisher liveness probe failed; heartbeat suppressed");
@@ -508,30 +651,19 @@ async fn run_session(
             continue;
         }
 
-        if let Some(expected) = *next_seq {
+        if let Some(expected) = state.next_seq {
             if seq < expected {
                 warn!(
                     expected,
                     actual = seq,
                     "SGLang KV event sequence moved backwards; treating publisher as restarted"
                 );
-                rotate_incarnation(config, incarnation);
-                *next_seq = None;
-                *pending_batch = None;
-                send_heartbeat(config, incarnation, &mut client).await?;
+                state.rotate_publisher(config);
+                send_heartbeat(config, state, &mut client).await?;
             }
             if seq > expected {
                 warn!(expected, actual = seq, "SGLang KV event sequence gap");
-                match replay_missing_batches(
-                    config,
-                    incarnation,
-                    &mut client,
-                    expected,
-                    seq,
-                    pending_batch,
-                )
-                .await
-                {
+                match replay_missing_batches(config, &mut client, expected, seq, state).await {
                     Ok(()) => {}
                     // Gap recovery is best effort. Once the publisher's replay
                     // buffer no longer covers the gap, no amount of retrying can
@@ -546,28 +678,20 @@ async fn run_session(
                             %reason,
                             "unrecoverable SGLang KV event gap; retiring worker incarnation and resyncing"
                         );
-                        rotate_incarnation(config, incarnation);
-                        *next_seq = None;
-                        *pending_batch = None;
-                        send_heartbeat(config, incarnation, &mut client).await?;
+                        state.rotate_publisher(config);
+                        send_heartbeat(config, state, &mut client).await?;
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
 
-        let last_applied_seq = commit_batch(
-            config,
-            incarnation,
-            &mut client,
-            &RawBatch { seq, payload },
-            pending_batch,
-        )
-        .await?;
+        let last_applied_seq =
+            commit_batch(config, &mut client, &RawBatch { seq, payload }, state).await?;
         // Advance from the indexer's durable position: on a duplicate this is
         // >= seq, so a restart that re-observes already-applied batches resyncs
         // without reprocessing them.
-        *next_seq = last_applied_seq.max(seq).checked_add(1);
+        state.next_seq = last_applied_seq.max(seq).checked_add(1);
     }
 }
 
@@ -605,11 +729,10 @@ async fn receive_replay(socket: &mut DealerSocket) -> Result<Vec<bytes::Bytes>, 
 
 async fn replay_missing_batches(
     config: &BridgeConfig,
-    incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
     start_seq: u64,
     stop_before_seq: u64,
-    pending_batch: &mut Option<RawBatch>,
+    state: &mut SessionState,
 ) -> Result<(), BridgeError> {
     let Some(endpoint) = &config.event_replay_endpoint else {
         return Err(BridgeError::Replay(format!(
@@ -647,7 +770,7 @@ async fn replay_missing_batches(
             seq,
             payload: payload.to_vec(),
         };
-        commit_batch(config, incarnation, client, &batch, pending_batch).await?;
+        commit_batch(config, client, &batch, state).await?;
         replay_expected = seq.checked_add(1).unwrap_or(seq);
         recovered += 1;
     }
@@ -730,19 +853,20 @@ fn decode_seq(bytes: &[u8]) -> Result<u64, BridgeError> {
 
 async fn forward_raw_batch(
     config: &BridgeConfig,
-    incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
     batch: &RawBatch,
+    state: &mut SessionState,
 ) -> Result<u64, BridgeError> {
-    let actions = match decode_event_batch(&batch.payload) {
-        Ok(actions) => actions,
+    let decoded = match decode_event_batch(&batch.payload) {
+        Ok(decoded) => decoded,
         Err(error) => {
             warn!(seq = batch.seq, %error, "skipping undecodable event batch");
             return Ok(batch.seq);
         }
     };
+    state.profile.observe(&decoded);
 
-    let request = build_apply_request(config, incarnation, batch.seq, actions);
+    let request = build_apply_request(config, state, batch.seq, decoded);
     // Nothing decodable to a supported mutation (e.g. only ignored event tags):
     // preserve the previous no-op behaviour and skip the RPC entirely. The batch
     // still counts as consumed, so report its seq as the applied position.
@@ -763,7 +887,7 @@ async fn forward_raw_batch(
 /// propagated so a broken connection ends the session and triggers reconnect.
 async fn send_heartbeat(
     config: &BridgeConfig,
-    incarnation: &str,
+    state: &SessionState,
     client: &mut KvIndexerClient<Channel>,
 ) -> Result<Option<u64>, BridgeError> {
     let request = ApplyExternalKvBatchRequest {
@@ -771,7 +895,9 @@ async fn send_heartbeat(
         seq: 0,
         actions: Vec::new(),
         worker_address: config.worker_address.clone(),
-        incarnation: incarnation.to_string(),
+        incarnation: state.incarnation.clone(),
+        hash_spec: state.profile.hash_spec(),
+        dp_rank: state.profile.dp_rank.unwrap_or(0),
     };
     let response = client
         .apply_external_kv_batch(request)
@@ -790,9 +916,9 @@ async fn send_heartbeat(
 /// carries the same semantics as the legacy per-tier revoke-all RPCs.
 fn build_apply_request(
     config: &BridgeConfig,
-    incarnation: &str,
+    state: &SessionState,
     seq: u64,
-    events: EventActions,
+    events: DecodedBatch,
 ) -> ApplyExternalKvBatchRequest {
     let mut actions = Vec::with_capacity(events.actions.len());
     for action in events.actions {
@@ -824,18 +950,20 @@ fn build_apply_request(
         seq,
         actions,
         worker_address: config.worker_address.clone(),
-        incarnation: incarnation.to_string(),
+        incarnation: state.incarnation.clone(),
+        hash_spec: state.profile.hash_spec(),
+        dp_rank: state.profile.dp_rank.unwrap_or(0),
     }
 }
 
-fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
+fn decode_event_batch(payload: &[u8]) -> Result<DecodedBatch, BridgeError> {
     decode_event_batch_impl(payload, true)
 }
 
 fn decode_event_batch_impl(
     payload: &[u8],
     log_event_errors: bool,
-) -> Result<EventActions, BridgeError> {
+) -> Result<DecodedBatch, BridgeError> {
     let mut cursor = Cursor::new(payload);
     let value = read_value(&mut cursor).map_err(|error| BridgeError::Decode(error.to_string()))?;
     let batch = expect_array(&value, "KVEventBatch")?;
@@ -846,9 +974,13 @@ fn decode_event_batch_impl(
     }
 
     let events = expect_array(&batch[1], "KVEventBatch.events")?;
-    let mut actions = EventActions::default();
+    let mut decoded = DecodedBatch {
+        // `attn_dp_rank` is optional in the schema and may be nil or omitted.
+        dp_rank: batch.get(2).and_then(Value::as_u64).map(|rank| rank as u32),
+        ..DecodedBatch::default()
+    };
     for (event_index, event) in events.iter().enumerate() {
-        if let Err(error) = decode_event(event, &mut actions) {
+        if let Err(error) = decode_event(event, &mut decoded) {
             if log_event_errors {
                 warn!(
                     event_index,
@@ -858,10 +990,10 @@ fn decode_event_batch_impl(
             }
         }
     }
-    Ok(actions)
+    Ok(decoded)
 }
 
-fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
+fn decode_event(event: &Value, decoded: &mut DecodedBatch) -> Result<(), BridgeError> {
     let event = expect_array(event, "KV event")?;
     let event_type = expect_str(
         event
@@ -877,8 +1009,23 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
                     "BlockStored must have 7 array fields".to_string(),
                 ));
             }
-            let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            actions.report(tier, decode_hashes(&event[1])?);
+            // The hash space is a property of how the publisher hashes, not of
+            // where the block landed, so read it from every well-formed event -
+            // including one whose medium this index does not track. Otherwise a
+            // deployment writing mostly into an untracked medium would leave its
+            // workers unchecked for as long as that lasted.
+            decoded.block_size = decoded
+                .block_size
+                .max(event[4].as_u64().unwrap_or(0) as u32);
+            if let Some(bigram) = page_is_bigram(&event[3]) {
+                decoded.bigram = Some(bigram);
+            }
+            let medium = expect_optional_str(&event[6], "BlockStored.medium")?;
+            let Some(tier) = medium_to_tier(medium)? else {
+                decoded.unindexed_medium_events += 1;
+                return Ok(());
+            };
+            decoded.report(tier, decode_hashes(&event[1])?);
         }
         "BlockRemoved" => {
             if event.len() < 3 {
@@ -886,17 +1033,34 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
                     "BlockRemoved must have 3 array fields".to_string(),
                 ));
             }
-            let tier = medium_to_tier(expect_optional_str(&event[2], "BlockRemoved.medium")?)?;
-            actions.revoke(tier, decode_hashes(&event[1])?);
+            let medium = expect_optional_str(&event[2], "BlockRemoved.medium")?;
+            let Some(tier) = medium_to_tier(medium)? else {
+                decoded.unindexed_medium_events += 1;
+                return Ok(());
+            };
+            decoded.revoke(tier, decode_hashes(&event[1])?);
         }
         "AllBlocksCleared" => {
-            actions.clear_all();
+            decoded.clear_all();
         }
         other => {
             debug!(event_type = other, "ignoring unsupported SGLang KV event");
         }
     }
     Ok(())
+}
+
+/// Reads a `BlockStored.token_ids` array to tell the two page shapes apart.
+///
+/// SGLang emits one integer per unit for unigram pages and a `[t_i, t_i+1]`
+/// pair per unit for bigram (EAGLE-family) pages, so the element type is the
+/// discriminator. Returns `None` for an empty or unrecognizable array.
+fn page_is_bigram(token_ids: &Value) -> Option<bool> {
+    match token_ids.as_array()?.first()? {
+        Value::Array(_) => Some(true),
+        Value::Integer(_) => Some(false),
+        _ => None,
+    }
 }
 
 fn decode_hashes(value: &Value) -> Result<Vec<String>, BridgeError> {
@@ -916,20 +1080,28 @@ fn decode_hashes(value: &Value) -> Result<Vec<String>, BridgeError> {
         .collect()
 }
 
-fn medium_to_tier(medium: Option<&str>) -> Result<i32, BridgeError> {
+/// Maps a SGLang storage medium onto an indexer tier.
+///
+/// `Ok(None)` means the medium is understood but deliberately not indexed, as
+/// opposed to `Err`, which means the event could not be read at all. `EXTERNAL`
+/// is that deliberate case; see [`TierType`] in the proto for why a shared pool
+/// gets no per-worker tier.
+///
+/// A nil medium becomes HBM rather than dropping the event. `medium` is
+/// `Optional[str]` and arrives as an explicit nil, but SGLang's own emitter
+/// substitutes `StorageMedium.GPU` for `None` (`mem_cache/events.py`), so HBM is
+/// the value the publisher meant. Dropping the event instead would leave a
+/// permanent hole: the block is never reported and, because the matching removal
+/// is dropped too, never revoked.
+fn medium_to_tier(medium: Option<&str>) -> Result<Option<i32>, BridgeError> {
     match medium {
-        Some("GPU") => Ok(TierType::TierHbm as i32),
-        Some("CPU_PINNED") => Ok(TierType::TierDram as i32),
-        Some("DISK") => Ok(TierType::TierSsd as i32),
-        Some("EXTERNAL") => Err(BridgeError::Decode(
-            "EXTERNAL medium does not map to a local indexer tier".to_string(),
-        )),
+        Some("GPU") | None => Ok(Some(TierType::TierHbm as i32)),
+        Some("CPU_PINNED") => Ok(Some(TierType::TierDram as i32)),
+        Some("DISK") => Ok(Some(TierType::TierSsd as i32)),
+        Some("EXTERNAL") => Ok(None),
         Some(other) => Err(BridgeError::Decode(format!(
             "unsupported SGLang storage medium: {other}"
         ))),
-        None => Err(BridgeError::Decode(
-            "SGLang storage medium is missing".to_string(),
-        )),
     }
 }
 
@@ -1085,6 +1257,18 @@ mod tests {
         }
     }
 
+    /// The session state a bridge would hold after observing `decoded`.
+    fn state_of(config: &BridgeConfig, decoded: &DecodedBatch) -> SessionState {
+        let mut state = SessionState {
+            next_seq: None,
+            pending_batch: None,
+            incarnation: config.incarnation.clone(),
+            profile: PublisherProfile::default(),
+        };
+        state.profile.observe(decoded);
+        state
+    }
+
     fn temp_checkpoint(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1128,6 +1312,110 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// A publisher's page size and hashing mode are properties of its lifetime.
+    /// Rotating the incarnation declares a new lifetime, so keeping the old
+    /// profile would report a hash space the worker no longer publishes in —
+    /// and the indexer would then drop that worker from every routing query
+    /// until the bridge process itself restarted.
+    #[test]
+    fn rotation_forgets_the_previous_publishers_hash_space() {
+        let config = test_config(vec![hbm()]);
+        let decoded = decode_event_batch(&batch(vec![stored(&[1], "GPU")])).unwrap();
+        let mut state = state_of(&config, &decoded);
+        assert!(
+            state.profile.hash_spec().is_some(),
+            "the fixture must establish a spec for the reset to be observable"
+        );
+        state.next_seq = Some(7);
+        state.pending_batch = Some(RawBatch {
+            seq: 7,
+            payload: Vec::new(),
+        });
+
+        state.rotate_publisher(&config);
+
+        assert_eq!(state.profile, PublisherProfile::default());
+        assert!(state.profile.hash_spec().is_none());
+        assert!(state.next_seq.is_none());
+        assert!(state.pending_batch.is_none());
+    }
+
+    /// The rank identifies the one publisher this bridge follows. A second rank
+    /// on the same stream means the subscription is wrong; adopting it would
+    /// make the recorded rank flap between the two.
+    #[test]
+    fn publisher_rank_and_page_shape_are_pinned_by_the_first_observation() {
+        let mut profile = PublisherProfile::default();
+        profile.observe(&DecodedBatch {
+            block_size: 64,
+            bigram: Some(false),
+            dp_rank: Some(2),
+            ..DecodedBatch::default()
+        });
+        profile.observe(&DecodedBatch {
+            block_size: 16, // a node's trailing partial page
+            bigram: Some(true),
+            dp_rank: Some(5),
+            ..DecodedBatch::default()
+        });
+
+        assert_eq!(profile.dp_rank, Some(2));
+        assert_eq!(profile.bigram, Some(false));
+        assert_eq!(
+            profile.block_size, 64,
+            "page size is the maximum observed, since a partial page understates it"
+        );
+    }
+
+    /// A conflicting stream keeps conflicting on every batch, and SGLang emits
+    /// hundreds per second. One warning is the signal; the rest is a flood.
+    #[test]
+    fn a_conflicting_stream_is_only_reported_once() {
+        let mut profile = PublisherProfile::default();
+        let first = DecodedBatch {
+            block_size: 64,
+            bigram: Some(false),
+            dp_rank: Some(0),
+            ..DecodedBatch::default()
+        };
+        let conflicting = DecodedBatch {
+            block_size: 64,
+            bigram: Some(true),
+            dp_rank: Some(1),
+            ..DecodedBatch::default()
+        };
+        profile.observe(&first);
+        profile.observe(&conflicting);
+        assert!(profile.shape_conflict_logged);
+        assert!(profile.rank_conflict_logged);
+
+        let after_first_report = profile;
+        profile.observe(&conflicting);
+        assert_eq!(
+            profile, after_first_report,
+            "a repeated conflict must change nothing, so nothing re-warns"
+        );
+    }
+
+    /// An agreeing stream must not be mistaken for a conflicting one: a verbatim
+    /// replay of a batch re-observes the same values.
+    #[test]
+    fn replaying_a_batch_leaves_the_profile_unchanged() {
+        let mut profile = PublisherProfile::default();
+        let batch = DecodedBatch {
+            block_size: 64,
+            bigram: Some(true),
+            dp_rank: Some(3),
+            ..DecodedBatch::default()
+        };
+        profile.observe(&batch);
+        let settled = profile;
+        profile.observe(&batch);
+        assert_eq!(profile, settled);
+        assert!(!profile.shape_conflict_logged);
+        assert!(!profile.rank_conflict_logged);
+    }
+
     #[test]
     fn rotation_drops_a_checkpoint_it_cannot_update() {
         // A directory in place of the checkpoint fails every write.
@@ -1152,12 +1440,9 @@ mod tests {
         seq: u64,
         events: Vec<Value>,
     ) -> ApplyExternalKvBatchRequest {
-        build_apply_request(
-            config,
-            &config.incarnation,
-            seq,
-            decode_event_batch(&batch(events)).unwrap(),
-        )
+        let decoded = decode_event_batch(&batch(events)).unwrap();
+        let state = state_of(config, &decoded);
+        build_apply_request(config, &state, seq, decoded)
     }
 
     fn report(tier: i32, hashes: &[&str]) -> ExternalKvAction {
@@ -1456,31 +1741,61 @@ mod tests {
     #[test]
     fn python_msgspec_bigram_tokens_golden_decodes() {
         // token_ids contains Python tuples, encoded as nested msgpack arrays.
-        // The bridge intentionally ignores token payload shape and indexes the
-        // publisher-provided block hashes.
+        // Placement still keys off the publisher-provided block hashes, but the
+        // token shape is what tells the indexer which hash space they live in.
         let payload = golden_bytes(concat!(
             "93cb3ff80000000000009197ab426c6f636b53746f726564916f",
             "c092920a1492141e02c0a347505503"
         ));
+        let decoded = decode_event_batch(&payload).unwrap();
         assert_eq!(
-            decode_event_batch(&payload).unwrap().actions,
+            decoded.actions,
             vec![Action::Report {
                 tier: hbm(),
                 hashes: vec!["111".to_string()],
             }]
         );
+        assert_eq!(
+            decoded.bigram,
+            Some(true),
+            "paired token_ids identify an EAGLE-family bigram page"
+        );
+        assert_eq!(decoded.block_size, 2);
+        assert_eq!(decoded.dp_rank, Some(3));
     }
 
+    /// The Python schema permits `medium=None`. These bytes come from the real
+    /// encoder, which writes it as an explicit nil rather than omitting the
+    /// field, so the event still has its full field count. SGLang's own emitter
+    /// substitutes GPU for a missing medium, so the bridge indexes the block at
+    /// HBM; dropping the event instead would leave a permanent hole, since the
+    /// store is lost and so is the matching removal.
     #[test]
-    fn python_msgspec_nil_medium_golden_is_safely_skipped() {
-        // The Python schema permits medium=None. Such events cannot be mapped
-        // to an Indexer tier, so they are isolated rather than poisoning the
-        // batch or inventing a placement.
+    fn python_msgspec_nil_medium_golden_is_indexed_as_hbm() {
         let payload = golden_bytes(concat!(
             "93cb00000000000000009297ab426c6f636b53746f7265649101",
             "c092050602c0c093ac426c6f636b52656d6f7665649102c0c0"
         ));
-        assert!(decode_event_batch(&payload).unwrap().actions.is_empty());
+        assert_eq!(
+            decode_event_batch(&payload).unwrap().actions,
+            vec![
+                Action::Report {
+                    tier: hbm(),
+                    hashes: vec!["1".to_string()],
+                },
+                Action::Revoke {
+                    tier: hbm(),
+                    hashes: vec!["2".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unigram_page_shape_is_recognized() {
+        let decoded = decode_event_batch(&batch(vec![stored(&[1], "GPU")])).unwrap();
+        assert_eq!(decoded.bigram, Some(false));
+        assert_eq!(decoded.block_size, 1);
     }
 
     #[test]
@@ -1496,29 +1811,69 @@ mod tests {
 
     // --- error / mapping units ---
 
+    /// A shared remote pool has no per-worker tier, so its blocks are left out
+    /// of the index — but counted, because "we chose not to index this" and "we
+    /// saw nothing" must not look the same to an operator.
     #[test]
-    fn external_medium_event_is_skipped() {
-        assert!(decode_event_batch(&batch(vec![stored(&[1], "EXTERNAL")]))
-            .unwrap()
-            .actions
-            .is_empty());
+    fn external_medium_event_is_left_unindexed_and_counted() {
+        let decoded = decode_event_batch(&batch(vec![stored(&[1], "EXTERNAL")])).unwrap();
+        assert!(decoded.actions.is_empty());
+        assert_eq!(decoded.unindexed_medium_events, 1);
     }
 
+    /// The hash space does not depend on which medium a block landed in, so an
+    /// event we decline to index still reports it. A publisher writing only into
+    /// an untracked medium would otherwise leave its workers unchecked.
     #[test]
-    fn unknown_medium_event_is_skipped() {
-        assert!(decode_event_batch(&batch(vec![stored(&[1], "TAPE")]))
-            .unwrap()
-            .actions
-            .is_empty());
+    fn an_unindexed_event_still_reveals_the_hash_space() {
+        let decoded = decode_event_batch(&batch(vec![stored(&[1], "EXTERNAL")])).unwrap();
+        assert!(decoded.actions.is_empty());
+        assert_eq!(decoded.block_size, 1);
+        assert_eq!(decoded.bigram, Some(false));
+    }
+
+    /// An unreadable medium is a decode error, not a policy decision, so it must
+    /// not be counted as one.
+    #[test]
+    fn unknown_medium_event_is_skipped_without_counting_as_unindexed() {
+        let decoded = decode_event_batch(&batch(vec![stored(&[1], "TAPE")])).unwrap();
+        assert!(decoded.actions.is_empty());
+        assert_eq!(decoded.unindexed_medium_events, 0);
+    }
+
+    /// The report is made once per publisher lifetime. An EXTERNAL-emitting
+    /// deployment would otherwise produce one warning per event batch, at the
+    /// publisher's step rate.
+    #[test]
+    fn unindexed_medium_is_reported_once_per_publisher() {
+        let mut profile = PublisherProfile::default();
+        let skipped = DecodedBatch {
+            unindexed_medium_events: 4,
+            ..DecodedBatch::default()
+        };
+        profile.observe(&skipped);
+        assert!(profile.unindexed_medium_logged);
+
+        let settled = profile;
+        profile.observe(&skipped);
+        assert_eq!(
+            profile, settled,
+            "a repeated skip must change nothing, so nothing re-warns"
+        );
     }
 
     #[test]
     fn medium_to_tier_mapping() {
-        assert_eq!(medium_to_tier(Some("GPU")).unwrap(), hbm());
-        assert_eq!(medium_to_tier(Some("CPU_PINNED")).unwrap(), dram());
-        assert_eq!(medium_to_tier(Some("DISK")).unwrap(), ssd());
-        assert!(medium_to_tier(Some("EXTERNAL")).is_err());
-        assert!(medium_to_tier(None).is_err());
+        assert_eq!(medium_to_tier(Some("GPU")).unwrap(), Some(hbm()));
+        assert_eq!(medium_to_tier(Some("CPU_PINNED")).unwrap(), Some(dram()));
+        assert_eq!(medium_to_tier(Some("DISK")).unwrap(), Some(ssd()));
+        // Missing medium follows SGLang's own default rather than dropping the
+        // event; see `python_msgspec_nil_medium_golden_is_indexed_as_hbm`.
+        assert_eq!(medium_to_tier(None).unwrap(), Some(hbm()));
+        // Understood, deliberately not indexed.
+        assert_eq!(medium_to_tier(Some("EXTERNAL")).unwrap(), None);
+        // Not understood at all.
+        assert!(medium_to_tier(Some("TAPE")).is_err());
     }
 
     #[test]
