@@ -21,8 +21,8 @@ mod test_id;
 mod test_kv;
 
 use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvRequest, MatchExternalKvResponse,
+    ExternalKvActionType, GetExternalKvHitCountsRequest, MatchExternalKvRequest,
+    MatchExternalKvResponse,
 };
 use sgl_kv_indexer::{KvIndexerBackend, RedisKvIndexerBackend};
 use test_id::nanos;
@@ -56,21 +56,6 @@ async fn backend(test: &str) -> Option<RedisKvIndexerBackend> {
             "neither KV_INDEXER_REDIS_URL nor KV_INDEXER_REDIS_CLUSTER_NODES is set",
         );
         None
-    }
-}
-
-/// Like [`apply_req`] but tags the batch with a worker incarnation, so a change
-/// across calls simulates a worker restart.
-fn apply_req_inc(
-    worker: &str,
-    addr: &str,
-    incarnation: &str,
-    seq: u64,
-    actions: Vec<ExternalKvAction>,
-) -> ApplyExternalKvBatchRequest {
-    ApplyExternalKvBatchRequest {
-        incarnation: incarnation.to_string(),
-        ..apply_req(worker, addr, seq, actions)
     }
 }
 
@@ -187,9 +172,10 @@ itest!(duplicate_report_is_idempotent, b, {
     assert_eq!(tiers_for(&resp, "w1", "1"), vec![hbm()]);
 });
 
-itest!(same_seq_batch_replay_is_idempotent, b, {
+itest!(identical_batch_replay_is_idempotent, b, {
     // A batch that stores then removes then stores again the same hash; the net
-    // state is "stored". Replaying the identical batch (same seq) must not change it.
+    // state is "stored". Re-delivering the identical batch must not change it,
+    // since every individual mutation is idempotent.
     let batch = apply_req(
         "w1",
         "a",
@@ -296,98 +282,40 @@ itest!(recomputed_split_reports_only_materialized_hashes, b, {
     assert_eq!(tiers_for(&result, "w1", "new-suffix"), vec![hbm()]);
 });
 
-itest!(
-    recomputed_batch_replay_is_idempotent_and_keeps_cpu_copy,
-    b,
-    {
-        // Re-materializing on GPU must not revoke the existing host backup. If the
-        // bridge replays the same sequence, the durable sequence gate rejects the
-        // duplicate without changing either tier.
-        b.apply_external_kv_batch(apply_req(
-            "w1",
-            "a",
-            1,
-            vec![action(
-                ExternalKvActionType::ActionReport,
-                dram(),
-                &["tiered"],
-            )],
-        ))
-        .await
-        .unwrap();
-        let recomputed = apply_req(
-            "w1",
-            "a",
-            2,
-            vec![action(
-                ExternalKvActionType::ActionReport,
-                hbm(),
-                &["tiered"],
-            )],
-        );
-        let first = b.apply_external_kv_batch(recomputed.clone()).await.unwrap();
-        let replay = b.apply_external_kv_batch(recomputed).await.unwrap();
-        assert!(!first.duplicate);
-        assert!(replay.duplicate);
-
-        let result = b
-            .match_external_kv(match_req(&["tiered"], false))
-            .await
-            .unwrap();
-        assert_eq!(tiers_for(&result, "w1", "tiered"), vec![hbm(), dram()]);
-    }
-);
-
-itest!(cluster_client_recovers_after_master_failover, b, {
-    if std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES").is_err() {
-        eprintln!("skipping cluster failover test outside Redis Cluster");
-        return;
-    }
-    let Ok(hash) = std::env::var("KV_INDEXER_FAILOVER_HASH") else {
-        eprintln!("skipping cluster failover test: set KV_INDEXER_FAILOVER_HASH");
-        return;
-    };
-    let pause_secs = std::env::var("KV_INDEXER_FAILOVER_PAUSE_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(8);
-
+itest!(recomputed_batch_replay_keeps_cpu_copy, b, {
+    // Re-materializing on GPU must not revoke the existing host backup, and
+    // re-delivering the same batch must leave both tiers unchanged because the
+    // individual mutations are idempotent.
     b.apply_external_kv_batch(apply_req(
-        "failover-worker",
+        "w1",
         "a",
         1,
-        vec![action(ExternalKvActionType::ActionReport, hbm(), &[&hash])],
+        vec![action(
+            ExternalKvActionType::ActionReport,
+            dram(),
+            &["tiered"],
+        )],
     ))
     .await
     .unwrap();
-    eprintln!("FAILOVER_READY hash={hash}; stop its Redis master within {pause_secs}s");
-    tokio::time::sleep(std::time::Duration::from_secs(pause_secs)).await;
-
-    // Revoke then report after the external harness has stopped the slot's
-    // original master. This exercises topology refresh, replica promotion,
-    // Lua reload and both forward/reverse writes on the existing client.
-    b.apply_external_kv_batch(apply_req(
-        "failover-worker",
+    let recomputed = apply_req(
+        "w1",
         "a",
         2,
-        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &[&hash])],
-    ))
-    .await
-    .unwrap();
-    b.apply_external_kv_batch(apply_req(
-        "failover-worker",
-        "a",
-        3,
-        vec![action(ExternalKvActionType::ActionReport, hbm(), &[&hash])],
-    ))
-    .await
-    .unwrap();
+        vec![action(
+            ExternalKvActionType::ActionReport,
+            hbm(),
+            &["tiered"],
+        )],
+    );
+    b.apply_external_kv_batch(recomputed.clone()).await.unwrap();
+    b.apply_external_kv_batch(recomputed).await.unwrap();
 
     let result = b
-        .match_external_kv(match_req(&[&hash], false))
+        .match_external_kv(match_req(&["tiered"], false))
         .await
         .unwrap();
-    assert_eq!(tiers_for(&result, "failover-worker", &hash), vec![hbm()]);
+    assert_eq!(tiers_for(&result, "w1", "tiered"), vec![hbm(), dram()]);
 });
 
 itest!(cluster_client_follows_ask_redirect, b, {
@@ -417,29 +345,6 @@ itest!(cluster_client_follows_ask_redirect, b, {
         .await
         .unwrap();
     assert_eq!(tiers_for(&result, "ask-worker", &hash), vec![hbm()]);
-});
-
-itest!(cluster_heartbeat_follows_ask_redirect, b, {
-    if std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES").is_err() {
-        eprintln!("skipping heartbeat ASK test outside Redis Cluster");
-        return;
-    }
-    let Ok(worker) = std::env::var("KV_INDEXER_ASK_HEARTBEAT_WORKER") else {
-        eprintln!("skipping heartbeat ASK test: set KV_INDEXER_ASK_HEARTBEAT_WORKER");
-        return;
-    };
-
-    // The harness migrates the `{w:<worker>}` slot before this call. TOUCH_META
-    // is a multi-key Lua heartbeat in that slot and must follow ASK even when
-    // the importing master has not cached the script.
-    let response = b
-        .apply_external_kv_batch(apply_req_inc(&worker, "a", "ask-heartbeat", 0, vec![]))
-        .await
-        .unwrap();
-    assert!(
-        !response.has_applied_seq,
-        "a fresh heartbeat must not invent a durable event checkpoint"
-    );
 });
 
 itest!(revoke_partial_tier_keeps_other_tier, b, {
@@ -710,347 +615,3 @@ itest!(batch_action_order_is_preserved, b, {
 });
 
 // --- server-side seq gate (durable idempotency) -----------------------------
-
-itest!(duplicate_seq_batch_is_skipped_not_reapplied, b, {
-    // Apply a report at seq=1, then re-send seq=1 carrying a *different*
-    // mutation (a revoke). Because seq=1 was already applied, the whole batch
-    // is a duplicate and must be skipped, so the revoke has no effect.
-    let applied = b
-        .apply_external_kv_batch(apply_req(
-            "w1",
-            "a",
-            1,
-            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(applied.last_applied_seq, 1);
-    assert!(!applied.duplicate);
-
-    let dup = b
-        .apply_external_kv_batch(apply_req(
-            "w1",
-            "a",
-            1,
-            vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-    assert!(dup.duplicate, "re-sent seq must be reported as a duplicate");
-    assert_eq!(dup.last_applied_seq, 1);
-
-    // The revoke was skipped: the hash is still present.
-    let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
-    assert_eq!(tiers_for(&resp, "w1", "1"), vec![hbm()]);
-});
-
-itest!(lower_seq_batch_is_skipped_as_stale, b, {
-    // Advance to seq=5, then a late/out-of-order seq=3 arrives. It must be
-    // treated as stale (<= last) and skipped, leaving the ack at 5.
-    for seq in [1u64, 5] {
-        b.apply_external_kv_batch(apply_req(
-            "w1",
-            "a",
-            seq,
-            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-    }
-    let stale = b
-        .apply_external_kv_batch(apply_req(
-            "w1",
-            "a",
-            3,
-            vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-    assert!(stale.duplicate);
-    assert_eq!(stale.last_applied_seq, 5);
-    let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
-    assert_eq!(tiers_for(&resp, "w1", "1"), vec![hbm()]);
-});
-
-itest!(seq_is_per_worker_independent, b, {
-    // seq counters are independent per worker: the same seq value applied to a
-    // different worker is not a duplicate.
-    let a = b
-        .apply_external_kv_batch(apply_req(
-            "w1",
-            "a",
-            1,
-            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-    let c = b
-        .apply_external_kv_batch(apply_req(
-            "w2",
-            "a",
-            1,
-            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-    assert!(!a.duplicate && !c.duplicate);
-    let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
-    assert_eq!(resp.matches.len(), 2);
-});
-
-// --- worker liveness / stale-entry cleanup ----------------------------------
-
-itest!(
-    stale_worker_is_dropped_from_match_then_revived_by_heartbeat,
-    b,
-    {
-        // Arm a short per-worker TTL so a worker that stops talking expires quickly.
-        let b = b.with_worker_ttl(Some(std::time::Duration::from_secs(1)));
-
-        // Report a block: immediately matchable while the worker is live.
-        b.apply_external_kv_batch(apply_req(
-            "w1",
-            "10.0.0.1:9000",
-            1,
-            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
-        assert_eq!(resp.matches.len(), 1, "live worker must be matchable");
-
-        // Let the worker go silent past its TTL: match must drop it so the router
-        // never targets a dead node, even though placement/reverse entries linger.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
-        assert!(
-            resp.matches.is_empty(),
-            "stale worker must be dropped from match, got {:?}",
-            resp.matches
-        );
-        let resp = b.match_external_kv(match_req(&["1"], true)).await.unwrap();
-        assert!(resp.matches.is_empty());
-        let counts = b
-            .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
-                hashes: hashes(&["1"]),
-            })
-            .await
-            .unwrap();
-        assert!(
-            counts.entries.is_empty(),
-            "a placement held only by dead workers must not count as a returned hit"
-        );
-
-        // A heartbeat (empty-actions apply) refreshes liveness; the placement was
-        // never deleted, so the old block is instantly routable again.
-        b.apply_external_kv_batch(apply_req("w1", "10.0.0.1:9000", 0, vec![]))
-            .await
-            .unwrap();
-        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
-        assert_eq!(
-            tiers_for(&resp, "w1", "1"),
-            vec![hbm()],
-            "heartbeat must revive the worker with its existing placement intact"
-        );
-    }
-);
-
-// --- worker restart / incarnation reset -------------------------------------
-
-itest!(
-    worker_restart_new_incarnation_wipes_stale_state_and_resets_seq,
-    b,
-    {
-        // Incarnation "A": report h1 at seq 5, so the durable seq climbs to 5.
-        b.apply_external_kv_batch(apply_req_inc(
-            "w1",
-            "10.0.0.1:9000",
-            "A",
-            5,
-            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
-        assert_eq!(tiers_for(&resp, "w1", "1"), vec![hbm()]);
-
-        // Same incarnation, a stale/replayed low seq is still skipped as duplicate.
-        let dup = b
-            .apply_external_kv_batch(apply_req_inc(
-                "w1",
-                "10.0.0.1:9000",
-                "A",
-                2,
-                vec![action(ExternalKvActionType::ActionReport, hbm(), &["2"])],
-            ))
-            .await
-            .unwrap();
-        assert!(
-            dup.duplicate,
-            "low seq within same incarnation is a duplicate"
-        );
-
-        // Incarnation "B" (a restart) with a reset sequence (seq 1) reporting a new
-        // block. The restart must: (a) wipe the old placement for h1, (b) reset the
-        // durable seq so seq=1 is accepted (not skipped), (c) index the new block.
-        let after = b
-            .apply_external_kv_batch(apply_req_inc(
-                "w1",
-                "10.0.0.1:9000",
-                "B",
-                1,
-                vec![action(ExternalKvActionType::ActionReport, hbm(), &["9"])],
-            ))
-            .await
-            .unwrap();
-        assert!(
-            !after.duplicate,
-            "restarted worker's reset sequence must be accepted, not skipped"
-        );
-
-        let resp = b
-            .match_external_kv(match_req(&["1", "9"], false))
-            .await
-            .unwrap();
-        assert!(
-            tiers_for(&resp, "w1", "1").is_empty(),
-            "stale block from the previous incarnation must be wiped, got {:?}",
-            resp.matches
-        );
-        assert_eq!(
-            tiers_for(&resp, "w1", "9"),
-            vec![hbm()],
-            "new block from the restarted incarnation must be indexed"
-        );
-    }
-);
-
-itest!(
-    // P1 regression: a worker that expired out of `match` (its liveness TTL
-    // lapsed) and then slow-restarts with a NEW incarnation must still be reset.
-    // The durable meta (and thus the previous incarnation) must survive the TTL
-    // so the restart is detected and the stale placement is wiped — otherwise the
-    // dead incarnation's blocks would resurrect on the heartbeat that revives it.
-    expired_worker_new_incarnation_still_wipes_stale_state,
-    b,
-    {
-        let b = b.with_worker_ttl(Some(std::time::Duration::from_secs(1)));
-
-        // Incarnation "A" reports h1.
-        b.apply_external_kv_batch(apply_req_inc(
-            "w1",
-            "10.0.0.1:9000",
-            "A",
-            5,
-            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-        ))
-        .await
-        .unwrap();
-        assert_eq!(
-            tiers_for(
-                &b.match_external_kv(match_req(&["1"], false)).await.unwrap(),
-                "w1",
-                "1"
-            ),
-            vec![hbm()],
-        );
-
-        // The worker goes silent long enough for its liveness key to expire.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        assert!(
-            b.match_external_kv(match_req(&["1"], false))
-                .await
-                .unwrap()
-                .matches
-                .is_empty(),
-            "expired worker must be dropped from match",
-        );
-
-        // It slow-restarts as incarnation "B" (seq reset to 1) reporting h9. Even
-        // though the liveness key had expired, the durable incarnation "A" is
-        // still recorded, so the restart is detected: h1 is wiped, seq accepted.
-        let after = b
-            .apply_external_kv_batch(apply_req_inc(
-                "w1",
-                "10.0.0.1:9000",
-                "B",
-                1,
-                vec![action(ExternalKvActionType::ActionReport, hbm(), &["9"])],
-            ))
-            .await
-            .unwrap();
-        assert!(
-            !after.duplicate,
-            "restarted worker's reset seq must be accepted"
-        );
-
-        let resp = b
-            .match_external_kv(match_req(&["1", "9"], false))
-            .await
-            .unwrap();
-        assert!(
-            tiers_for(&resp, "w1", "1").is_empty(),
-            "stale block from expired-then-restarted incarnation must be wiped, got {:?}",
-            resp.matches
-        );
-        assert_eq!(tiers_for(&resp, "w1", "9"), vec![hbm()]);
-    }
-);
-
-// --- T5 regression: degraded-start / lazy-connect semantics -----------------
-
-/// A deferred backend (KV_INDEXER_REDIS_REQUIRED=0 path) does not connect at
-/// construction; it connects lazily on first use and serves correctly once the
-/// store is reachable. Requires a live store, so it skips when unset.
-#[tokio::test]
-async fn deferred_backend_connects_lazily_and_serves() {
-    let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
-        eprintln!("skipping deferred_backend_connects_lazily_and_serves: set KV_INDEXER_REDIS_URL");
-        return;
-    };
-    let ns = format!("itest:deferred_serves:{}", nanos());
-    // Construction never touches the network.
-    let b = RedisKvIndexerBackend::connect_single_deferred(&url, ns);
-    // First use lazily establishes the connection and succeeds.
-    b.apply_external_kv_batch(apply_req(
-        "wd",
-        "10.9.9.9:9000",
-        1,
-        vec![action(
-            ExternalKvActionType::ActionReport,
-            hbm(),
-            &["100", "101"],
-        )],
-    ))
-    .await
-    .expect("lazy connect + apply should succeed against a live store");
-    let resp = b
-        .match_external_kv(match_req(&["100", "101"], false))
-        .await
-        .unwrap();
-    assert!(
-        resp.matches.iter().any(|m| m.worker_id == "wd"),
-        "reported hashes must be matchable after a lazy connect"
-    );
-}
-
-/// A deferred backend pointed at an unreachable Redis must fail requests with an
-/// error within a bounded time (connect timeout), never hang. No store needed.
-#[tokio::test]
-async fn deferred_backend_unreachable_errors_within_bound() {
-    let b = RedisKvIndexerBackend::connect_single_deferred(
-        "redis://127.0.0.1:6399",
-        "itest:deferred_dead",
-    );
-    let started = std::time::Instant::now();
-    let res = b.match_external_kv(match_req(&["x"], false)).await;
-    let elapsed = started.elapsed();
-    assert!(
-        res.is_err(),
-        "match against an unreachable redis must error, got {res:?}"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(15),
-        "request must be bounded by the connect timeout, took {elapsed:?}"
-    );
-}

@@ -7,14 +7,11 @@
 //! cloneable and multiplexed, so per-hash operations are issued concurrently
 //! (one connection, many in-flight commands) rather than serialized.
 //!
-//! Connections are established lazily and cached: an eager constructor forces
-//! the first connect (and surfaces its error) for the "Redis is required"
-//! startup path, while a deferred constructor lets the server come up before
-//! Redis is reachable and connect on first use. Every attempt is bounded by a
-//! connection timeout / limited retries so an unreachable Redis can never wedge
-//! startup or a request indefinitely.
+//! Connections are established eagerly at construction so an unreachable Redis
+//! is a startup failure rather than a surprise on the first request. Every
+//! attempt is bounded by a connection timeout / limited retries so an
+//! unreachable Redis can never wedge startup or a request indefinitely.
 
-use std::sync::Mutex;
 use std::time::Duration;
 
 use redis::{
@@ -115,57 +112,23 @@ pub(crate) trait RedisConn: Send + Sync + 'static {
     ) -> RedisResult<Value>;
 }
 
-/// Single Redis/Dragonfly instance via an auto-reconnecting multiplexed manager,
-/// established lazily so the server can start before Redis is reachable.
+/// Single Redis/Dragonfly instance via an auto-reconnecting multiplexed manager.
 pub(crate) struct SingleConn {
-    url: String,
-    conn: Mutex<Option<redis::aio::ConnectionManager>>,
+    conn: redis::aio::ConnectionManager,
 }
 
 impl SingleConn {
-    /// Eager: force the first connect now, surfacing any error (used when Redis
-    /// is a required dependency and we want a fast, loud startup failure).
     pub(crate) async fn connect(url: &str) -> RedisResult<Self> {
-        let this = Self::deferred(url);
-        this.manager().await?;
-        Ok(this)
-    }
-
-    /// Deferred: hold only the target; connect on first use. Never fails here,
-    /// so the server can start degraded and self-heal once Redis is up.
-    pub(crate) fn deferred(url: &str) -> Self {
-        Self {
-            url: url.to_string(),
-            conn: Mutex::new(None),
-        }
-    }
-
-    fn cached(&self) -> Option<redis::aio::ConnectionManager> {
-        self.conn.lock().unwrap().clone()
-    }
-
-    /// Returns the cached manager or builds one. The (async) build happens
-    /// without holding the lock; a lost race just drops the redundant manager.
-    async fn manager(&self) -> RedisResult<redis::aio::ConnectionManager> {
-        if let Some(c) = self.cached() {
-            return Ok(c);
-        }
-        let client = redis::Client::open(self.url.as_str())?;
-        let built =
-            redis::aio::ConnectionManager::new_with_config(client, manager_config()).await?;
-        let mut guard = self.conn.lock().unwrap();
-        if let Some(existing) = guard.clone() {
-            return Ok(existing);
-        }
-        *guard = Some(built.clone());
-        Ok(built)
+        let client = redis::Client::open(url)?;
+        let conn = redis::aio::ConnectionManager::new_with_config(client, manager_config()).await?;
+        Ok(Self { conn })
     }
 }
 
 #[tonic::async_trait]
 impl RedisConn for SingleConn {
     async fn query(&self, cmd: Cmd) -> RedisResult<Value> {
-        let mut c = self.manager().await?;
+        let mut c = self.conn.clone();
         cmd.query_async(&mut c).await
     }
 
@@ -175,7 +138,7 @@ impl RedisConn for SingleConn {
         keys: Vec<String>,
         args: Vec<String>,
     ) -> RedisResult<Value> {
-        let mut c = self.manager().await?;
+        let mut c = self.conn.clone();
         let mut inv = script.prepare_invoke();
         for k in &keys {
             inv.key(k.as_str());
@@ -188,42 +151,19 @@ impl RedisConn for SingleConn {
     }
 }
 
-/// Redis Cluster via the async cluster connection. MOVED/ASK redirects and slot
-/// map refresh are handled by the client; each command/script is routed by key.
-/// Established lazily and bounded by a connect timeout, mirroring `SingleConn`.
+/// Redis Cluster via the async cluster connection. MOVED redirects and slot map
+/// refresh are handled by the client; ASK redirects during slot migration are
+/// followed explicitly in [`ClusterConn::invoke`], since a script invocation must
+/// be preceded by `ASKING` on the importing node.
 pub(crate) struct ClusterConn {
     nodes: Vec<String>,
-    conn: Mutex<Option<redis::cluster_async::ClusterConnection>>,
+    conn: redis::cluster_async::ClusterConnection,
 }
 
 impl ClusterConn {
     pub(crate) async fn connect(nodes: Vec<String>) -> RedisResult<Self> {
-        let this = Self::deferred(nodes);
-        this.connection().await?;
-        Ok(this)
-    }
-
-    pub(crate) fn deferred(nodes: Vec<String>) -> Self {
-        Self {
-            nodes,
-            conn: Mutex::new(None),
-        }
-    }
-
-    fn cached(&self) -> Option<redis::cluster_async::ClusterConnection> {
-        self.conn.lock().unwrap().clone()
-    }
-
-    fn invalidate(&self) {
-        *self.conn.lock().unwrap() = None;
-    }
-
-    async fn connection(&self) -> RedisResult<redis::cluster_async::ClusterConnection> {
-        if let Some(c) = self.cached() {
-            return Ok(c);
-        }
-        let client = redis::cluster::ClusterClient::new(self.nodes.clone())?;
-        let built = match tokio::time::timeout(
+        let client = redis::cluster::ClusterClient::new(nodes.clone())?;
+        let conn = match tokio::time::timeout(
             CLUSTER_CONNECT_TIMEOUT,
             client.get_async_connection(),
         )
@@ -237,12 +177,7 @@ impl ClusterConn {
                 )))
             }
         };
-        let mut guard = self.conn.lock().unwrap();
-        if let Some(existing) = guard.clone() {
-            return Ok(existing);
-        }
-        *guard = Some(built.clone());
-        Ok(built)
+        Ok(Self { nodes, conn })
     }
 
     async fn invoke_ask(
@@ -278,14 +213,10 @@ impl ClusterConn {
 #[tonic::async_trait]
 impl RedisConn for ClusterConn {
     async fn query(&self, cmd: Cmd) -> RedisResult<Value> {
-        let mut c = self.connection().await?;
-        match tokio::time::timeout(RESPONSE_TIMEOUT, cmd.query_async(&mut c)).await {
-            Ok(result) => result,
-            Err(_) => {
-                self.invalidate();
-                Err(response_timeout_error())
-            }
-        }
+        let mut c = self.conn.clone();
+        tokio::time::timeout(RESPONSE_TIMEOUT, cmd.query_async(&mut c))
+            .await
+            .map_err(|_| response_timeout_error())?
     }
 
     async fn invoke(

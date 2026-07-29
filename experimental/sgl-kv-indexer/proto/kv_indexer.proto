@@ -42,36 +42,25 @@ message ExternalKvAction {
 
 message ApplyExternalKvBatchRequest {
   string worker_id = 1;
-  // The SGLang batch sequence number, monotonic per worker. The indexer stores
-  // the last applied seq per worker and uses it as an idempotency key: a batch
-  // whose seq is <= the stored value is treated as a duplicate and skipped.
+  // The SGLang batch sequence number, monotonic per worker. Carried for
+  // observability only: this build applies every batch it receives and does not
+  // deduplicate, fence, or checkpoint on it.
   uint64 seq = 2;
   repeated ExternalKvAction actions = 3;
   // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
   // Supplied by the bridge; may be empty, in which case matches for this worker
   // carry an empty address.
   string worker_address = 4;
-  // Opaque per-lifetime token identifying the worker's current incarnation
-  // (e.g. bridge process start id). When it changes for a worker, the indexer
-  // treats it as a restart: it wipes that worker's stale placement/reverse
-  // entries and resets its durable seq, so the fresh (restarted-from-zero)
-  // sequence is accepted instead of being skipped as a duplicate. Empty
-  // disables the behavior (backward compatible).
-  string incarnation = 5;
+
+  // Field 5 held the worker incarnation token used for restart fencing.
+  reserved 5;
 }
 
+// Deliberately empty: applies are unconditional, so there is nothing to report
+// back. Kept as a message so the RPC signature stays stable.
 message ApplyExternalKvBatchResponse {
-  // The worker's durable last-applied seq after this call. For an applied batch
-  // this equals the request seq; for a duplicate it is the previously stored
-  // (higher-or-equal) seq. The bridge uses `last_applied_seq + 1` as the next
-  // expected seq so it can resume correctly after a restart.
-  uint64 last_applied_seq = 1;
-  // True when the batch was skipped because its seq was already applied.
-  bool duplicate = 2;
-  // False only when this worker incarnation has not committed any event batch
-  // yet. Heartbeat callers use this to distinguish a real durable seq=0 from
-  // the empty checkpoint of a fresh incarnation.
-  bool has_applied_seq = 3;
+  // Fields 1-3 held the durable seq checkpoint and duplicate flag.
+  reserved 1, 2, 3;
 }
 
 message TierHashes {

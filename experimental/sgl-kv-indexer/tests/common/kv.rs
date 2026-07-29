@@ -36,6 +36,5 @@ pub fn apply_request(
         seq,
         actions,
         worker_address: address.to_string(),
-        incarnation: String::new(),
     }
 }

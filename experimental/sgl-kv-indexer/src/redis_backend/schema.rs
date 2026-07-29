@@ -13,8 +13,7 @@
 //! (TierType HBM=1, DRAM=2, SSD=3). The bitmask is manipulated with plain integer
 //! arithmetic in Lua so the scripts run unchanged on Redis, Dragonfly and Valkey.
 
-/// Placement key for a block hash: HASH of
-/// `worker_id -> "<generation>:<tier bitmask>"`.
+/// Placement key for a block hash: HASH of `worker_id -> tier bitmask`.
 pub fn placement_key(ns: &str, hash: &str) -> String {
     format!("{ns}:{{{hash}}}:p")
 }
@@ -24,16 +23,14 @@ pub fn hit_key(ns: &str, hash: &str) -> String {
     format!("{ns}:{{{hash}}}:h")
 }
 
-/// Reverse index for a worker: SET of `"<generation>:<hash>"` members. Legacy
-/// plain hash members are generation zero.
+/// Reverse index for a worker: SET of block hashes it currently holds.
 pub fn worker_blocks_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:blocks")
 }
 
-/// Durable registry for a worker: HASH with fields `addr`, `seq`,
-/// `incarnation`, `generation`, `reset_pending`, `live_until_ms`, and
-/// `retired:<incarnation>`. Never expires. Keeping worker metadata in one key
-/// lets heartbeat Lua remain valid during Redis Cluster slot migration.
+/// Registry for a worker: HASH with a single `addr` field, used to populate the
+/// routing address in match responses. Never expires — this build does not track
+/// worker liveness.
 pub fn worker_meta_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:meta")
 }

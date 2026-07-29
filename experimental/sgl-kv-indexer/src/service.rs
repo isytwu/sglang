@@ -25,10 +25,8 @@ const MAX_ACTIONS_PER_BATCH: usize = 256;
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
-    /// must be applied in order. `seq` is a per-worker monotonic idempotency
-    /// key: a durable backend stores the last applied seq per worker, skips a
-    /// batch whose seq was already applied (a duplicate), and reports its
-    /// durable position back in [`ApplyExternalKvBatchResponse::last_applied_seq`].
+    /// must be applied in order. Applies are unconditional: the request `seq` is
+    /// informational only and a redelivered batch is applied again.
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
@@ -43,13 +41,6 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
         &self,
         request: GetExternalKvHitCountsRequest,
     ) -> Result<GetExternalKvHitCountsResponse, Status>;
-
-    /// Readiness probe: `true` when the backend can serve requests. Stateless
-    /// backends are always ready; a durable backend (Redis) overrides this to
-    /// reflect store connectivity so the gRPC health service can report it.
-    async fn health(&self) -> bool {
-        true
-    }
 }
 
 /// Blanket impl so the server can hold the selected backend as
@@ -75,10 +66,6 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
         request: GetExternalKvHitCountsRequest,
     ) -> Result<GetExternalKvHitCountsResponse, Status> {
         (**self).get_external_kv_hit_counts(request).await
-    }
-
-    async fn health(&self) -> bool {
-        (**self).health().await
     }
 }
 
@@ -167,9 +154,9 @@ fn validate_tier(tier: i32) -> Result<(), Status> {
 }
 
 fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
-    // An empty actions list is a valid heartbeat: it carries no mutation and
-    // simply refreshes the worker's liveness on the server. Non-empty batches
-    // still have every action validated below.
+    // An empty actions list is accepted and applied as a no-op; it only refreshes
+    // the worker's recorded address. Non-empty batches still have every action
+    // validated below.
     if actions.len() > MAX_ACTIONS_PER_BATCH {
         return Err(Status::resource_exhausted(format!(
             "batch contains {} actions; maximum is {MAX_ACTIONS_PER_BATCH}",
@@ -215,8 +202,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_actions_allows_empty_as_heartbeat() {
-        // An empty batch is a liveness heartbeat, not an error.
+    fn validate_actions_allows_empty_batch() {
+        // An empty batch carries no mutation but is not an error.
         assert!(validate_actions(&[]).is_ok());
     }
 

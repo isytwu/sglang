@@ -132,7 +132,7 @@ jobs:
         run: cargo test --features redis-backend
 
   redis-cluster:
-    name: Redis Cluster redirects and failover
+    name: Redis Cluster routing and ASK redirects
     needs: gate
     if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
@@ -182,57 +182,23 @@ jobs:
       - name: Run full Redis Cluster integration suite
         run: cargo test --features redis-backend --test redis_integration -- --test-threads=1
 
+      # Only ASK redirects are exercised here. This build has no fault tolerance,
+      # so there is nothing to assert about master failover.
+
       - name: Exercise ASK redirect
         run: |
           set -euo pipefail
-          slot=$(docker exec kvidx-c1 redis-cli cluster keyslot failover-hash)
+          slot=$(docker exec kvidx-c1 redis-cli cluster keyslot ask-hash)
           source_id=$(docker exec kvidx-c1 redis-cli cluster myid)
           target_id=$(docker exec kvidx-c2 redis-cli cluster myid)
           docker exec kvidx-c1 redis-cli cluster setslot "$slot" migrating "$target_id"
           docker exec kvidx-c2 redis-cli cluster setslot "$slot" importing "$source_id"
-          KV_INDEXER_ASK_HASH=failover-hash \
+          KV_INDEXER_ASK_HASH=ask-hash \
             cargo test --features redis-backend --test redis_integration \
               cluster_client_follows_ask_redirect -- --exact --nocapture --test-threads=1
           for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
           docker exec kvidx-c1 redis-cli cluster setslot "$slot" stable
           docker exec kvidx-c2 redis-cli cluster setslot "$slot" stable
-
-          worker=ask-heartbeat-worker
-          slot=$(docker exec kvidx-c1 redis-cli cluster keyslot "{w:$worker}")
-          if (( slot <= 5460 )); then
-            source=kvidx-c1
-            target=kvidx-c2
-          elif (( slot <= 10922 )); then
-            source=kvidx-c2
-            target=kvidx-c3
-          else
-            source=kvidx-c3
-            target=kvidx-c1
-          fi
-          source_id=$(docker exec "$source" redis-cli cluster myid)
-          target_id=$(docker exec "$target" redis-cli cluster myid)
-          docker exec "$source" redis-cli cluster setslot "$slot" migrating "$target_id"
-          docker exec "$target" redis-cli cluster setslot "$slot" importing "$source_id"
-          KV_INDEXER_ASK_HEARTBEAT_WORKER="$worker" \
-            cargo test --features redis-backend --test redis_integration \
-              cluster_heartbeat_follows_ask_redirect -- --exact --nocapture --test-threads=1
-          for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
-          docker exec "$source" redis-cli cluster setslot "$slot" stable
-          docker exec "$target" redis-cli cluster setslot "$slot" stable
-
-      - name: Exercise master failover on existing client
-        run: |
-          set -euo pipefail
-          cargo test --features redis-backend --test redis_integration --no-run
-          KV_INDEXER_FAILOVER_HASH=failover-hash \
-          KV_INDEXER_FAILOVER_PAUSE_SECS=12 \
-            cargo test --features redis-backend --test redis_integration \
-              cluster_client_recovers_after_master_failover \
-              -- --exact --nocapture --test-threads=1 &
-          test_pid=$!
-          sleep 3
-          docker stop kvidx-c1
-          wait "$test_pid"
 
       - name: Clean up Redis Cluster
         if: always()
