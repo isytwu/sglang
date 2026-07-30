@@ -21,7 +21,7 @@ pub mod redis_backend;
 pub use client::{
     GrpcPrefixIndex, NoSignalReason, PrefixIndex, PrefixIndexConfig, PrefixMatch, PrefixOutcome,
 };
-pub use service::{KvIndexerBackend, KvIndexerService};
+pub use service::{BlockComponents, KvIndexerBackend, KvIndexerService, WorkerPrefixInput};
 pub use shutdown::shutdown_signal;
 
 #[cfg(feature = "redis-backend")]

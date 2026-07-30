@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
+    ApplyExternalKvBatchRequest, ComponentSet, ExternalKvAction, ExternalKvActionType, TierType,
 };
 
 pub fn hbm() -> i32 {
@@ -22,6 +22,31 @@ pub fn action(kind: ExternalKvActionType, tier: i32, values: &[&str]) -> Externa
         r#type: kind as i32,
         tier,
         hashes: hashes(values),
+        component_sets: Vec::new(),
+        block_sizes: Vec::new(),
+    }
+}
+
+/// A component-aware REPORT action: each hash carries its component set and token
+/// count, index-aligned with `values`.
+#[allow(dead_code)] // used by redis_integration, not grpc_contract
+pub fn component_report(
+    tier: i32,
+    values: &[&str],
+    components: &[&[&str]],
+    block_sizes: &[u32],
+) -> ExternalKvAction {
+    ExternalKvAction {
+        r#type: ExternalKvActionType::ActionReport as i32,
+        tier,
+        hashes: hashes(values),
+        component_sets: components
+            .iter()
+            .map(|set| ComponentSet {
+                components: set.iter().map(|c| c.to_string()).collect(),
+            })
+            .collect(),
+        block_sizes: block_sizes.to_vec(),
     }
 }
 
@@ -36,5 +61,6 @@ pub fn apply_request(
         seq,
         actions,
         worker_address: address.to_string(),
+        cache_spec: None,
     }
 }

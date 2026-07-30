@@ -21,13 +21,14 @@ mod test_id;
 mod test_kv;
 
 use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ComponentRule, ExternalKvActionType,
     GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest,
-    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, MatchRule,
+    WorkerCacheSpec,
 };
-use sgl_kv_indexer::{KvIndexerBackend, RedisKvIndexerBackend};
+use sgl_kv_indexer::{KvIndexerBackend, RedisKvIndexerBackend, WorkerPrefixInput};
 use test_id::nanos;
-use test_kv::{action, apply_request as apply_req, dram, hashes, hbm};
+use test_kv::{action, apply_request as apply_req, component_report, dram, hashes, hbm};
 use tonic::Status;
 
 /// Builds a backend against the configured store with a unique namespace, or
@@ -647,6 +648,16 @@ impl KvIndexerBackend for DefaultViaRedis {
         self.0.match_external_kv(request).await
     }
 
+    // Delegate the component-aware read to Redis so the trait-default
+    // `match_external_kv_prefix` computes over the same placement + specs the
+    // fast path sees — the parity contract covers component-aware data too.
+    async fn collect_worker_prefix_inputs(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<WorkerPrefixInput>, Status> {
+        self.0.collect_worker_prefix_inputs(hashes).await
+    }
+
     async fn get_external_kv_hit_counts(
         &self,
         request: GetExternalKvHitCountsRequest,
@@ -812,4 +823,203 @@ async fn prefix_max_blocks_caps_the_scan() {
     assert_eq!(resp.blocks_read, 2);
     assert_eq!(resp.matches.len(), 1);
     assert_eq!(resp.matches[0].matched_prefix_blocks, 2);
+}
+
+// --- component-aware placement & prefix -------------------------------------
+
+/// A hybrid-SWA spec: full is contiguous, swa is a 100-token trailing window,
+/// both servable from HBM.
+fn swa_spec() -> WorkerCacheSpec {
+    WorkerCacheSpec {
+        version: 1,
+        components: vec![
+            ComponentRule {
+                name: "full".to_string(),
+                rule: MatchRule::RuleContiguous as i32,
+                window_tokens: 0,
+                available_tiers: vec![hbm(), dram()],
+            },
+            ComponentRule {
+                name: "swa".to_string(),
+                rule: MatchRule::RuleTrailingWindow as i32,
+                window_tokens: 100,
+                available_tiers: vec![hbm()],
+            },
+        ],
+    }
+}
+
+fn apply_with_spec(
+    worker: &str,
+    addr: &str,
+    seq: u64,
+    spec: WorkerCacheSpec,
+    actions: Vec<sgl_kv_indexer::pb::ExternalKvAction>,
+) -> ApplyExternalKvBatchRequest {
+    let mut req = apply_req(worker, addr, seq, actions);
+    req.cache_spec = Some(spec);
+    req
+}
+
+#[tokio::test]
+async fn component_prefix_matches_default_impl() {
+    let Some((fast, reference)) = shared_ns_pair("component_parity").await else {
+        return;
+    };
+    let reference = DefaultViaRedis(reference);
+
+    // Four full blocks (50 tokens each); swa present on all but the 4th, so the
+    // largest boundary with an unbroken 100-token swa window is 3.
+    let report = component_report(
+        hbm(),
+        &["a", "b", "c", "d"],
+        &[
+            &["full", "swa"],
+            &["full", "swa"],
+            &["full", "swa"],
+            &["full"],
+        ],
+        &[50, 50, 50, 50],
+    );
+    fast.apply_external_kv_batch(apply_with_spec(
+        "w-swa",
+        "10.0.0.1:1",
+        1,
+        swa_spec(),
+        vec![report],
+    ))
+    .await
+    .unwrap();
+
+    let query = ["a", "b", "c", "d"];
+    let fast_resp = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let ref_resp = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+
+    assert_eq!(prefix_pairs(&fast_resp), prefix_pairs(&ref_resp));
+    assert_eq!(fast_resp.best_prefix_blocks, ref_resp.best_prefix_blocks);
+    assert_eq!(prefix_pairs(&fast_resp), vec![("w-swa".to_string(), 3)]);
+}
+
+#[tokio::test]
+async fn partial_eviction_replace_shrinks_component_set() {
+    let Some(b) = backend("component_replace").await else {
+        return;
+    };
+    // Store full+swa, then restate to full-only (partial swa eviction) via a
+    // REPLACE snapshot for the same (hash, tier). No BlockRemoved is involved.
+    b.apply_external_kv_batch(apply_with_spec(
+        "w1",
+        "10.0.0.1:1",
+        1,
+        swa_spec(),
+        vec![component_report(
+            hbm(),
+            &["a", "b"],
+            &[&["full", "swa"], &["full", "swa"]],
+            &[80, 80],
+        )],
+    ))
+    .await
+    .unwrap();
+    // Both blocks reusable (window 100 met by 2x80 tokens; head rule also holds).
+    let before = b
+        .match_external_kv_prefix(prefix_req(&["a", "b"]))
+        .await
+        .unwrap();
+    assert_eq!(before.best_prefix_blocks, 2);
+
+    // Restate block "b" to full only: swa gone there.
+    b.apply_external_kv_batch(apply_with_spec(
+        "w1",
+        "10.0.0.1:1",
+        2,
+        swa_spec(),
+        vec![component_report(hbm(), &["b"], &[&["full"]], &[80])],
+    ))
+    .await
+    .unwrap();
+    // "b" has no swa now, and its trailing window (only 80 < 100) is not headed,
+    // so the largest valid boundary drops to 1.
+    let after = b
+        .match_external_kv_prefix(prefix_req(&["a", "b"]))
+        .await
+        .unwrap();
+    assert_eq!(after.best_prefix_blocks, 1);
+}
+
+#[tokio::test]
+async fn revoking_one_tier_keeps_other_tiers() {
+    let Some(b) = backend("tier_independence").await else {
+        return;
+    };
+    // Report the same hash at HBM and DRAM, then revoke only HBM.
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "10.0.0.1:1",
+        1,
+        vec![
+            action(ExternalKvActionType::ActionReport, hbm(), &["a"]),
+            action(ExternalKvActionType::ActionReport, dram(), &["a"]),
+        ],
+    ))
+    .await
+    .unwrap();
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "10.0.0.1:1",
+        2,
+        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["a"])],
+    ))
+    .await
+    .unwrap();
+
+    // The block still exists at DRAM only.
+    let resp = b
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: hashes(&["a"]),
+            count_as_hit: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.matches.len(), 1);
+    let tiers: Vec<i32> = resp.matches[0]
+        .hashes_by_tier
+        .iter()
+        .map(|t| t.tier)
+        .collect();
+    assert_eq!(tiers, vec![dram()]);
+}
+
+#[tokio::test]
+async fn component_aware_worker_without_spec_is_excluded() {
+    let Some(b) = backend("no_spec_excluded").await else {
+        return;
+    };
+    // Report component-aware placement but never send a spec: the worker cannot
+    // be interpreted and must be excluded (NoSignal-safe), never over-reported.
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "10.0.0.1:1",
+        1,
+        vec![component_report(
+            hbm(),
+            &["a", "b"],
+            &[&["full"], &["full"]],
+            &[16, 16],
+        )],
+    ))
+    .await
+    .unwrap();
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["a", "b"]))
+        .await
+        .unwrap();
+    assert!(resp.matches.is_empty());
+    assert_eq!(resp.best_prefix_blocks, 0);
 }

@@ -1,16 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use tonic::{Request, Response, Status};
 
 use crate::pb::kv_indexer_server::KvIndexer;
 use crate::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ComponentRule, ExternalKvAction,
     ExternalKvActionType, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
     GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse,
+    MatchExternalKvRequest, MatchExternalKvResponse, MatchRule, TierType, WorkerCacheSpec,
 };
 
 /// Protocol-level resource bounds. The Redis backend additionally chunks its
@@ -40,18 +40,40 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
         request: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status>;
 
-    /// Answers, per worker, the longest contiguous request prefix it holds.
+    /// Collects the per-worker, per-block component placement needed to compute a
+    /// prefix, aligned with `hashes`.
+    ///
+    /// The default implementation is component-blind: it composes
+    /// `match_external_kv` and treats every held block as a legacy whole-block
+    /// placement (no components, no size, no spec). Component-aware backends
+    /// override it to attach each worker's `WorkerCacheSpec` and the resident
+    /// component set per `(hash, tier)`.
+    async fn collect_worker_prefix_inputs(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<WorkerPrefixInput>, Status> {
+        let matched = self
+            .match_external_kv(MatchExternalKvRequest {
+                hashes: hashes.to_vec(),
+                count_as_hit: false,
+            })
+            .await?;
+        Ok(legacy_inputs_from_match(hashes, &matched))
+    }
+
+    /// Answers, per worker, the longest reusable request prefix it holds.
     ///
     /// This default implementation *is* the written definition of the prefix
-    /// semantics: it composes `match_external_kv` and walks each worker's
-    /// matched set in request order, so any backend that overrides it for
-    /// performance must stay field-for-field identical (except `blocks_read`,
-    /// which is observability, not semantics).
+    /// semantics: it collects each worker's component placement (see
+    /// [`KvIndexerBackend::collect_worker_prefix_inputs`]) and runs the shared
+    /// rule engine ([`compute_prefix_response`]), so any backend that overrides
+    /// it for performance must stay field-for-field identical (except
+    /// `blocks_read`, which is observability, not semantics).
     ///
-    /// The semantics are deliberately stricter than `sgl-router`'s in-process
-    /// `HashTree::match_prefix`: a worker's prefix stops at the first block it is
-    /// missing, so the indexer never reports a worker as holding a prefix it
-    /// cannot actually serve. It can only under-report, never over-report.
+    /// The result is a safe lower bound of what the worker can actually reuse: a
+    /// component-aware match applies each required component's rule (contiguous /
+    /// trailing-window / exact-boundary), so the indexer can only under-report,
+    /// never over-report, whenever its index state is accurate.
     async fn match_external_kv_prefix(
         &self,
         request: MatchExternalKvPrefixRequest,
@@ -61,18 +83,9 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
         if hashes.is_empty() {
             return Ok(MatchExternalKvPrefixResponse::default());
         }
-        let matched = self
-            .match_external_kv(MatchExternalKvRequest {
-                hashes: hashes.clone(),
-                count_as_hit: false,
-            })
-            .await?;
         // The default path reads placement for every considered block.
-        Ok(build_prefix_response(
-            &hashes,
-            &matched,
-            hashes.len() as u32,
-        ))
+        let inputs = self.collect_worker_prefix_inputs(&hashes).await?;
+        Ok(compute_prefix_response(&inputs, hashes.len() as u32))
     }
 
     async fn get_external_kv_hit_counts(
@@ -97,6 +110,13 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
         request: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status> {
         (**self).match_external_kv(request).await
+    }
+
+    async fn collect_worker_prefix_inputs(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<WorkerPrefixInput>, Status> {
+        (**self).collect_worker_prefix_inputs(hashes).await
     }
 
     async fn match_external_kv_prefix(
@@ -251,42 +271,210 @@ pub(crate) fn prefix_limit(len: usize, max_blocks: u32) -> usize {
     }
 }
 
-/// Derives the prefix response from a `MatchExternalKv` result — the semantic
-/// definition consumed by the trait default implementation. Each worker's prefix
-/// is the run of leading `hashes` it holds contiguously; the walk stops at the
-/// first missing block.
-pub(crate) fn build_prefix_response(
+/// Tiers the indexer treats as servable when deciding a component is reusable.
+/// V1: HBM (device) and DRAM (load-backable host); SSD is not counted.
+const SERVABLE_TIERS: [i32; 2] = [TierType::TierHbm as i32, TierType::TierDram as i32];
+
+/// The resident KV components for one block at one worker, per tier, plus the
+/// block's token count (used to accumulate trailing windows).
+#[derive(Debug, Clone)]
+pub struct BlockComponents {
+    pub token_count: u32,
+    /// `(tier, components)` for every tier at which the worker holds the block.
+    /// A legacy whole-block placement carries an empty component list.
+    pub tier_components: Vec<(i32, Vec<String>)>,
+}
+
+/// Everything the prefix rule engine needs about one candidate worker: its
+/// routing identity, its (optional) component spec, and, aligned with the query
+/// hashes, the block placement (`None` for a block the worker does not hold).
+#[derive(Debug, Clone)]
+pub struct WorkerPrefixInput {
+    pub worker_id: String,
+    pub address: String,
+    pub spec: Option<WorkerCacheSpec>,
+    pub blocks: Vec<Option<BlockComponents>>,
+}
+
+/// Builds component-blind (legacy) prefix inputs from a `MatchExternalKv` result.
+/// Each block the worker holds becomes a whole-block placement with no
+/// components, no size and no spec — reproducing the pre-component behaviour.
+pub(crate) fn legacy_inputs_from_match(
     hashes: &[String],
     matched: &MatchExternalKvResponse,
-    blocks_read: u32,
-) -> MatchExternalKvPrefixResponse {
-    let entries = matched
+) -> Vec<WorkerPrefixInput> {
+    matched
         .matches
         .iter()
-        .filter_map(|node| {
+        .map(|node| {
+            let mut tiers_by_hash: HashMap<&str, Vec<i32>> = HashMap::new();
+            for tier in &node.hashes_by_tier {
+                for hash in &tier.hashes {
+                    tiers_by_hash
+                        .entry(hash.as_str())
+                        .or_default()
+                        .push(tier.tier);
+                }
+            }
+            let blocks = hashes
+                .iter()
+                .map(|hash| {
+                    tiers_by_hash
+                        .get(hash.as_str())
+                        .map(|tiers| BlockComponents {
+                            token_count: 0,
+                            tier_components: tiers.iter().map(|tier| (*tier, Vec::new())).collect(),
+                        })
+                })
+                .collect();
+            WorkerPrefixInput {
+                worker_id: node.worker_id.clone(),
+                address: node.address.clone(),
+                spec: None,
+                blocks,
+            }
+        })
+        .collect()
+}
+
+/// Runs the component-aware rule engine over each worker and assembles the
+/// response. This is the single definition of the prefix semantics; every
+/// backend feeds the same engine so fast paths cannot drift from it.
+pub(crate) fn compute_prefix_response(
+    inputs: &[WorkerPrefixInput],
+    blocks_read: u32,
+) -> MatchExternalKvPrefixResponse {
+    let entries = inputs
+        .iter()
+        .filter_map(|worker| {
             // An empty address is unroutable for the router (see the proto's
             // worker_address contract); drop it rather than report a match it
             // can never intersect.
-            if node.address.is_empty() {
+            if worker.address.is_empty() {
                 return None;
             }
-            let held: HashSet<&str> = node
-                .hashes_by_tier
-                .iter()
-                .flat_map(|tier| tier.hashes.iter().map(String::as_str))
-                .collect();
-            let mut prefix = 0u32;
-            for hash in hashes {
-                if held.contains(hash.as_str()) {
-                    prefix += 1;
-                } else {
-                    break;
-                }
-            }
-            (prefix > 0).then(|| (node.worker_id.clone(), node.address.clone(), prefix))
+            let prefix = compute_worker_prefix(worker.spec.as_ref(), &worker.blocks);
+            (prefix > 0).then(|| (worker.worker_id.clone(), worker.address.clone(), prefix))
         })
         .collect();
     assemble_prefix_response(entries, blocks_read)
+}
+
+/// The reusable prefix length for one worker: a safe lower bound on what it can
+/// serve. Returns 0 (the worker is excluded) when a component-aware store lacks a
+/// spec or the spec carries an unusable rule.
+pub(crate) fn compute_worker_prefix(
+    spec: Option<&WorkerCacheSpec>,
+    blocks: &[Option<BlockComponents>],
+) -> u32 {
+    match spec {
+        // No spec: a worker that reports components but declares no rules cannot
+        // be interpreted safely, so it is excluded. A purely legacy worker keeps
+        // the whole-block contiguous prefix (unchanged behaviour).
+        None => {
+            if blocks_carry_components(blocks) {
+                0
+            } else {
+                legacy_contiguous_prefix(blocks)
+            }
+        }
+        Some(spec) if spec.components.is_empty() => legacy_contiguous_prefix(blocks),
+        Some(spec) => component_aware_prefix(spec, blocks),
+    }
+}
+
+/// The count of leading blocks the worker holds (the legacy whole-block prefix).
+fn legacy_contiguous_prefix(blocks: &[Option<BlockComponents>]) -> u32 {
+    blocks.iter().take_while(|block| block.is_some()).count() as u32
+}
+
+/// Whether any held block carries a non-empty component set — the signal that a
+/// worker is reporting component-aware placement.
+fn blocks_carry_components(blocks: &[Option<BlockComponents>]) -> bool {
+    blocks.iter().flatten().any(|block| {
+        block
+            .tier_components
+            .iter()
+            .any(|(_, components)| !components.is_empty())
+    })
+}
+
+/// The largest boundary `N` such that every required component's rule holds.
+fn component_aware_prefix(spec: &WorkerCacheSpec, blocks: &[Option<BlockComponents>]) -> u32 {
+    // A rule the engine cannot evaluate makes the worker unsafe to interpret.
+    for rule in &spec.components {
+        match MatchRule::try_from(rule.rule) {
+            Ok(MatchRule::RuleContiguous) | Ok(MatchRule::RuleExactBoundary) => {}
+            Ok(MatchRule::RuleTrailingWindow) if rule.window_tokens > 0 => {}
+            _ => return 0,
+        }
+    }
+    let mut best = 0u32;
+    for n in 1..=blocks.len() {
+        if spec
+            .components
+            .iter()
+            .all(|rule| component_valid_at(rule, blocks, n))
+        {
+            best = n as u32;
+        }
+    }
+    best
+}
+
+/// Whether component `rule` admits the boundary at block count `n`.
+fn component_valid_at(rule: &ComponentRule, blocks: &[Option<BlockComponents>], n: usize) -> bool {
+    match MatchRule::try_from(rule.rule) {
+        Ok(MatchRule::RuleContiguous) => blocks[..n]
+            .iter()
+            .all(|block| component_available(rule, block)),
+        Ok(MatchRule::RuleExactBoundary) => component_available(rule, &blocks[n - 1]),
+        Ok(MatchRule::RuleTrailingWindow) => trailing_window_valid(rule, blocks, n),
+        _ => false,
+    }
+}
+
+/// A trailing-window component is valid at boundary `n` when the contiguous run
+/// of that component ending at block `n-1` covers at least `window_tokens`
+/// tokens, or reaches the very first block (an unbounded head is always valid,
+/// matching the unified cache's window accumulator seeded at infinity).
+fn trailing_window_valid(
+    rule: &ComponentRule,
+    blocks: &[Option<BlockComponents>],
+    n: usize,
+) -> bool {
+    let window = rule.window_tokens as u64;
+    let mut accumulated = 0u64;
+    for index in (0..n).rev() {
+        if !component_available(rule, &blocks[index]) {
+            return false;
+        }
+        accumulated += blocks[index]
+            .as_ref()
+            .map(|block| block.token_count as u64)
+            .unwrap_or(0);
+        if accumulated >= window {
+            return true;
+        }
+        // Reached the head of the request with an unbroken run.
+        if index == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the component named by `rule` is resident on `block` at any tier that
+/// is both declared servable by the rule and servable by the indexer.
+fn component_available(rule: &ComponentRule, block: &Option<BlockComponents>) -> bool {
+    let Some(block) = block else {
+        return false;
+    };
+    block.tier_components.iter().any(|(tier, components)| {
+        SERVABLE_TIERS.contains(tier)
+            && rule.available_tiers.contains(tier)
+            && components.iter().any(|name| name == &rule.name)
+    })
 }
 
 /// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds
@@ -328,6 +516,8 @@ mod tests {
             r#type: r#type as i32,
             tier,
             hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            component_sets: Vec::new(),
+            block_sizes: Vec::new(),
         }
     }
 
@@ -399,5 +589,174 @@ mod tests {
     fn validate_worker_id_rejects_empty_value() {
         assert!(validate_worker_id("").is_err());
         assert!(validate_worker_id("worker-1").is_ok());
+    }
+
+    // --- component-aware prefix rule engine ---
+
+    fn dram() -> i32 {
+        crate::pb::TierType::TierDram as i32
+    }
+    fn ssd() -> i32 {
+        crate::pb::TierType::TierSsd as i32
+    }
+
+    /// A held block with `(tier, components)` placements and a token count.
+    fn blk(tiers: &[(i32, &[&str])], token_count: u32) -> Option<BlockComponents> {
+        Some(BlockComponents {
+            token_count,
+            tier_components: tiers
+                .iter()
+                .map(|(tier, comps)| (*tier, comps.iter().map(|c| c.to_string()).collect()))
+                .collect(),
+        })
+    }
+
+    /// A legacy whole-block placement (base component only) at HBM.
+    fn legacy_blk() -> Option<BlockComponents> {
+        blk(&[(hbm(), &[])], 0)
+    }
+
+    fn rule(name: &str, rule: MatchRule, window: u32, tiers: &[i32]) -> ComponentRule {
+        ComponentRule {
+            name: name.to_string(),
+            rule: rule as i32,
+            window_tokens: window,
+            available_tiers: tiers.to_vec(),
+        }
+    }
+
+    fn spec(components: Vec<ComponentRule>) -> WorkerCacheSpec {
+        WorkerCacheSpec {
+            version: 1,
+            components,
+        }
+    }
+
+    #[test]
+    fn legacy_no_spec_is_contiguous() {
+        let blocks = vec![legacy_blk(), legacy_blk(), legacy_blk(), None, legacy_blk()];
+        assert_eq!(compute_worker_prefix(None, &blocks), 3);
+    }
+
+    #[test]
+    fn component_report_without_spec_is_excluded() {
+        // A worker that reports components but declared no spec cannot be
+        // interpreted safely, so it contributes nothing (NoSignal-safe).
+        let blocks = vec![
+            blk(&[(hbm(), &["full"])], 16),
+            blk(&[(hbm(), &["full"])], 16),
+        ];
+        assert_eq!(compute_worker_prefix(None, &blocks), 0);
+    }
+
+    #[test]
+    fn contiguous_full_stops_at_first_gap() {
+        let s = spec(vec![rule(
+            "full",
+            MatchRule::RuleContiguous,
+            0,
+            &[hbm(), dram()],
+        )]);
+        let blocks = vec![
+            blk(&[(hbm(), &["full"])], 16),
+            blk(&[(dram(), &["full"])], 16), // full may live on a different servable tier
+            blk(&[(hbm(), &["swa"])], 16),   // no full here -> prefix stops
+            blk(&[(hbm(), &["full"])], 16),
+        ];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 2);
+    }
+
+    #[test]
+    fn ssd_only_is_not_servable_in_v1() {
+        let s = spec(vec![rule(
+            "full",
+            MatchRule::RuleContiguous,
+            0,
+            &[hbm(), dram()],
+        )]);
+        let blocks = vec![blk(&[(ssd(), &["full"])], 16)];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
+    }
+
+    #[test]
+    fn trailing_window_requires_unbroken_window_before_boundary() {
+        // window = 100 tokens, 50 tokens per block: two contiguous swa blocks
+        // cover a window. full is present on every block.
+        let s = spec(vec![
+            rule("full", MatchRule::RuleContiguous, 0, &[hbm()]),
+            rule("swa", MatchRule::RuleTrailingWindow, 100, &[hbm()]),
+        ]);
+        let with_swa = || blk(&[(hbm(), &["full", "swa"])], 50);
+        let no_swa = || blk(&[(hbm(), &["full"])], 50);
+        // swa present everywhere -> full length reusable.
+        let blocks = vec![with_swa(), with_swa(), with_swa(), with_swa(), with_swa()];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 5);
+        // swa tombstoned at block index 3: the largest boundary whose trailing
+        // 100-token window is unbroken is N=3 (blocks 1..2 cover 100 tokens).
+        let holed = vec![with_swa(), with_swa(), with_swa(), no_swa(), with_swa()];
+        assert_eq!(compute_worker_prefix(Some(&s), &holed), 3);
+    }
+
+    #[test]
+    fn trailing_window_head_is_always_valid() {
+        // Fewer tokens than a window, but an unbroken run from the head is valid
+        // (matches the unified cache's window accumulator seeded at infinity).
+        let s = spec(vec![
+            rule("full", MatchRule::RuleContiguous, 0, &[hbm()]),
+            rule("swa", MatchRule::RuleTrailingWindow, 1000, &[hbm()]),
+        ]);
+        let blocks = vec![blk(&[(hbm(), &["full", "swa"])], 16); 2];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 2);
+    }
+
+    #[test]
+    fn exact_boundary_only_matches_at_a_checkpoint() {
+        // mamba lives only on the 4th block (a leaf checkpoint). full is on all.
+        let s = spec(vec![
+            rule("full", MatchRule::RuleContiguous, 0, &[hbm(), dram()]),
+            rule("mamba", MatchRule::RuleExactBoundary, 0, &[hbm(), dram()]),
+        ]);
+        let blocks = vec![
+            blk(&[(hbm(), &["full"])], 16),
+            blk(&[(hbm(), &["full"])], 16),
+            blk(&[(hbm(), &["full"])], 16),
+            blk(&[(hbm(), &["full", "mamba"])], 16),
+        ];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 4);
+        // A shorter request that never reaches the checkpoint cannot reuse it.
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks[..2]), 0);
+    }
+
+    #[test]
+    fn exact_boundary_component_may_live_on_another_tier() {
+        let s = spec(vec![
+            rule("full", MatchRule::RuleContiguous, 0, &[hbm()]),
+            rule("mamba", MatchRule::RuleExactBoundary, 0, &[dram()]),
+        ]);
+        let blocks = vec![
+            blk(&[(hbm(), &["full"])], 16),
+            blk(&[(hbm(), &["full"]), (dram(), &["mamba"])], 16),
+        ];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 2);
+    }
+
+    #[test]
+    fn unknown_rule_excludes_the_worker() {
+        let s = spec(vec![rule("full", MatchRule::RuleUnknown, 0, &[hbm()])]);
+        let blocks = vec![blk(&[(hbm(), &["full"])], 16)];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
+    }
+
+    #[test]
+    fn missing_component_data_under_spec_excludes() {
+        // Spec requires full+swa, but the worker reported legacy whole-block
+        // placement (e.g. the component flag was off): cannot confirm swa, so it
+        // is excluded rather than over-reported.
+        let s = spec(vec![
+            rule("full", MatchRule::RuleContiguous, 0, &[hbm()]),
+            rule("swa", MatchRule::RuleTrailingWindow, 100, &[hbm()]),
+        ]);
+        let blocks = vec![legacy_blk(), legacy_blk()];
+        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
     }
 }

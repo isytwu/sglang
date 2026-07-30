@@ -13,6 +13,54 @@ enum TierType {
   TIER_SSD = 3;
 }
 
+// How a single KV component participates in prefix matching. The indexer treats
+// component names as opaque labels; the rule (supplied by the worker's
+// WorkerCacheSpec) is what drives the match, so the indexer never hardcodes
+// full/swa/mamba semantics.
+enum MatchRule {
+  RULE_UNKNOWN = 0;
+  // Path component (e.g. full attention): must be resident on every block of the
+  // reusable prefix. A gap ends the prefix.
+  RULE_CONTIGUOUS = 1;
+  // Boundary/checkpoint component (e.g. mamba): only the candidate boundary block
+  // must carry it. Sparse checkpoints; a request whose boundary never reaches one
+  // does not match.
+  RULE_EXACT_BOUNDARY = 2;
+  // Trailing-window component (e.g. sliding-window attention): the candidate
+  // boundary is valid only if the component is resident contiguously over at
+  // least `window_tokens` tokens immediately preceding the boundary. Older blocks
+  // beyond the window need not carry it.
+  RULE_TRAILING_WINDOW = 3;
+}
+
+// One component's static match parameters, as declared by a worker. All fields
+// are opaque to the indexer except as they feed the generic rule engine.
+message ComponentRule {
+  // Opaque component label as it appears on the wire (e.g. "full"/"swa"/"mamba").
+  string name = 1;
+  MatchRule rule = 2;
+  // Sliding-window size in tokens; meaningful only for RULE_TRAILING_WINDOW.
+  uint32 window_tokens = 3;
+  // Tiers this component can be served from. Intersected with the indexer's
+  // servable set (V1: HBM+DRAM) at query time.
+  repeated TierType available_tiers = 4;
+}
+
+// A worker's versioned cache specification: which components it reports and how
+// each participates in prefix matching. Absent on a worker means legacy /
+// full-only (whole-block) behaviour.
+message WorkerCacheSpec {
+  uint32 version = 1;
+  repeated ComponentRule components = 2;
+}
+
+// The set of KV components resident for a single (hash, tier) placement. A
+// REPLACE snapshot, index-aligned with ExternalKvAction.hashes. An empty set
+// means legacy whole-block placement (base component only).
+message ComponentSet {
+  repeated string components = 1;
+}
+
 message MatchExternalKvRequest {
   // MVP semantics: these are block-level hashes to match against placement
   // metadata. The indexer returns block placement matches and does not compute
@@ -38,6 +86,17 @@ message ExternalKvAction {
   TierType tier = 2;
   // Non-empty for REPORT/REVOKE; ignored for CLEAR_ALL_AT_TIER.
   repeated string hashes = 3;
+
+  // REPORT only. The resident component set for each hash at this tier, as a
+  // REPLACE snapshot. When present it is index-aligned with `hashes`; when empty
+  // every hash is treated as legacy whole-block (base component only). REVOKE and
+  // CLEAR_ALL_AT_TIER ignore it.
+  repeated ComponentSet component_sets = 4;
+
+  // REPORT only. The token count (block_size) of each hash, index-aligned with
+  // `hashes`, used to accumulate trailing windows in tokens. Empty when the
+  // reporter does not supply sizes (legacy).
+  repeated uint32 block_sizes = 5;
 }
 
 message ApplyExternalKvBatchRequest {
@@ -54,6 +113,11 @@ message ApplyExternalKvBatchRequest {
 
   // Field 5 held the worker incarnation token used for restart fencing.
   reserved 5;
+
+  // The worker's component cache spec. Carried on every batch (like
+  // worker_address) so it self-heals across reconnects and indexer restarts.
+  // Absent means a legacy / full-only worker.
+  WorkerCacheSpec cache_spec = 6;
 }
 
 // Deliberately empty: applies are unconditional, so there is nothing to report

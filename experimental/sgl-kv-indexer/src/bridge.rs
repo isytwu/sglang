@@ -23,7 +23,10 @@ use tracing::{debug, info, warn};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
-use crate::pb::{ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType};
+use crate::pb::{
+    ApplyExternalKvBatchRequest, ComponentRule, ComponentSet, ExternalKvAction,
+    ExternalKvActionType, MatchRule, TierType, WorkerCacheSpec,
+};
 
 /// Backoff bounds for the reconnect supervisor loop.
 const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(500);
@@ -41,6 +44,9 @@ pub struct BridgeConfig {
     pub event_topic: String,
     pub indexer_endpoint: String,
     pub clear_tiers: Vec<i32>,
+    /// The worker's component cache spec, forwarded on every apply batch. `None`
+    /// for a legacy / full-only worker that reports no component metadata.
+    pub cache_spec: Option<WorkerCacheSpec>,
 }
 
 impl BridgeConfig {
@@ -58,6 +64,16 @@ impl BridgeConfig {
         let clear_tiers = parse_clear_tiers(
             &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
+        let cache_spec = match std::env::var("KV_INDEXER_CACHE_SPEC") {
+            Ok(spec) if !spec.trim().is_empty() => {
+                let version = std::env::var("KV_INDEXER_CACHE_SPEC_VERSION")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or(1);
+                Some(parse_cache_spec(&spec, version)?)
+            }
+            _ => None,
+        };
 
         Ok(Self {
             worker_id,
@@ -66,6 +82,7 @@ impl BridgeConfig {
             event_topic,
             indexer_endpoint,
             clear_tiers,
+            cache_spec,
         })
     }
 }
@@ -134,10 +151,23 @@ fn classify_rpc(status: Status) -> BridgeError {
 /// A single indexer mutation, kept in the exact order it appeared in the event
 /// batch so that store/remove/clear operations on the same hash are never
 /// reordered relative to each other.
+///
+/// `Report` carries per-hash component metadata in arrays index-aligned with
+/// `hashes`: `components[i]` is `None` for a legacy whole-block store and
+/// `Some(labels)` for a component-aware store; `block_sizes[i]` is the reported
+/// token count, `None` when the reporter did not supply one (legacy).
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    Report { tier: i32, hashes: Vec<String> },
-    Revoke { tier: i32, hashes: Vec<String> },
+    Report {
+        tier: i32,
+        hashes: Vec<String>,
+        components: Vec<Option<Vec<String>>>,
+        block_sizes: Vec<Option<u32>>,
+    },
+    Revoke {
+        tier: i32,
+        hashes: Vec<String>,
+    },
     ClearAll,
 }
 
@@ -147,24 +177,42 @@ struct EventActions {
 }
 
 impl EventActions {
-    /// Append a store, coalescing only with an immediately-preceding store to
-    /// the same tier. Coalescing never crosses a revoke/clear, so ordering (and
-    /// therefore the final per-hash state) is preserved.
-    fn report(&mut self, tier: i32, hashes: Vec<String>) {
+    /// Append a store for the block hashes of one `BlockStored`, coalescing only
+    /// with an immediately-preceding store to the same tier. Coalescing never
+    /// crosses a revoke/clear, so ordering (and therefore the final per-hash
+    /// state) is preserved. All hashes in this call share the event's component
+    /// set and block size.
+    fn report(
+        &mut self,
+        tier: i32,
+        hashes: Vec<String>,
+        component: Option<Vec<String>>,
+        block_size: Option<u32>,
+    ) {
         if hashes.is_empty() {
             return;
         }
+        let n = hashes.len();
         if let Some(Action::Report {
             tier: last_tier,
             hashes: last,
+            components,
+            block_sizes,
         }) = self.actions.last_mut()
         {
             if *last_tier == tier {
                 last.extend(hashes);
+                components.extend(std::iter::repeat_n(component, n));
+                block_sizes.extend(std::iter::repeat_n(block_size, n));
                 return;
             }
         }
-        self.actions.push(Action::Report { tier, hashes });
+        self.actions.push(Action::Report {
+            tier,
+            hashes,
+            components: vec![component; n],
+            block_sizes: vec![block_size; n],
+        });
     }
 
     fn revoke(&mut self, tier: i32, hashes: Vec<String>) {
@@ -371,15 +419,27 @@ fn build_apply_request(
     let mut actions = Vec::with_capacity(events.actions.len());
     for action in events.actions {
         match action {
-            Action::Report { tier, hashes } => actions.push(ExternalKvAction {
+            Action::Report {
+                tier,
+                hashes,
+                components,
+                block_sizes,
+            } => actions.push(ExternalKvAction {
                 r#type: ExternalKvActionType::ActionReport as i32,
                 tier,
                 hashes,
+                // Emit the per-hash arrays only when at least one hash carries
+                // component data; a fully-legacy report leaves them empty so the
+                // backend keeps the whole-block fast path.
+                component_sets: encode_component_sets(&components),
+                block_sizes: encode_block_sizes(&block_sizes),
             }),
             Action::Revoke { tier, hashes } => actions.push(ExternalKvAction {
                 r#type: ExternalKvActionType::ActionRevoke as i32,
                 tier,
                 hashes,
+                component_sets: Vec::new(),
+                block_sizes: Vec::new(),
             }),
             Action::ClearAll => {
                 for tier in &config.clear_tiers {
@@ -387,6 +447,8 @@ fn build_apply_request(
                         r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
                         tier: *tier,
                         hashes: Vec::new(),
+                        component_sets: Vec::new(),
+                        block_sizes: Vec::new(),
                     });
                 }
             }
@@ -398,7 +460,35 @@ fn build_apply_request(
         seq,
         actions,
         worker_address: config.worker_address.clone(),
+        cache_spec: config.cache_spec.clone(),
     }
+}
+
+/// Maps per-hash component sets to the wire form. Returns an empty vector (the
+/// legacy signal) when no hash carries components, otherwise one `ComponentSet`
+/// per hash, with a legacy hash represented by an empty set.
+fn encode_component_sets(components: &[Option<Vec<String>>]) -> Vec<ComponentSet> {
+    if components.iter().all(Option::is_none) {
+        return Vec::new();
+    }
+    components
+        .iter()
+        .map(|component| ComponentSet {
+            components: component.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Maps per-hash block sizes to the wire form. Returns an empty vector when no
+/// hash carries a size, otherwise one entry per hash (`0` for a legacy hash).
+fn encode_block_sizes(block_sizes: &[Option<u32>]) -> Vec<u32> {
+    if block_sizes.iter().all(Option::is_none) {
+        return Vec::new();
+    }
+    block_sizes
+        .iter()
+        .map(|size| size.unwrap_or_default())
+        .collect()
 }
 
 fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
@@ -445,13 +535,28 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
 
     match event_type {
         "BlockStored" => {
+            // At least 7 fields (the legacy schema); an 8th `component_types`
+            // slot is present when the producer runs with
+            // `--enable-kv-events-component-types`. Both shapes are accepted.
             if event.len() < 7 {
                 return Err(BridgeError::Decode(
-                    "BlockStored must have 7 array fields".to_string(),
+                    "BlockStored must have at least 7 array fields".to_string(),
                 ));
             }
             let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            actions.report(tier, decode_hashes(&event[1])?);
+            // `component_types` is the trailing slot: a list of opaque component
+            // labels, or nil/absent for a legacy whole-block store.
+            let component = match event.get(7) {
+                Some(value) => decode_component_types(value)?,
+                None => None,
+            };
+            // The token count is only carried alongside component-aware stores,
+            // where the query path needs it to accumulate trailing windows.
+            let block_size = match &component {
+                Some(_) => Some(decode_block_size(&event[4])?),
+                None => None,
+            };
+            actions.report(tier, decode_hashes(&event[1])?, component, block_size);
         }
         "BlockRemoved" => {
             if event.len() < 3 {
@@ -489,6 +594,38 @@ fn decode_hashes(value: &Value) -> Result<Vec<String>, BridgeError> {
         .collect()
 }
 
+/// Decodes the optional `component_types` slot of a `BlockStored`.
+///
+/// `nil` (the default when the producer omits the field) maps to `None`, a
+/// legacy whole-block store. A msgpack array maps to the list of opaque
+/// component labels; the indexer never interprets the strings itself.
+fn decode_component_types(value: &Value) -> Result<Option<Vec<String>>, BridgeError> {
+    if matches!(value, Value::Nil) {
+        return Ok(None);
+    }
+    let items = expect_array(value, "BlockStored.component_types")?;
+    let components = items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| BridgeError::Decode("component type must be a string".to_string()))
+        })
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(Some(components))
+}
+
+/// Decodes the `block_size` (token count) slot of a `BlockStored`.
+fn decode_block_size(value: &Value) -> Result<u32, BridgeError> {
+    let raw = value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|v| u64::try_from(v).ok()))
+        .ok_or_else(|| {
+            BridgeError::Decode("block_size must be a non-negative integer".to_string())
+        })?;
+    u32::try_from(raw).map_err(|_| BridgeError::Decode("block_size exceeds u32".to_string()))
+}
+
 fn medium_to_tier(medium: Option<&str>) -> Result<i32, BridgeError> {
     match medium {
         Some("GPU") => Ok(TierType::TierHbm as i32),
@@ -503,6 +640,90 @@ fn medium_to_tier(medium: Option<&str>) -> Result<i32, BridgeError> {
         None => Err(BridgeError::Decode(
             "SGLang storage medium is missing".to_string(),
         )),
+    }
+}
+
+/// Parses `KV_INDEXER_CACHE_SPEC` into a [`WorkerCacheSpec`].
+///
+/// Grammar (component labels are opaque; the indexer never interprets them):
+/// ```text
+///   spec := comp (";" comp)*
+///   comp := name ":" rule (":" field)*
+///   field := "window=" uint            (tokens; TRAILING_WINDOW only)
+///          | "tiers=" tier ("+" tier)*  (defaults to HBM+DRAM)
+///   rule := "contiguous" | "exact_boundary" | "trailing_window"
+/// ```
+/// Example: `full:contiguous;swa:trailing_window:window=4096:tiers=HBM`.
+fn parse_cache_spec(value: &str, version: u32) -> Result<WorkerCacheSpec, BridgeError> {
+    let mut components = Vec::new();
+    for raw in value.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut fields = raw.split(':').map(str::trim);
+        let name = fields
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| BridgeError::Config(format!("cache spec component has no name: {raw}")))?
+            .to_string();
+        let rule = match fields.next() {
+            Some("contiguous") => MatchRule::RuleContiguous,
+            Some("exact_boundary") => MatchRule::RuleExactBoundary,
+            Some("trailing_window") => MatchRule::RuleTrailingWindow,
+            other => {
+                return Err(BridgeError::Config(format!(
+                    "cache spec component {name} has unsupported rule: {other:?}"
+                )))
+            }
+        };
+        let mut window_tokens = 0u32;
+        let mut available_tiers: Vec<i32> = Vec::new();
+        for field in fields {
+            if let Some(window) = field.strip_prefix("window=") {
+                window_tokens = window.parse::<u32>().map_err(|_| {
+                    BridgeError::Config(format!("cache spec {name} has invalid window: {window}"))
+                })?;
+            } else if let Some(tiers) = field.strip_prefix("tiers=") {
+                for tier in tiers.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+                    available_tiers.push(tier_name_to_type(tier)?);
+                }
+            } else {
+                return Err(BridgeError::Config(format!(
+                    "cache spec {name} has unknown field: {field}"
+                )));
+            }
+        }
+        if rule == MatchRule::RuleTrailingWindow && window_tokens == 0 {
+            return Err(BridgeError::Config(format!(
+                "cache spec {name} uses trailing_window but sets no window=<tokens>"
+            )));
+        }
+        if available_tiers.is_empty() {
+            available_tiers = vec![TierType::TierHbm as i32, TierType::TierDram as i32];
+        }
+        components.push(ComponentRule {
+            name,
+            rule: rule as i32,
+            window_tokens,
+            available_tiers,
+        });
+    }
+    if components.is_empty() {
+        return Err(BridgeError::Config(
+            "cache spec is set but declares no components".to_string(),
+        ));
+    }
+    Ok(WorkerCacheSpec {
+        version,
+        components,
+    })
+}
+
+fn tier_name_to_type(name: &str) -> Result<i32, BridgeError> {
+    match name {
+        "HBM" | "GPU" => Ok(TierType::TierHbm as i32),
+        "DRAM" | "CPU" | "CPU_PINNED" => Ok(TierType::TierDram as i32),
+        "SSD" | "DISK" => Ok(TierType::TierSsd as i32),
+        other => Err(BridgeError::Config(format!(
+            "cache spec has unsupported tier: {other}"
+        ))),
     }
 }
 
@@ -580,6 +801,42 @@ mod tests {
         ])
     }
 
+    /// A component-aware `BlockStored` (8-element schema): trailing
+    /// `component_types` slot plus a concrete `block_size` token count.
+    fn stored_c(hashes: &[i64], medium: &str, block_size: i64, components: Value) -> Value {
+        Value::Array(vec![
+            Value::String("BlockStored".into()),
+            ints(hashes),
+            Value::Nil, // parent_block_hash
+            ints(&[1]), // token_ids
+            Value::from(block_size),
+            Value::Nil, // lora_id
+            Value::String(medium.into()),
+            components, // component_types (Nil or array of strings)
+        ])
+    }
+
+    fn strv(items: &[&str]) -> Value {
+        Value::Array(items.iter().map(|s| Value::String((*s).into())).collect())
+    }
+
+    /// Legacy (whole-block) report action expectation.
+    fn rep(tier: i32, hashes: &[&str]) -> Action {
+        Action::Report {
+            tier,
+            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            components: vec![None; hashes.len()],
+            block_sizes: vec![None; hashes.len()],
+        }
+    }
+
+    fn rev(tier: i32, hashes: &[&str]) -> Action {
+        Action::Revoke {
+            tier,
+            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
     fn removed(hashes: &[i64], medium: &str) -> Value {
         Value::Array(vec![
             Value::String("BlockRemoved".into()),
@@ -625,6 +882,7 @@ mod tests {
             event_topic: "kv-events".to_string(),
             indexer_endpoint: "http://[::1]:50051".to_string(),
             clear_tiers,
+            cache_spec: None,
         }
     }
 
@@ -642,6 +900,8 @@ mod tests {
             r#type: ExternalKvActionType::ActionReport as i32,
             tier,
             hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            component_sets: Vec::new(),
+            block_sizes: Vec::new(),
         }
     }
 
@@ -650,6 +910,8 @@ mod tests {
             r#type: ExternalKvActionType::ActionRevoke as i32,
             tier,
             hashes: hashes.iter().map(|h| h.to_string()).collect(),
+            component_sets: Vec::new(),
+            block_sizes: Vec::new(),
         }
     }
 
@@ -658,6 +920,8 @@ mod tests {
             r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
             tier,
             hashes: Vec::new(),
+            component_sets: Vec::new(),
+            block_sizes: Vec::new(),
         }
     }
 
@@ -721,10 +985,7 @@ mod tests {
     fn block_stored_maps_to_report_on_tier() {
         assert_eq!(
             actions_of(vec![stored(&[123], "GPU")]),
-            vec![Action::Report {
-                tier: hbm(),
-                hashes: vec!["123".to_string()],
-            }]
+            vec![rep(hbm(), &["123"])]
         );
     }
 
@@ -732,17 +993,11 @@ mod tests {
     fn mediums_map_to_expected_tiers() {
         assert_eq!(
             actions_of(vec![stored(&[1], "CPU_PINNED")]),
-            vec![Action::Report {
-                tier: dram(),
-                hashes: vec!["1".to_string()],
-            }]
+            vec![rep(dram(), &["1"])]
         );
         assert_eq!(
             actions_of(vec![removed(&[2], "DISK")]),
-            vec![Action::Revoke {
-                tier: ssd(),
-                hashes: vec!["2".to_string()],
-            }]
+            vec![rev(ssd(), &["2"])]
         );
     }
 
@@ -754,16 +1009,7 @@ mod tests {
                 stored(&[2], "EXTERNAL"),
                 removed(&[3], "DISK"),
             ]),
-            vec![
-                Action::Report {
-                    tier: hbm(),
-                    hashes: vec!["1".to_string()],
-                },
-                Action::Revoke {
-                    tier: ssd(),
-                    hashes: vec!["3".to_string()],
-                },
-            ]
+            vec![rep(hbm(), &["1"]), rev(ssd(), &["3"])]
         );
     }
 
@@ -788,16 +1034,7 @@ mod tests {
         // Net state must be "stored"; reordering to report-then-revoke would drop it.
         assert_eq!(
             actions_of(vec![removed(&[9], "GPU"), stored(&[9], "GPU")]),
-            vec![
-                Action::Revoke {
-                    tier: hbm(),
-                    hashes: vec!["9".to_string()],
-                },
-                Action::Report {
-                    tier: hbm(),
-                    hashes: vec!["9".to_string()],
-                },
-            ]
+            vec![rev(hbm(), &["9"]), rep(hbm(), &["9"])]
         );
     }
 
@@ -805,13 +1042,7 @@ mod tests {
     fn clear_then_store_keeps_order() {
         assert_eq!(
             actions_of(vec![cleared(), stored(&[7], "GPU")]),
-            vec![
-                Action::ClearAll,
-                Action::Report {
-                    tier: hbm(),
-                    hashes: vec!["7".to_string()],
-                },
-            ]
+            vec![Action::ClearAll, rep(hbm(), &["7"])]
         );
     }
 
@@ -819,13 +1050,7 @@ mod tests {
     fn store_then_clear_keeps_order() {
         assert_eq!(
             actions_of(vec![stored(&[7], "GPU"), cleared()]),
-            vec![
-                Action::Report {
-                    tier: hbm(),
-                    hashes: vec!["7".to_string()],
-                },
-                Action::ClearAll,
-            ]
+            vec![rep(hbm(), &["7"]), Action::ClearAll]
         );
     }
 
@@ -835,10 +1060,7 @@ mod tests {
     fn adjacent_same_tier_stores_coalesce() {
         assert_eq!(
             actions_of(vec![stored(&[1], "GPU"), stored(&[2], "GPU")]),
-            vec![Action::Report {
-                tier: hbm(),
-                hashes: vec!["1".to_string(), "2".to_string()],
-            }]
+            vec![rep(hbm(), &["1", "2"])]
         );
     }
 
@@ -846,16 +1068,7 @@ mod tests {
     fn different_tier_stores_do_not_coalesce() {
         assert_eq!(
             actions_of(vec![stored(&[1], "GPU"), stored(&[2], "CPU_PINNED")]),
-            vec![
-                Action::Report {
-                    tier: hbm(),
-                    hashes: vec!["1".to_string()],
-                },
-                Action::Report {
-                    tier: dram(),
-                    hashes: vec!["2".to_string()],
-                },
-            ]
+            vec![rep(hbm(), &["1"]), rep(dram(), &["2"])]
         );
     }
 
@@ -863,16 +1076,7 @@ mod tests {
     fn store_then_remove_same_tier_do_not_merge() {
         assert_eq!(
             actions_of(vec![stored(&[1], "GPU"), removed(&[1], "GPU")]),
-            vec![
-                Action::Report {
-                    tier: hbm(),
-                    hashes: vec!["1".to_string()],
-                },
-                Action::Revoke {
-                    tier: hbm(),
-                    hashes: vec!["1".to_string()],
-                },
-            ]
+            vec![rep(hbm(), &["1"]), rev(hbm(), &["1"])]
         );
     }
 
@@ -890,10 +1094,7 @@ mod tests {
         ]));
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
-            vec![Action::Report {
-                tier: hbm(),
-                hashes: vec!["5".to_string()],
-            }]
+            vec![rep(hbm(), &["5"])]
         );
     }
 
@@ -910,14 +1111,8 @@ mod tests {
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
             vec![
-                Action::Report {
-                    tier: hbm(),
-                    hashes: vec!["1234567890123".to_string(), "-987654321".to_string()],
-                },
-                Action::Revoke {
-                    tier: ssd(),
-                    hashes: vec!["100".to_string(), "200".to_string()],
-                },
+                rep(hbm(), &["1234567890123", "-987654321"]),
+                rev(ssd(), &["100", "200"]),
                 Action::ClearAll,
             ]
         );
@@ -934,10 +1129,7 @@ mod tests {
         ));
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
-            vec![Action::Report {
-                tier: hbm(),
-                hashes: vec!["111".to_string()],
-            }]
+            vec![rep(hbm(), &["111"])]
         );
     }
 
@@ -957,10 +1149,7 @@ mod tests {
     fn negative_hashes_are_stringified() {
         assert_eq!(
             actions_of(vec![stored(&[-1905904552702706914], "GPU")]),
-            vec![Action::Report {
-                tier: hbm(),
-                hashes: vec!["-1905904552702706914".to_string()],
-            }]
+            vec![rep(hbm(), &["-1905904552702706914"])]
         );
     }
 
@@ -1042,5 +1231,114 @@ mod tests {
     fn seq_decoders_are_big_endian() {
         assert_eq!(decode_seq(&5_u64.to_be_bytes()).unwrap(), 5);
         assert!(decode_seq(&[0_u8; 4]).is_err());
+    }
+
+    // --- component-aware decoding ---
+
+    #[test]
+    fn component_types_list_decodes_into_report() {
+        assert_eq!(
+            actions_of(vec![stored_c(&[1], "GPU", 64, strv(&["full", "swa"]))]),
+            vec![Action::Report {
+                tier: hbm(),
+                hashes: vec!["1".to_string()],
+                components: vec![Some(vec!["full".to_string(), "swa".to_string()])],
+                block_sizes: vec![Some(64)],
+            }]
+        );
+    }
+
+    #[test]
+    fn component_types_nil_decodes_as_legacy() {
+        // An 8-element BlockStored whose trailing slot is nil is exactly the
+        // legacy whole-block store: no components, no size.
+        assert_eq!(
+            actions_of(vec![stored_c(&[1], "GPU", 64, Value::Nil)]),
+            vec![rep(hbm(), &["1"])]
+        );
+    }
+
+    #[test]
+    fn seven_element_block_stored_is_still_legacy() {
+        assert_eq!(
+            actions_of(vec![stored(&[1], "GPU")]),
+            vec![rep(hbm(), &["1"])]
+        );
+    }
+
+    #[test]
+    fn component_aware_report_carries_aligned_wire_arrays() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(
+            &config,
+            0,
+            vec![
+                stored_c(&[1], "GPU", 64, strv(&["full", "swa"])),
+                stored_c(&[2], "GPU", 32, strv(&["full"])),
+            ],
+        );
+        assert_eq!(request.actions.len(), 1);
+        let action = &request.actions[0];
+        assert_eq!(action.hashes, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(
+            action.component_sets,
+            vec![
+                ComponentSet {
+                    components: vec!["full".to_string(), "swa".to_string()]
+                },
+                ComponentSet {
+                    components: vec!["full".to_string()]
+                },
+            ]
+        );
+        assert_eq!(action.block_sizes, vec![64, 32]);
+    }
+
+    #[test]
+    fn legacy_report_leaves_wire_arrays_empty() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
+        let action = &request.actions[0];
+        assert!(action.component_sets.is_empty());
+        assert!(action.block_sizes.is_empty());
+    }
+
+    #[test]
+    fn cache_spec_forwarded_on_request() {
+        let mut config = test_config(vec![hbm()]);
+        config.cache_spec = Some(parse_cache_spec("full:contiguous", 1).unwrap());
+        let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
+        assert_eq!(request.cache_spec, config.cache_spec);
+    }
+
+    // --- cache spec parsing ---
+
+    #[test]
+    fn parse_cache_spec_parses_rules_window_and_tiers() {
+        let spec = parse_cache_spec(
+            "full:contiguous;swa:trailing_window:window=4096:tiers=HBM",
+            2,
+        )
+        .unwrap();
+        assert_eq!(spec.version, 2);
+        assert_eq!(spec.components.len(), 2);
+        assert_eq!(spec.components[0].name, "full");
+        assert_eq!(spec.components[0].rule, MatchRule::RuleContiguous as i32);
+        // Default tiers when omitted are HBM+DRAM.
+        assert_eq!(spec.components[0].available_tiers, vec![hbm(), dram()]);
+        assert_eq!(spec.components[1].name, "swa");
+        assert_eq!(
+            spec.components[1].rule,
+            MatchRule::RuleTrailingWindow as i32
+        );
+        assert_eq!(spec.components[1].window_tokens, 4096);
+        assert_eq!(spec.components[1].available_tiers, vec![hbm()]);
+    }
+
+    #[test]
+    fn parse_cache_spec_rejects_unknown_rule_and_missing_window() {
+        assert!(parse_cache_spec("full:bogus", 1).is_err());
+        assert!(parse_cache_spec("swa:trailing_window", 1).is_err());
+        assert!(parse_cache_spec("swa:trailing_window:tiers=NVME", 1).is_err());
     }
 }
