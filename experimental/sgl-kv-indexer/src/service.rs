@@ -256,6 +256,24 @@ fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
                 return Err(Status::invalid_argument("action type is not supported"));
             }
         }
+        // The per-hash arrays are either absent (legacy) or index-aligned with
+        // `hashes`; a partial array is a malformed batch, not a silent legacy hash.
+        validate_aligned(
+            action.component_masks.len(),
+            action.hashes.len(),
+            "component_masks",
+        )?;
+        validate_aligned(action.block_sizes.len(), action.hashes.len(), "block_sizes")?;
+    }
+    Ok(())
+}
+
+/// A per-hash side array must be empty (legacy) or exactly as long as `hashes`.
+fn validate_aligned(array_len: usize, hashes_len: usize, field: &str) -> Result<(), Status> {
+    if array_len != 0 && array_len != hashes_len {
+        return Err(Status::invalid_argument(format!(
+            "{field} has {array_len} entries but must be empty or match {hashes_len} hashes"
+        )));
     }
     Ok(())
 }
@@ -544,6 +562,32 @@ mod tests {
     fn validate_actions_rejects_bad_tier() {
         let actions = [action(ExternalKvActionType::ActionReport, 0, &["1"])];
         assert!(validate_actions(&actions).is_err());
+    }
+
+    #[test]
+    fn validate_actions_rejects_misaligned_side_arrays() {
+        let base = action(ExternalKvActionType::ActionReport, hbm(), &["a", "b"]);
+        // Empty side arrays (legacy) are fine.
+        assert!(validate_actions(std::slice::from_ref(&base)).is_ok());
+        // Aligned arrays are fine.
+        let mut aligned = base.clone();
+        aligned.component_masks = vec![COMPONENT_FULL, COMPONENT_FULL];
+        aligned.block_sizes = vec![16, 16];
+        assert!(validate_actions(&[aligned]).is_ok());
+        // A short component_masks array is a malformed batch, not a silent legacy.
+        let mut bad_masks = base.clone();
+        bad_masks.component_masks = vec![COMPONENT_FULL];
+        assert_eq!(
+            validate_actions(&[bad_masks]).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        // A short block_sizes array is rejected too.
+        let mut bad_sizes = base;
+        bad_sizes.block_sizes = vec![16];
+        assert_eq!(
+            validate_actions(&[bad_sizes]).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[test]

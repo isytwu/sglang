@@ -218,14 +218,27 @@ impl RedisKvIndexerBackend {
                     // store+restate of the same block) must not be fanned out
                     // concurrently against the same key and race to a
                     // nondeterministic snapshot.
+                    // The per-hash arrays are validated at the service entry to be
+                    // empty (legacy) or aligned with `hashes`, so an empty array
+                    // means "no detail" and a non-empty one indexes directly.
+                    let has_masks = !action.component_masks.is_empty();
+                    let has_sizes = !action.block_sizes.is_empty();
                     let mut last_by_hash: HashMap<&str, ReportOne> = HashMap::new();
                     for (index, hash) in action.hashes.iter().enumerate() {
                         last_by_hash.insert(
                             hash.as_str(),
                             ReportOne {
                                 hash: hash.as_str(),
-                                mask: action.component_masks.get(index).copied().unwrap_or(0),
-                                token_count: action.block_sizes.get(index).copied().unwrap_or(0),
+                                mask: if has_masks {
+                                    action.component_masks[index]
+                                } else {
+                                    0
+                                },
+                                token_count: if has_sizes {
+                                    action.block_sizes[index]
+                                } else {
+                                    0
+                                },
                             },
                         );
                     }
