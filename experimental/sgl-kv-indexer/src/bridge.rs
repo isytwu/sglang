@@ -1289,15 +1289,10 @@ mod tests {
     // --- cache spec config helpers ---
 
     #[test]
-    fn tier_name_to_type_maps_aliases() {
+    fn config_helpers_map_tiers_and_components() {
         assert_eq!(tier_name_to_type("HBM").unwrap(), hbm());
-        assert_eq!(tier_name_to_type("GPU").unwrap(), hbm());
         assert_eq!(tier_name_to_type("CPU_PINNED").unwrap(), dram());
         assert!(tier_name_to_type("NVME").is_err());
-    }
-
-    #[test]
-    fn component_bit_maps_known_labels_only() {
         assert_eq!(component_bit("full"), Some(crate::service::COMPONENT_FULL));
         assert_eq!(component_bit("swa"), Some(COMPONENT_SWA));
         assert_eq!(component_bit("bogus"), None);

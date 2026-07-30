@@ -271,16 +271,15 @@ pub(crate) fn prefix_limit(len: usize, max_blocks: u32) -> usize {
     }
 }
 
-/// KV component bits. The set and their match rules are fixed: a component's
-/// rule is a property of its type (FULL is a path component, SWA a trailing
-/// window, MAMBA a boundary checkpoint), so the indexer applies fixed semantics
-/// rather than a per-worker rule binding.
+/// KV component bits. The set and their rules are fixed (a component's rule is a
+/// property of its type), so the indexer applies fixed semantics, not a
+/// per-worker rule binding.
 pub const COMPONENT_FULL: u32 = 1 << 0;
 pub const COMPONENT_SWA: u32 = 1 << 1;
 pub const COMPONENT_MAMBA: u32 = 1 << 2;
 
-/// Maps an on-wire component label to its bit; `None` for a label this build
-/// does not model (ignored, so an unknown future component never counts).
+/// On-wire component label to its bit; `None` for a label this build does not
+/// model (ignored, so an unknown future component never counts).
 pub fn component_bit(name: &str) -> Option<u32> {
     match name {
         "full" => Some(COMPONENT_FULL),
@@ -290,16 +289,12 @@ pub fn component_bit(name: &str) -> Option<u32> {
     }
 }
 
-/// Tiers the indexer treats as servable when deciding a component is reusable,
-/// as a bitmask of `1 << TierType`. V1: HBM (device) and DRAM (load-backable
-/// host); SSD is not counted.
+/// Servable tiers as a `1 << TierType` bitmask. V1: HBM + DRAM, SSD excluded.
 const SERVABLE_TIER_MASK: u32 =
     (1 << (TierType::TierHbm as u32)) | (1 << (TierType::TierDram as u32));
 
-/// Highest `WorkerCacheSpec.version` this build knows how to interpret. A spec
-/// from the future (higher version) is treated as unusable and fails closed,
-/// rather than being misread against the current rule set. Version 0 is the
-/// proto default (unversioned) and is accepted as the current version.
+/// Highest `WorkerCacheSpec.version` this build interprets; a higher (future)
+/// version fails closed. Version 0 (proto default) is accepted as current.
 const SUPPORTED_SPEC_VERSION: u32 = 1;
 
 /// Whether `tier` is set in a `1 << TierType` bitmask.
@@ -307,19 +302,16 @@ fn tier_in_mask(mask: u32, tier: i32) -> bool {
     tier >= 0 && mask & (1u32 << tier) != 0
 }
 
-/// The resident KV components for one block at one worker, per tier, plus the
-/// block's token count (used to accumulate SWA trailing windows).
+/// One block's placement at one worker: token count plus, per tier held, the
+/// resident component bitmask (mask `0` = legacy whole-block, held with no detail).
 #[derive(Debug, Clone)]
 pub struct BlockComponents {
     pub token_count: u32,
-    /// `(tier, component bitmask)` for every tier at which the worker holds the
-    /// block. A legacy whole-block placement carries mask `0` (held, no detail).
     pub tier_masks: Vec<(i32, u32)>,
 }
 
-/// Everything the prefix rule engine needs about one candidate worker: its
-/// routing identity, its (optional) component spec, and, aligned with the query
-/// hashes, the block placement (`None` for a block the worker does not hold).
+/// One candidate worker for the rule engine: routing identity, optional spec, and
+/// per-query-block placement (`None` where the worker does not hold the block).
 #[derive(Debug, Clone)]
 pub struct WorkerPrefixInput {
     pub worker_id: String,
@@ -379,9 +371,7 @@ pub(crate) fn compute_prefix_response(
     let entries = inputs
         .iter()
         .filter_map(|worker| {
-            // An empty address is unroutable for the router (see the proto's
-            // worker_address contract); drop it rather than report a match it
-            // can never intersect.
+            // An empty address is unroutable (see the proto worker_address contract).
             if worker.address.is_empty() {
                 return None;
             }
@@ -400,9 +390,8 @@ pub(crate) fn compute_worker_prefix(
     blocks: &[Option<BlockComponents>],
 ) -> u32 {
     match spec {
-        // No spec: a worker that reports components but declares none cannot be
-        // interpreted safely, so it is excluded. A purely legacy worker keeps the
-        // whole-block contiguous prefix (unchanged behaviour).
+        // No spec: component-aware placement can't be interpreted (fail closed);
+        // a purely legacy worker keeps the whole-block contiguous prefix.
         None => {
             if blocks_carry_components(blocks) {
                 0
@@ -410,9 +399,7 @@ pub(crate) fn compute_worker_prefix(
                 legacy_contiguous_prefix(blocks)
             }
         }
-        // A declared spec with no components, or from an unsupported (future)
-        // version, cannot be interpreted safely → fail closed (worker excluded)
-        // rather than misread. A full-only worker declares no spec (None arm).
+        // Empty or future-version spec is unusable → fail closed.
         Some(spec) if spec.components == 0 || spec.version > SUPPORTED_SPEC_VERSION => 0,
         Some(spec) => component_aware_prefix(spec, blocks),
     }
@@ -723,14 +710,6 @@ mod tests {
     }
 
     #[test]
-    fn swa_without_window_excludes_the_worker() {
-        // SWA present but no window configured is an unusable spec -> fail closed.
-        let s = spec(COMPONENT_FULL | COMPONENT_SWA, 0, &[hbm()], &[hbm()], &[]);
-        let blocks = vec![blk(&[(hbm(), COMPONENT_FULL | COMPONENT_SWA)], 16)];
-        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
-    }
-
-    #[test]
     fn exact_boundary_only_matches_at_a_checkpoint() {
         // mamba lives only on the 4th block (a leaf checkpoint). full is on all.
         let s = spec(
@@ -752,20 +731,17 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_spec_version_excludes_the_worker() {
-        let mut s = spec(COMPONENT_FULL, 0, &[hbm()], &[], &[]);
-        s.version = SUPPORTED_SPEC_VERSION + 1; // a future wire we cannot read
-        let blocks = vec![blk(&[(hbm(), COMPONENT_FULL)], 16)];
-        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
-    }
-
-    #[test]
-    fn empty_declared_spec_excludes_the_worker() {
-        // A full-only worker declares no spec (None); a declared-but-empty spec
-        // (no components) is a misconfiguration and fails closed.
-        let s = spec(0, 0, &[hbm()], &[], &[]);
-        let blocks = vec![blk(&[(hbm(), COMPONENT_FULL)], 16)];
-        assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
+    fn unusable_specs_are_excluded() {
+        // Each of these declared specs is unusable and must fail closed: an empty
+        // component set, a future/unsupported version, and SWA without a window.
+        let blocks = vec![blk(&[(hbm(), COMPONENT_FULL | COMPONENT_SWA)], 16)];
+        let empty = spec(0, 0, &[hbm()], &[], &[]);
+        let mut future = spec(COMPONENT_FULL, 0, &[hbm()], &[], &[]);
+        future.version = SUPPORTED_SPEC_VERSION + 1;
+        let swa_no_window = spec(COMPONENT_FULL | COMPONENT_SWA, 0, &[hbm()], &[hbm()], &[]);
+        for s in [empty, future, swa_no_window] {
+            assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
+        }
     }
 
     #[test]
