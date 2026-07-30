@@ -130,6 +130,42 @@ impl CacheAwareZmqPolicy {
         let rel_threshold = (min_load as f32 * self.config.balance_rel_threshold) as usize;
         abs_diff > self.config.balance_abs_threshold && max_load > rel_threshold
     }
+
+    fn select_external(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+        signal: &crate::policies::ExternalPrefixSignal,
+    ) -> Option<Arc<Worker>> {
+        let sgl_kv_indexer::PrefixOutcome::Matched {
+            matches,
+            best_prefix_blocks,
+        } = &signal.outcome
+        else {
+            return None;
+        };
+        if signal.query_blocks == 0 {
+            return None;
+        }
+
+        let match_rate = *best_prefix_blocks as f32 / signal.query_blocks as f32;
+        if let Some(metrics) = self.metrics.get() {
+            metrics.observe_overlap_blocks(ctx.model().0.as_str(), *best_prefix_blocks as u64);
+        }
+        if match_rate <= self.config.cache_threshold {
+            return None;
+        }
+
+        workers
+            .iter()
+            .filter(|worker| {
+                matches.iter().any(|m| {
+                    m.matched_prefix_blocks == *best_prefix_blocks && m.address == worker.url
+                })
+            })
+            .min_by_key(|worker| worker.active_load())
+            .cloned()
+    }
 }
 
 impl Policy for CacheAwareZmqPolicy {
@@ -142,6 +178,12 @@ impl Policy for CacheAwareZmqPolicy {
         //    dropped in favour of evening out load.
         if self.is_imbalanced(workers) {
             return Self::pick_min_load(workers);
+        }
+        if let Some(worker) = ctx
+            .external_prefix()
+            .and_then(|signal| self.select_external(workers, ctx, signal))
+        {
+            return Some(worker);
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -263,6 +305,7 @@ mod tests {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            kv_indexer_endpoint: None,
         }
     }
 
@@ -350,6 +393,61 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
+    #[test]
+    fn external_prefix_signal_uses_existing_cache_policy() {
+        let mut config = cfg_default();
+        config.cache_threshold = 0.0;
+        let policy = CacheAwareZmqPolicy::new(
+            config,
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _load = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let signal = crate::policies::ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![sgl_kv_indexer::PrefixMatch {
+                    address: w0.url.clone(),
+                    matched_prefix_blocks: 4,
+                    worker_id: "w0".into(),
+                }],
+                best_prefix_blocks: 4,
+            },
+            query_blocks: 4,
+        };
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_external_prefix(Some(&signal));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, w0.url);
+    }
+
+    #[test]
+    fn external_no_signal_falls_back_to_existing_policy() {
+        let policy = CacheAwareZmqPolicy::new(
+            cfg_default(),
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _load = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let signal = crate::policies::ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::NoSignal(
+                sgl_kv_indexer::NoSignalReason::Timeout,
+            ),
+            query_blocks: 4,
+        };
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_external_prefix(Some(&signal));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, w1.url);
+    }
+
     /// Tree contains w0's prefix; cache-aware selection picks w0 even
     /// though w1 has lower load (the load skew is below the imbalance
     /// threshold, so cache wins).
@@ -377,6 +475,7 @@ mod tests {
                 cache_threshold: 0.0, // any match counts
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -414,6 +513,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -459,6 +559,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             toks,
@@ -510,6 +611,7 @@ mod tests {
                 cache_threshold: 1.0, // match_rate <= 1.0 always -> always fall back
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             toks,
@@ -593,6 +695,7 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
+                    kv_indexer_endpoint: None,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -632,6 +735,7 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
+                    kv_indexer_endpoint: None,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -690,6 +794,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -762,6 +867,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -800,6 +906,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -903,6 +1010,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -938,6 +1046,7 @@ mod tests {
                 cache_threshold: 0.0, // would normally always match
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1063,6 +1172,7 @@ mod tests {
                 cache_threshold: 0.99,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -1146,6 +1256,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree.clone(),
             registry,
@@ -1243,6 +1354,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
