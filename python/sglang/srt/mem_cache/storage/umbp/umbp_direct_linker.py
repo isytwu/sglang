@@ -417,7 +417,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "extkv_revoked": 0,
             "extkv_reconcile_failures": 0,
         }
-        self._metrics = _build_metrics_collector(tp_rank=tp_rank)
+        self.metrics = _build_metrics_collector(tp_rank=tp_rank)
         backend_name = getattr(self.backend_mode, "name", str(self.backend_mode))
         self._extkv_enabled = (
             tp_rank == 0
@@ -883,10 +883,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
-                        if self._metrics is not None:
+                        if self.metrics is not None:
                             # Ranges, not object sizes: a group covers only part
                             # of the layer stack, so only these ranges moved.
-                            self._metrics.increment_load_num_bytes(
+                            self.metrics.increment_load_num_bytes(
                                 sum(sum(entry) for entry in sizes[start:end]),
                                 plan.name.value,
                             )
@@ -1175,11 +1175,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         len(results),
                     )
                     return False
-                if self._metrics is not None:
+                if self.metrics is not None:
                     # object_sizes, not the ranges: the ranges tile each object
                     # exactly, so summing either is the same total, and the
                     # object view survives a future change to range splitting.
-                    self._metrics.increment_offload_num_bytes(
+                    self.metrics.increment_offload_num_bytes(
                         sum(object_sizes[start:end]), transfer.name.value
                     )
 

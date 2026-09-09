@@ -2225,11 +2225,47 @@ class UMBPLinkerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["pool"],
         )
 
+        self.match_kv_hit_tokens = Counter(
+            name="sglang:umbp_match_kv_hit_tokens_total",
+            documentation="Full-attention tokens a prefix match resolved, by "
+            "the tier that supplied them (device or host). Separates hitting "
+            "from transferring: a device hit moves no bytes.",
+            labelnames=list(labels.keys()) + ["tier"],
+        )
+
+        self.match_mamba_hit_slots = Counter(
+            name="sglang:umbp_match_mamba_hit_slots_total",
+            documentation="Recurrent-state slots a prefix match resolved from "
+            "the external tier. Slots, not tokens: one state per node "
+            "regardless of length. There is no device counterpart because the "
+            "device-side mamba match is not visible at this point; infer it "
+            "from a match that succeeded with this counter unmoved.",
+            labelnames=list(labels.keys()) + ["tier"],
+        )
+
+        self.match_outcome = Counter(
+            name="sglang:umbp_match_outcome_total",
+            documentation="Where each prefix match ended: device_complete (no "
+            "external lookup needed), no_tail, component_missing (a pool could "
+            "not build a lookup, so the conjunctive match bailed out), "
+            "host_miss, host_hit.",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
+
     def increment_offload_num_bytes(self, num_bytes: int, pool: str) -> None:
         self.offload_num_bytes.labels(**self.labels, pool=pool).inc(num_bytes)
 
     def increment_load_num_bytes(self, num_bytes: int, pool: str) -> None:
         self.load_num_bytes.labels(**self.labels, pool=pool).inc(num_bytes)
+
+    def increment_match_kv_hit_tokens(self, num_tokens: int, tier: str) -> None:
+        self.match_kv_hit_tokens.labels(**self.labels, tier=tier).inc(num_tokens)
+
+    def increment_match_mamba_hit_slots(self, num_slots: int, tier: str) -> None:
+        self.match_mamba_hit_slots.labels(**self.labels, tier=tier).inc(num_slots)
+
+    def increment_match_outcome(self, outcome: str) -> None:
+        self.match_outcome.labels(**self.labels, outcome=outcome).inc()
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

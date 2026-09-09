@@ -54,6 +54,9 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    # None when metrics are off or this rank does not report; the wrapper's
+    # match() reads it, so it must exist on every backend, not just UMBP.
+    metrics: object = None
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -180,12 +183,21 @@ class UnifiedCacheLinkerWrapper:
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
         page = cache.page_size
+        metrics = self.cache_linker.metrics
         device_hit_len = int(result.device_indices.numel())
+        # Counted before the early returns, so a fully device-served match is
+        # still recorded rather than silently dropped.
+        if metrics is not None and device_hit_len > 0:
+            metrics.increment_match_kv_hit_tokens(device_hit_len, "device")
         if device_hit_len >= len(key):
+            if metrics is not None:
+                metrics.increment_match_outcome("device_complete")
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            if metrics is not None:
+                metrics.increment_match_outcome("no_tail")
             return result
 
         lookup_transfers = []
@@ -194,6 +206,8 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
+                if metrics is not None:
+                    metrics.increment_match_outcome("component_missing")
                 return result
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
@@ -205,6 +219,8 @@ class UnifiedCacheLinkerWrapper:
             device_hit_pages=0,
         )
         if hit_pages == 0:
+            if metrics is not None:
+                metrics.increment_match_outcome("host_miss")
             return result
         hit_tokens = hit_pages * page
 
@@ -216,6 +232,12 @@ class UnifiedCacheLinkerWrapper:
         )
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+
+        if metrics is not None:
+            metrics.increment_match_outcome("host_hit")
+            metrics.increment_match_kv_hit_tokens(hit_tokens, "host")
+            if mamba_host_hit_length > 0:
+                metrics.increment_match_mamba_hit_slots(mamba_host_hit_length, "host")
 
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             prefix_key=key[: device_hit_len + hit_tokens],
