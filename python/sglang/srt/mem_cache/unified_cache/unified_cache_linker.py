@@ -417,6 +417,7 @@ class UnifiedCacheLinkerWrapper:
     ) -> list[PoolTransfer]:
         if not component_transfers:
             return []
+        metrics = self.cache_linker.metrics
         full = component_transfers[0][1]
         result = []
         transfers = (
@@ -457,6 +458,10 @@ class UnifiedCacheLinkerWrapper:
                     # owns, which the idle invariant reports as a mamba count one
                     # larger than the pool with leaked_mamba_pages=None.
                     if insert_result.mamba_exist:
+                        if metrics is not None:
+                            metrics.increment_load_dropped(
+                                transfer.name.value, "slot_freed_by_insert"
+                            )
                         continue
                 else:
                     indices, keys = self._select_adopted_pages(
@@ -466,6 +471,10 @@ class UnifiedCacheLinkerWrapper:
                         transfer.keys,
                     )
                     if not keys:
+                        if metrics is not None:
+                            metrics.increment_load_dropped(
+                                transfer.name.value, "no_adopted_page"
+                            )
                         continue
                     transfer.device_indices = indices
                     transfer.keys = keys
