@@ -62,6 +62,42 @@ def _ordered_layers(entry) -> list[int]:
     return [by_buffer[index] for index in range(pool_layer_count)]
 
 
+def _build_metrics_collector(*, tp_rank: int):
+    """Return a UMBP linker metrics collector, or None when it must stay silent.
+
+    Gated to attn-tp rank 0 unless enable_metrics_for_all_schedulers, matching
+    how the scheduler gates its own collectors: every rank registers the same
+    buffers, so all eight would otherwise report near-identical series.
+    """
+    from sglang.srt.observability.metrics_collector import (
+        STAT_LOGGER_ROLE_UMBP_LINKER,
+        UMBPLinkerMetricsCollector,
+        resolve_collector_class,
+    )
+    from sglang.srt.runtime_context import (
+        get_observability,
+        get_server_args,
+        get_serving,
+    )
+
+    observability = get_observability()
+    if not observability.enable_metrics:
+        return None
+    if tp_rank != 0 and not observability.enable_metrics_for_all_schedulers:
+        return None
+
+    labels = {
+        "model_name": get_serving().served_model_name,
+        "tp_rank": tp_rank,
+    }
+    if observability.extra_metric_labels:
+        labels.update(observability.extra_metric_labels)
+    collector_cls = resolve_collector_class(
+        get_server_args(), STAT_LOGGER_ROLE_UMBP_LINKER, UMBPLinkerMetricsCollector
+    )
+    return collector_cls(labels=labels)
+
+
 def _drain_sync_groups(params: CacheInitParams) -> tuple[Any, ...]:
     """Return the cache-rank groups that must agree on drain state."""
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
@@ -381,6 +417,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "extkv_revoked": 0,
             "extkv_reconcile_failures": 0,
         }
+        self._metrics = _build_metrics_collector(tp_rank=tp_rank)
         backend_name = getattr(self.backend_mode, "name", str(self.backend_mode))
         self._extkv_enabled = (
             tp_rank == 0
@@ -846,6 +883,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
+                        if self._metrics is not None:
+                            # Ranges, not object sizes: a group covers only part
+                            # of the layer stack, so only these ranges moved.
+                            self._metrics.increment_load_num_bytes(
+                                sum(sum(entry) for entry in sizes[start:end]),
+                                plan.name.value,
+                            )
                 # Only now is every layer in the group readable, so they are
                 # released together. A group wider than 1 trades overlap
                 # granularity for fewer times each object is named on the wire.
@@ -1131,6 +1175,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         len(results),
                     )
                     return False
+                if self._metrics is not None:
+                    # object_sizes, not the ranges: the ranges tile each object
+                    # exactly, so summing either is the same total, and the
+                    # object view survives a future change to range splitting.
+                    self._metrics.increment_offload_num_bytes(
+                        sum(object_sizes[start:end]), transfer.name.value
+                    )
 
         self._stats["offload"] += 1
         return True

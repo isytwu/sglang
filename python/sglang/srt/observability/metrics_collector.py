@@ -201,6 +201,7 @@ STAT_LOGGER_ROLE_TOKENIZER = "tokenizer"
 STAT_LOGGER_ROLE_STORAGE = "storage"
 STAT_LOGGER_ROLE_RADIX_CACHE = "radix_cache"
 STAT_LOGGER_ROLE_EXPERT_DISPATCH = "expert_dispatch"
+STAT_LOGGER_ROLE_UMBP_LINKER = "umbp_linker"
 
 
 def resolve_collector_class(
@@ -2189,6 +2190,46 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+
+class UMBPLinkerMetricsCollector(_StatLoggerDIMixin):
+    """Metrics for the UMBP external-cache linker (L3), by device pool.
+
+    Bytes, not tokens: a mamba hit is one state slot per node regardless of
+    length, so tokens are not commensurable across pools.
+    """
+
+    def __init__(self, labels: Dict[str, str]) -> None:
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+        from prometheus_client import Counter as _PromCounter
+
+        Counter = self._counter_cls or _PromCounter
+
+        self.labels = labels
+
+        self.offload_num_bytes = Counter(
+            name="sglang:umbp_offload_bytes_total",
+            documentation="Bytes written from GPU into the UMBP external tier, "
+            "by device pool (kv, mamba, ...). Counts only objects the tier "
+            "acknowledged. Its pool breakdown is the KDA-vs-full-attention "
+            "composition of what UMBP holds.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+
+        self.load_num_bytes = Counter(
+            name="sglang:umbp_load_bytes_total",
+            documentation="Bytes read back from the UMBP external tier into "
+            "GPU, by device pool (kv, mamba, ...). Divided by "
+            "sglang:umbp_offload_bytes_total of the same pool, gives how much "
+            "of what was offloaded was actually used.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+
+    def increment_offload_num_bytes(self, num_bytes: int, pool: str) -> None:
+        self.offload_num_bytes.labels(**self.labels, pool=pool).inc(num_bytes)
+
+    def increment_load_num_bytes(self, num_bytes: int, pool: str) -> None:
+        self.load_num_bytes.labels(**self.labels, pool=pool).inc(num_bytes)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
