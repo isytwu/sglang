@@ -2251,6 +2251,14 @@ class UMBPLinkerMetricsCollector(_StatLoggerDIMixin):
             "host_miss, host_hit.",
             labelnames=list(labels.keys()) + ["outcome"],
         )
+        self.load_dropped = Counter(
+            name="sglang:umbp_load_dropped_total",
+            documentation="Queued loads dropped between the match that credited "
+            "them and the transfer that would have moved them, by pool and "
+            "reason. A pool can be credited with a host hit and still move zero "
+            "bytes; this says where that happens.",
+            labelnames=list(labels.keys()) + ["pool", "reason"],
+        )
 
     def increment_offload_num_bytes(self, num_bytes: int, pool: str) -> None:
         self.offload_num_bytes.labels(**self.labels, pool=pool).inc(num_bytes)
@@ -2263,15 +2271,6 @@ class UMBPLinkerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_match_mamba_hit_slots(self, num_slots: int, tier: str) -> None:
         self.match_mamba_hit_slots.labels(**self.labels, tier=tier).inc(num_slots)
-
-        self.load_dropped = Counter(
-            name="sglang:umbp_load_dropped_total",
-            documentation="Queued loads dropped between the match that credited "
-            "them and the transfer that would have moved them, by pool and "
-            "reason. A pool can be credited with a host hit and still move zero "
-            "bytes; this says where that happens.",
-            labelnames=list(labels.keys()) + ["pool", "reason"],
-        )
 
     def increment_match_outcome(self, outcome: str) -> None:
         self.match_outcome.labels(**self.labels, outcome=outcome).inc()
