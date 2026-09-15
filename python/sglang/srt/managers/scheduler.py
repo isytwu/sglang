@@ -3785,7 +3785,12 @@ class Scheduler(
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
         adder = PrefillAdder(
-            self.page_size,
+            # Under --dcp-size > 1 the KV allocator and tree page on
+            # page_size * dcp_size; self.page_size is the unwidened value.
+            # Truncating chunks on the narrow grid misaligns the mamba
+            # checkpoint boundary and later trips _page_disjoint on free
+            # (mem_cache/allocator/base.py).
+            self.tree_cache.page_size if self.tree_cache is not None else self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
