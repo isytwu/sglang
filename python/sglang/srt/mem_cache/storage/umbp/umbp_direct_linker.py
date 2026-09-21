@@ -65,6 +65,38 @@ def _ordered_layers(entry) -> list[int]:
     return [by_buffer[index] for index in range(pool_layer_count)]
 
 
+def _build_metrics_collector(*, tp_rank: int):
+    """Return a UMBP linker metrics collector, or None when it must stay silent.
+
+    Gated to attn-tp rank 0 unless enable_metrics_for_all_schedulers, matching
+    how the scheduler gates its own collectors: every rank registers the same
+    buffers, so all eight would otherwise report near-identical series.
+    """
+    from sglang.srt.observability.metrics_collector import (
+        STAT_LOGGER_ROLE_UMBP_LINKER,
+        UMBPLinkerMetricsCollector,
+        resolve_collector_class,
+    )
+    from sglang.srt.runtime_context import get_observability, get_serving
+
+    observability = get_observability()
+    if not observability.enable_metrics:
+        return None
+    if tp_rank != 0 and not observability.enable_metrics_for_all_schedulers:
+        return None
+
+    labels = {
+        "model_name": get_serving().served_model_name,
+        "tp_rank": tp_rank,
+    }
+    if observability.extra_metric_labels:
+        labels.update(observability.extra_metric_labels)
+    collector_cls = resolve_collector_class(
+        STAT_LOGGER_ROLE_UMBP_LINKER, UMBPLinkerMetricsCollector
+    )
+    return collector_cls(labels=labels)
+
+
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
@@ -398,6 +430,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
         }
+        self._metrics = _build_metrics_collector(tp_rank=tp_rank)
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -927,6 +960,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
+                        if self._metrics is not None:
+                            # Ranges, not object sizes: a group covers only part
+                            # of the layer stack, so only these ranges moved.
+                            self._metrics.increment_load_num_bytes(
+                                sum(sum(entry) for entry in sizes[start:end]),
+                                plan.name.value,
+                            )
 
                     self._map_chunks(
                         [
@@ -1072,6 +1112,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         len(results),
                     )
                     return False
+                if self._metrics is not None:
+                    # object_sizes, not the ranges: the ranges tile each object
+                    # exactly, so summing either is the same total, and the
+                    # object view survives a future change to range splitting.
+                    self._metrics.increment_offload_num_bytes(
+                        sum(object_sizes[start:end]), plan.name.value
+                    )
                 return True
 
             chunk_ok = self._map_chunks(
