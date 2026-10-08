@@ -674,14 +674,14 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertEqual(match.host_hit_length, len(tokens))
         self.assertEqual(match.mamba_host_hit_length, 1)
         self._apply_match_to_req(req, match)
-        loaded, loaded_node = consumer.init_load_back(
+        loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
                 best_match_node=match.best_match_node,
                 host_hit_length=match.host_hit_length,
                 req=req,
             )
         )
-        self.assertEqual(loaded.numel(), len(tokens))
+        self.assertEqual(loaded_len, len(tokens))
         loads = {
             transfer.name: transfer
             for transfer in consumer_linker.queued_loads[req.rid]
@@ -706,7 +706,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
-        self.assertEqual(final_match.device_indices.numel(), len(tokens))
+        self.assertEqual(final_match.device_prefix_len, len(tokens))
         consumer.sanity_check()
 
 
