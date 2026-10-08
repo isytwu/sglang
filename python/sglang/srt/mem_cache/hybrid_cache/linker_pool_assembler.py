@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 
 class DevicePoolEntry:
@@ -32,6 +32,7 @@ class DevicePoolEntry:
         rows_are_pages: bool,
         packed: bool = True,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        dcp_size: int = 1,
     ):
         self.name = name
         self.indices_from_pool = indices_from_pool
@@ -42,7 +43,18 @@ class DevicePoolEntry:
         self.packed = packed
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
-        self._row_span = 1 if rows_are_pages else page_size
+        # Token-addressed indices are DCP-widened locs: the allocator spans
+        # [0, max_total * dcp_size) and each rank stores the locs it owns
+        # (`loc % dcp_size == dcp_rank`) at row `loc // dcp_size` (see
+        # `set_mla_kv_buffer_dcp_sharded_triton`), so a widened page of
+        # `page_size` locs is `page_size // dcp_size` rows here.
+        if page_size % dcp_size:
+            raise ValueError(
+                f"Pool {name}: page_size={page_size} must be a multiple of "
+                f"dcp_size={dcp_size} for the widened loc space to collapse."
+            )
+        self._dcp_size = dcp_size
+        self._row_span = 1 if rows_are_pages else page_size // dcp_size
 
         if not self.components or any(not component for component in self.components):
             raise ValueError(f"Device pool {name} has no storage buffers.")
@@ -94,10 +106,15 @@ class DevicePoolEntry:
             pages, starts[:, None] + self._page_offsets
         ):
             raise ValueError(f"Pool {self.name} requires aligned contiguous pages.")
+        # A page-addressed pool (mamba state slots, the DSA indexer) is indexed
+        # by slot id and is never DCP-widened, so it keeps the page divide.
+        # A token-addressed pool collapses the widened loc: the page start is
+        # page_size-aligned and page_size % dcp_size == 0, so every rank's first
+        # owned loc in the page floors to the same physical row.
         rows = (
             starts.div(self.page_size, rounding_mode="floor")
             if self._row_span == 1
-            else starts
+            else starts.div(self._dcp_size, rounding_mode="floor")
         )
         first_row = int(rows.min())
         last_row = int(rows.max()) + self._row_span
@@ -402,6 +419,14 @@ def _build_dsa_device_pool_group(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
+    # This entry packs the target's DCP-widened KV rows together with any MTP
+    # draft rows (replicated, indexed raw) under one set of rows; a single
+    # dcp_size cannot collapse both correctly.
+    if get_parallel().attn_dcp_size > 1:
+        raise ValueError(
+            "The direct external linker's DSA pool group does not support "
+            "--dcp-size > 1 yet."
+        )
     num_layers = kvcache.layer_num
     if any(pool.page_size != page_size for pool in mtp_draft_device_pools):
         raise ValueError("DSA MTP page size must match the tree page size.")
@@ -494,13 +519,7 @@ def _mamba_device_pool_entry(
     )
 
 
-def _build_mamba_swa_device_pool_group(
-    kvcache: Any, params: Any, page_size: int
-) -> DevicePoolGroup:
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-        _swa_layer_mappings,
-    )
-
+def _reject_unsupported_mamba_configs(req_to_token_pool: Any) -> None:
     # TODO(alphabetc1): support unified memory for hybrid Mamba models.
     if get_memory().enable_unified_memory:
         raise ValueError(
@@ -508,7 +527,6 @@ def _build_mamba_swa_device_pool_group(
             "on hybrid Mamba models yet."
         )
     # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
-    req_to_token_pool = params.req_to_token_pool
     if (
         req_to_token_pool.mamba_ckpt_pool is not None
         or req_to_token_pool.short_conv_pool.enabled
@@ -519,6 +537,15 @@ def _build_mamba_swa_device_pool_group(
             "or Mamba side states yet."
         )
 
+
+def _build_mamba_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+
+    _reject_unsupported_mamba_configs(params.req_to_token_pool)
     full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
     entries = [
         _mha_device_pool_entry(
@@ -531,6 +558,47 @@ def _build_mamba_swa_device_pool_group(
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     return DevicePoolGroup(entries, num_layers + 1, page_size)
+
+
+def _build_mamba_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    """FULL + MAMBA over a HybridLinearKVPool (e.g. Kimi K3: MLA + KDA)."""
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _stage_local_layer_mapping,
+    )
+
+    _reject_unsupported_mamba_configs(params.req_to_token_pool)
+    full_kv_pool = kvcache.full_kv_pool
+    if getattr(full_kv_pool, "kv_scale_buffer", None) is not None:
+        raise ValueError(
+            "The direct external linker does not support scaled KV caches yet."
+        )
+    full_layer_mapping = _stage_local_layer_mapping(
+        kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+    )
+    mamba_entry = _mamba_device_pool_entry(
+        params.req_to_token_pool, kvcache.start_layer
+    )
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_kv_pool,
+            components=[full_kv_pool.kv_buffer],
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+            # The MLA KV is the DCP-sharded pool: its indices are widened locs.
+            dcp_size=get_parallel().attn_dcp_size,
+        ),
+        mamba_entry,
+    ]
+    # Not rank_replicated: the MLA KV is TP-replicated but the KDA state is not.
+    return DevicePoolGroup(
+        entries, len(full_layer_mapping | mamba_entry.layer_mapping), page_size
+    )
 
 
 def resolve_hybrid_device_pool_group(

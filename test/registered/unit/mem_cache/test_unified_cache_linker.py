@@ -663,11 +663,18 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             self.assertEqual(unpublished.device_prefix_len, 3)
         consumer.sanity_check()
 
-    def _mamba_linker_consumer(self, tokens):
+    @staticmethod
+    def _mamba_pools(with_swa):
+        return {PoolName.KV, PoolName.MAMBA} | ({PoolName.SWA} if with_swa else set())
+
+    def _mamba_linker_consumer(self, tokens, *, with_swa=True):
+        # with_swa=False is the Kimi K3 shape: FULL + MAMBA, no sliding window.
         self.cfg = CacheConfig(
             page_size=1,
-            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
-            sliding_window_size=2,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+            if with_swa
+            else (ComponentType.FULL, ComponentType.MAMBA),
+            sliding_window_size=2 if with_swa else None,
             kv_size=64,
             max_context_len=64,
         )
@@ -681,10 +688,11 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         *ancestors, offload = producer_linker.offload_calls
         for transfers in ancestors:
             self.assertEqual(
-                {transfer.name for transfer in transfers}, {PoolName.KV, PoolName.SWA}
+                {transfer.name for transfer in transfers},
+                self._mamba_pools(with_swa) - {PoolName.MAMBA},
             )
         offloads = {transfer.name: transfer for transfer in offload}
-        self.assertEqual(set(offloads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        self.assertEqual(set(offloads), self._mamba_pools(with_swa))
         mamba_offload = offloads[PoolName.MAMBA]
         self.assertEqual(mamba_offload.keys, offloads[PoolName.KV].keys[-1:])
         self.assertEqual(mamba_offload.hit_policy, PoolHitPolicy.TRAILING_PAGES)
@@ -705,9 +713,14 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         return consumer, consumer_req_pool, consumer_linker
 
     def test_mamba_state_round_trips_only_at_its_checkpoint(self):
+        for with_swa in (True, False):
+            with self.subTest(with_swa=with_swa):
+                self._check_mamba_state_round_trips_only_at_its_checkpoint(with_swa)
+
+    def _check_mamba_state_round_trips_only_at_its_checkpoint(self, with_swa):
         tokens = list(range(1, 7))
         consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
-            tokens
+            tokens, with_swa=with_swa
         )
 
         # Every KV and SWA page is stored, but only the full prefix has a state.
@@ -738,7 +751,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             transfer.name: transfer
             for transfer in consumer_linker.queued_loads[req.rid]
         }
-        self.assertEqual(set(loads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        self.assertEqual(set(loads), self._mamba_pools(with_swa))
         self.assertEqual(loads[PoolName.MAMBA].keys, loads[PoolName.KV].keys[-1:])
         loaded_state = loads[PoolName.MAMBA].device_indices
         self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
@@ -763,9 +776,14 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         consumer.sanity_check()
 
     def test_mamba_load_supersedes_a_shorter_device_cow(self):
+        for with_swa in (True, False):
+            with self.subTest(with_swa=with_swa):
+                self._check_mamba_load_supersedes_a_shorter_device_cow(with_swa)
+
+    def _check_mamba_load_supersedes_a_shorter_device_cow(self, with_swa):
         tokens = list(range(1, 7))
         consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
-            tokens
+            tokens, with_swa=with_swa
         )
         self._insert(
             consumer,

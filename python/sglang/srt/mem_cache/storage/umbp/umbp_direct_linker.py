@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -37,7 +38,7 @@ device_module = get_device_module()
 
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
 # This is a logical-page count; existence queries carry keys only, no ranges.
-CHUNK_PAGES = 64
+CHUNK_PAGES = int(os.getenv("UMBP_CHUNK_PAGES", "64"))
 
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
@@ -156,6 +157,16 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
+        # Chunks of one batch touch disjoint keys and pointers, so their calls
+        # may run concurrently; 1 keeps them serial on the draining thread.
+        self._rpc_parallelism = max(1, int(os.getenv("UMBP_RPC_PARALLELISM", "1")))
+        self._rpc_pool = (
+            ThreadPoolExecutor(
+                max_workers=self._rpc_parallelism, thread_name_prefix="umbp-rpc"
+            )
+            if self._rpc_parallelism > 1
+            else None
+        )
         # Coalesce queued offload tasks up to this many pages; offload_nodes
         # queues one task per node, so they arrive a page or two at a time.
         self._offload_coalesce_pages = max(
@@ -425,8 +436,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         max_objects = CHUNK_PAGES * self.num_layers
         pages_per_call = max(1, max_objects // objects_per_page)
 
-        page_exists = []
-        for start in range(0, len(page_keys), pages_per_call):
+        def _exists_chunk(start: int) -> list[bool]:
             chunk_pages = page_keys[start : start + pages_per_call]
             object_keys, _ = self._object_keys_for_pages(chunk_pages, transfer)
             exists = list(self.storage.client.batch_exists(object_keys))
@@ -435,10 +445,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     f"UMBP exists result-size mismatch for pool {transfer.name}: "
                     f"expected={len(object_keys)} actual={len(exists)}."
                 )
-            page_exists.extend(
+            return [
                 all(exists[index : index + objects_per_page])
                 for index in range(0, len(exists), objects_per_page)
-            )
+            ]
+
+        # _apply_hit_policy reads this as a positional prefix, so the chunk
+        # results must stay in page order (_map_chunks keeps submission order).
+        page_exists = []
+        for chunk in self._map_chunks(
+            [
+                (lambda s=start: _exists_chunk(s))
+                for start in range(0, len(page_keys), pages_per_call)
+            ]
+        ):
+            page_exists.extend(chunk)
         return page_exists
 
     @staticmethod
@@ -783,6 +804,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         offsets = [[layer[index][3] for layer in items] for index in range(components)]
         return ptrs, sizes * len(rows), offsets * len(rows)
 
+    def _map_chunks(self, jobs: list[Callable[[], Any]]) -> list[Any]:
+        """Run each zero-arg job, at most UMBP_RPC_PARALLELISM at a time, and
+        return the results in submission order."""
+        if self._rpc_pool is None or len(jobs) <= 1:
+            return [job() for job in jobs]
+        futures = [self._rpc_pool.submit(job) for job in jobs]
+        return [future.result() for future in futures]
+
     @staticmethod
     def _entries_per_call(sizes: list[list[int]]) -> int:
         """Objects per RPC, budgeted by the ranges they actually carry.
@@ -812,7 +841,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         continue
                     ptrs, sizes, offsets = meta
                     step = self._entries_per_call(sizes)
-                    for start in range(0, len(plan.keys), step):
+
+                    def _get_chunk(start: int) -> None:
                         end = start + step
                         chunk_keys = plan.keys[start:end]
                         results = list(
@@ -834,6 +864,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
+
+                    self._map_chunks(
+                        [
+                            (lambda s=start: _get_chunk(s))
+                            for start in range(0, len(plan.keys), step)
+                        ]
+                    )
                 # Only now is every layer in the group readable, so they are
                 # released together. A group wider than 1 trades overlap
                 # granularity for fewer times each object is named on the wire.
@@ -947,7 +984,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # An object's ranges must tile it exactly, so a chunk boundary may
             # fall between objects but never inside one.
             step = self._entries_per_call(sizes)
-            for start in range(0, len(plan.keys), step):
+
+            def _put_chunk(start: int) -> bool:
                 end = start + step
                 chunk_keys = plan.keys[start:end]
                 results = list(
@@ -971,6 +1009,16 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         len(results),
                     )
                     return False
+                return True
+
+            chunk_ok = self._map_chunks(
+                [
+                    (lambda s=start: _put_chunk(s))
+                    for start in range(0, len(plan.keys), step)
+                ]
+            )
+            if not all(chunk_ok):
+                return False
 
         self._stats["offload"] += len(tasks)
         self._stats["offload_batches"] += 1
@@ -1011,6 +1059,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if thread.is_alive():
                 queue.put(None)
                 thread.join()
+        if self._rpc_pool is not None:
+            self._rpc_pool.shutdown(wait=True)
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until
