@@ -720,7 +720,28 @@ class MambaComponent(TreeComponent):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         if phase == LinkerTransferPhase.LOAD:
-            transfer.device_indices = self._alloc_mamba_slot().to(torch.int64)
+            # Not _alloc_mamba_slot(): that asserts when the pool is exhausted,
+            # and the pool CAN be exhausted here by this very path. Each
+            # in-flight linker load pins its slot through the node lock
+            # _queue_load takes, and nothing bounds how many loads are in
+            # flight, so a burst pins every slot and leaves eviction with
+            # nothing to reclaim. Measured at DCP8/conc=48: the assertion fired
+            # ~7 minutes in, not from the linker but from an unrelated
+            # prepare_for_caching_req that found the pool already drained,
+            # while a HiCache arm on the identical configuration ran clean.
+            #
+            # Returning None is the contract load_back() already implements:
+            # the caller ABORTs the transfers it has built and falls back to
+            # recomputing this prefix. Declining one external load costs a
+            # recompute; asserting costs all eight ranks.
+            allocator = self.cache.req_to_token_pool.mamba_allocator
+            slot = allocator.alloc(1)
+            if slot is None:
+                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                slot = allocator.alloc(1)
+            if slot is None:
+                return None
+            transfer.device_indices = slot.to(torch.int64)
         return transfer
 
     def update_external_linker_load(
