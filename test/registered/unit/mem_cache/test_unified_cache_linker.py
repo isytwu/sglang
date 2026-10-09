@@ -1107,6 +1107,92 @@ def test_async_offload_pins_node_until_completion():
     assert unlocks == [(node_id, lock_params)]
 
 
+def _offloadable_nodes(count):
+    return {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in range(count)
+    }
+
+
+def _mamba_offload_cache(nodes, *, mamba_pool_size, offload_transfers):
+    return _cache_for_wrapper(
+        components={ComponentType.MAMBA: object()},
+        req_to_token_pool=SimpleNamespace(
+            mamba_allocator=SimpleNamespace(size=mamba_pool_size)
+        ),
+        tree_core=_FakeExternalTreeCore(nodes, offload_transfers=offload_transfers),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: None),
+        dec_lock_ref=lambda node_id, params: None,
+    )
+
+
+def test_write_through_leaves_a_quarter_of_the_mamba_pool_unpinned():
+    nodes = _offloadable_nodes(10)
+    linker = _FakeLinker()
+    cache = _mamba_offload_cache(
+        nodes,
+        mamba_pool_size=8,
+        offload_transfers=[
+            PoolTransfer(name=PoolName.KV, keys=["page"]),
+            PoolTransfer(name=PoolName.MAMBA, keys=["page"]),
+        ],
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper.offload_nodes(list(nodes))
+
+    # A queued offload locks its node, which hides its mamba state from
+    # eviction; two of the eight slots must stay reclaimable.
+    assert [pending.lock_node_id for pending in wrapper.pending_offloads] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert len(linker.queued_offloads) == 6
+    assert all(nodes[node_id].write_through_pending_id is None for node_id in (6, 7))
+
+    linker.completed_offloads.append(True)
+    wrapper.commit_completed_offloads(wrapper.take_completed_offloads(finish_count=1))
+    wrapper.offload_nodes([6])
+
+    assert nodes[0].external_cache_stored
+    assert nodes[6].write_through_pending_id == 6
+    assert len(wrapper.pending_offloads) == 6
+
+
+def test_kv_only_offloads_ignore_the_mamba_ceiling():
+    nodes = _offloadable_nodes(10)
+    cache = _mamba_offload_cache(
+        nodes,
+        mamba_pool_size=8,
+        offload_transfers=[PoolTransfer(name=PoolName.KV, keys=["page"])],
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    wrapper.offload_nodes(list(nodes))
+
+    assert len(wrapper.pending_offloads) == 10
+
+
+def test_a_tree_without_mamba_has_no_offload_ceiling():
+    nodes = _offloadable_nodes(10)
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore(nodes),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: None),
+        dec_lock_ref=lambda node_id, params: None,
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    wrapper.offload_nodes(list(nodes))
+
+    assert len(wrapper.pending_offloads) == 10
+
+
 def test_offload_skips_node_already_stored_by_tree_core():
     linker = _FakeLinker()
     node = SimpleNamespace(
