@@ -122,6 +122,16 @@ class UnifiedCacheLinker(ABC):
     def close(self) -> None:
         """Quiesce all transfers and release backend resources."""
 
+    def store_responsive(self) -> bool:
+        """Whether this rank's store is answering. Reduced over the attention
+        ranks with every lookup and handed back via set_store_responsive."""
+        return True
+
+    def set_store_responsive(self, responsive: bool) -> None:
+        """The attention ranks' agreed view as of the latest lookup. Every rank
+        receives the same value at the same point, so it may steer decisions
+        that change tree state, such as declining an offload."""
+
 
 class ExternalCacheHitMarker(NamedTuple):
     """What ``match`` found in the external store, consumed by ``load_back``.
@@ -253,14 +263,17 @@ class UnifiedCacheLinkerWrapper:
 
         A rank's set is sparse, so reducing per-rank maxima could land on a
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
-        makes the reduction an intersection.
+        makes the reduction an intersection. The extra last slot carries each
+        rank's store health through the same reduction.
         """
-        mask = torch.zeros(num_pages + 1, dtype=torch.int)
+        mask = torch.zeros(num_pages + 2, dtype=torch.int)
         for pages in restorable:
             if device_hit_pages < pages <= num_pages:
                 mask[pages] = 1
+        mask[-1] = int(self.cache_linker.store_responsive())
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        common = mask.nonzero()
+        self.cache_linker.set_store_responsive(bool(mask[-1].item()))
+        common = mask[:-1].nonzero()
         if common.numel() == 0:
             return 0
         return int(common[-1].item())

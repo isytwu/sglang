@@ -861,7 +861,8 @@ class TestUnifiedCacheLinkerTreeCoreRustBackend(
 
 
 def test_restorable_prefix_intersects_sparse_rank_results():
-    remote_mask = torch.tensor([0, 0, 1, 0, 0], dtype=torch.int)
+    # Pages 0..4, then the remote rank's store-health slot.
+    remote_mask = torch.tensor([0, 0, 1, 0, 0, 1], dtype=torch.int)
 
     def intersect_remote_mask(mask, op):
         assert op == torch.distributed.ReduceOp.MIN
@@ -873,6 +874,37 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
 
     assert hit_pages == 2
+
+
+def test_store_health_is_agreed_across_ranks():
+    class _HealthLinker(_FakeLinker):
+        def __init__(self, responsive):
+            super().__init__()
+            self.responsive = responsive
+            self.agreed = []
+
+        def store_responsive(self):
+            return self.responsive
+
+        def set_store_responsive(self, responsive):
+            self.agreed.append(responsive)
+
+    def reduce_with(remote_health):
+        def reduce(mask, op):
+            assert op == torch.distributed.ReduceOp.MIN
+            remote = torch.ones_like(mask)
+            remote[-1] = remote_health
+            mask.copy_(torch.minimum(mask, remote))
+
+        return reduce
+
+    # A stalled store on another rank reaches this rank, and vice versa.
+    for local, remote, agreed in ((True, 0, False), (False, 1, False), (True, 1, True)):
+        linker = _HealthLinker(local)
+        cache = _cache_for_wrapper(_all_reduce_attn_groups=reduce_with(remote))
+        wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+        wrapper._sync_restorable_prefix([2], num_pages=4, device_hit_pages=0)
+        assert linker.agreed == [agreed]
 
 
 def test_async_offload_pins_node_until_completion():

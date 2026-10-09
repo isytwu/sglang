@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -213,6 +215,23 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if self._rpc_parallelism > 1
             else None
         )
+        # A lookup that outlives this deadline counts as a miss; 0 waits forever.
+        self._lookup_timeout_s = (
+            max(0.0, float(os.getenv("UMBP_LOOKUP_TIMEOUT_MS", "1000"))) / 1000
+        )
+        # One worker, so at most one lookup is ever left running past its deadline.
+        self._lookup_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="umbp-lookup"
+        )
+        self._stuck_lookup: Future | None = None
+        # An offload batch busy for longer than this means the store has stopped
+        # draining; 0 never treats it as stalled.
+        self._offload_stall_s = (
+            max(0.0, float(os.getenv("UMBP_OFFLOAD_STALL_MS", "5000"))) / 1000
+        )
+        self._offload_busy_since: float | None = None
+        # The attention ranks' agreed view, from the latest lookup's reduction.
+        self._ranks_see_stall = False
         # Coalesce queued offload tasks up to this many pages; offload_nodes
         # queues one task per node, so they arrive a page or two at a time.
         self._offload_coalesce_pages = max(
@@ -421,8 +440,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
             "lookup": 0,
+            "lookup_timeout": 0,
+            "lookup_skipped": 0,
             "load": 0,
             "offload": 0,
+            "offload_skipped": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
         }
@@ -531,6 +553,37 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        # The scheduler waits on this inside the prefill batch build, so a store
+        # that stops answering would stall every rank. A miss here is safe: the
+        # caller intersects the restorable lengths over the attention ranks, so
+        # one rank's miss becomes a miss on all of them.
+        if self._lookup_timeout_s <= 0:
+            return self._lookup(rid, transfers)
+        stuck = self._stuck_lookup
+        if stuck is not None:
+            if not stuck.done():
+                self._stats["lookup_skipped"] += 1
+                return []
+            self._stuck_lookup = None
+            if stuck.exception() is not None:
+                logger.warning(
+                    "UMBP lookup failed after its deadline: %r", stuck.exception()
+                )
+        future = self._lookup_pool.submit(self._lookup, rid, transfers)
+        try:
+            return future.result(timeout=self._lookup_timeout_s)
+        except FutureTimeoutError:
+            self._stuck_lookup = future
+            self._stats["lookup_timeout"] += 1
+            logger.warning(
+                "UMBP lookup exceeded %.0f ms; lookups count as misses until it "
+                "returns (timeouts=%d).",
+                self._lookup_timeout_s * 1000,
+                self._stats["lookup_timeout"],
+            )
+            return []
+
+    def _lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -974,6 +1027,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ]
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
+        # The tree pins a node until its offload lands. With the store stalled,
+        # queuing more would pin every new node, and Mamba slots run out within
+        # a minute; writes are best effort, so drop them until it drains. Pins
+        # decide what may be evicted, so this must match on every rank: the
+        # agreed view, never this rank's own.
+        if self._ranks_see_stall:
+            self._stats["offload_skipped"] += 1
+            return False
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
@@ -1019,14 +1080,39 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if stopping:
                 return
 
+    def store_responsive(self) -> bool:
+        return not self._store_stalled()
+
+    def set_store_responsive(self, responsive: bool) -> None:
+        if not responsive and not self._ranks_see_stall:
+            logger.warning(
+                "UMBP store is stalled on some rank; skipping offloads until it drains."
+            )
+        elif responsive and self._ranks_see_stall:
+            logger.info("UMBP store answers on every rank again; offloads resume.")
+        self._ranks_see_stall = not responsive
+
+    def _store_stalled(self) -> bool:
+        stuck = self._stuck_lookup
+        if stuck is not None and not stuck.done():
+            return True
+        since = self._offload_busy_since
+        return (
+            self._offload_stall_s > 0
+            and since is not None
+            and time.monotonic() - since > self._offload_stall_s
+        )
+
     def _offload_batch(self, tasks: list[_OffloadTask]) -> None:
         success = False
+        self._offload_busy_since = time.monotonic()
         try:
             success = self._run_offload(tasks)
         except BaseException:
             logger.exception("UMBP offload failed")
             success = False
         finally:
+            self._offload_busy_since = None
             # One result per task in submission order: the tree pairs them
             # positionally. A batch resolves as a unit because the first failed
             # pool stops the rest, leaving every task in it incomplete.
@@ -1151,6 +1237,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if thread.is_alive():
                 queue.put(None)
                 thread.join()
+        # A lookup still stuck in the store may never return; do not wait on it.
+        self._lookup_pool.shutdown(wait=self._stuck_lookup is None)
         if self._rpc_pool is not None:
             self._rpc_pool.shutdown(wait=True)
         if self._standalone_process_mode and self._registered:

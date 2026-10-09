@@ -16,6 +16,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def _with_idle_store(linker):
+    # offload() first checks the ranks' agreed view of the store.
+    linker._ranks_see_stall = False
+    return linker
+
+
 class TestStorageSuffix(CustomTestCase):
     def test_replicated_group_drops_the_tp_term(self):
         # MLA/DSA pages are byte-identical on every attention TP rank, so every
@@ -61,7 +67,7 @@ class TestEveryRankWrites(CustomTestCase):
     """
 
     def test_offload_queues_the_write_on_every_rank(self):
-        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker = _with_idle_store(UMBPDirectLinker.__new__(UMBPDirectLinker))
         linker._offload_results = Queue()
         linker._offload_queue = Queue()
         linker._gc_frozen = True  # short-circuits _freeze_gc_once
@@ -79,7 +85,7 @@ class TestEveryRankWrites(CustomTestCase):
         self.assertEqual(linker._offload_results.qsize(), 0)
 
     def test_empty_transfer_set_produces_no_result(self):
-        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker = _with_idle_store(UMBPDirectLinker.__new__(UMBPDirectLinker))
         linker._offload_results = Queue()
         linker._offload_queue = Queue()
         linker._gc_frozen = True
