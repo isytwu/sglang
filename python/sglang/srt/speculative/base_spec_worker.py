@@ -53,6 +53,32 @@ def _can_pack_hicache_mtp(
     return is_nextn_mtp or is_dspark_dsv4
 
 
+def _can_pack_linker_draft(
+    spec_algorithm: SpeculativeAlgorithm,
+    draft_runners: tuple[ModelRunner, ...],
+    target_runner: ModelRunner,
+) -> bool:
+    """Draft KV the direct linker stores next to the target's.
+
+    Only the FULL + Mamba pool group (hybrid linear targets such as Kimi K3)
+    carries a DSPARK draft's MHA KV, as its own DRAFT pool; every other group
+    still rejects a draft it would omit from storage.
+    """
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MHATokenToKVPool,
+    )
+
+    return (
+        spec_algorithm.is_dspark()
+        and isinstance(target_runner.token_to_kv_pool, HybridLinearKVPool)
+        and all(
+            isinstance(runner.token_to_kv_pool, MHATokenToKVPool)
+            for runner in draft_runners
+        )
+    )
+
+
 class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
@@ -288,6 +314,14 @@ class BaseSpecWorker(ABC):
             )
 
         if get_memory().enable_unified_cache_external_linker:
+            if _can_pack_linker_draft(
+                spec_algorithm, draft_runners, target_model_runner
+            ):
+                target_model_runner.mtp_draft_device_pools = draft_pools
+                return HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.PACKED,
+                    device_pools=draft_pools,
+                )
             raise NotImplementedError(
                 "The external linker only supports packed draft KV caches."
             )
