@@ -246,6 +246,17 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Ceiling on in-flight offloads that pin a mamba state; None when the
+        # tree has no MAMBA component. The quarter left over is what eviction
+        # reclaims from: the pool only has to stay non-empty.
+        mamba_pool_size = (
+            self.cache.req_to_token_pool.mamba_allocator.size
+            if ComponentType.MAMBA in cache.components
+            else 0
+        )
+        self._mamba_offload_cap = (
+            mamba_pool_size - max(1, mamba_pool_size // 4) if mamba_pool_size else None
+        )
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -474,7 +485,25 @@ class UnifiedCacheLinkerWrapper:
             if transfers is not None:
                 if self._skip_swa:
                     transfers = [t for t in transfers if t.name != PoolName.SWA]
+                if not self._mamba_offload_has_headroom(transfers):
+                    continue
                 self._offload_node(node_id, transfers)
+
+    def _mamba_offload_has_headroom(self, transfers: list[PoolTransfer]) -> bool:
+        """Refuse an offload that would pin the last reclaimable mamba states.
+
+        A queued offload holds `inc_lock_ref` on its node until the backend
+        acknowledges it, and the MAMBA LRU skips locked nodes. Unbounded, the
+        queue can lock every checkpoint once the backend drains slower than
+        prefill donates them, and the next mamba allocation then fails on
+        every rank. Skipping leaves the checkpoint device-resident and
+        evictable, just not persisted, as when `offload()` declines to queue.
+        """
+        if self._mamba_offload_cap is None:
+            return True
+        if not any(transfer.name == PoolName.MAMBA for transfer in transfers):
+            return True
+        return len(self.pending_offloads) < self._mamba_offload_cap
 
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
