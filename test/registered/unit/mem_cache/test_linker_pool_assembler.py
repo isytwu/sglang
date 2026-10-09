@@ -577,8 +577,24 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 mamba_cache=SimpleNamespace(conv=[conv], temporal=temporal),
             ),
         )
-        params = SimpleNamespace(req_to_token_pool=req_to_token_pool)
+        params = SimpleNamespace(
+            req_to_token_pool=req_to_token_pool, mtp_draft_device_pools=()
+        )
         return kvcache, params, kv, conv, temporal
+
+    @staticmethod
+    def _dspark_draft(num_layers=1, rows=18):
+        return SimpleNamespace(
+            page_size=2,
+            k_buffer=[
+                torch.zeros((rows, 4), dtype=torch.uint8) for _ in range(num_layers)
+            ],
+            v_buffer=[
+                torch.zeros((rows, 4), dtype=torch.uint8) for _ in range(num_layers)
+            ],
+            k_scale_buffer=None,
+            native_k_scale_buffer=None,
+        )
 
     def _resolve_mamba(self, kvcache, params, *, page_size=2, unified_memory=False):
         with patch(
@@ -639,6 +655,140 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(
             group.entry_map[PoolName.MAMBA].prepare_locations(torch.tensor([5])), [5]
         )
+
+    def test_mamba_carries_a_dspark_draft_as_its_own_pool(self):
+        kvcache, params, kv, _, _ = self._mamba_stack()
+        draft = self._dspark_draft()
+        params.mtp_draft_device_pools = (draft,)
+        with get_parallel().override(attn_dcp_size=1):
+            group = self._resolve_mamba(kvcache, params)
+
+        # The draft KV follows the target KV's indices, as its own pool.
+        self.assertEqual(
+            group.sources,
+            {
+                PoolName.KV: PoolName.KV,
+                PoolName.DRAFT: PoolName.KV,
+                PoolName.MAMBA: PoolName.MAMBA,
+            },
+        )
+        entry = group.entry_map[PoolName.DRAFT]
+        # Draft layer 0 rides on the first full-attention layer (1).
+        self.assertEqual(entry.layer_mapping, {1: 0})
+        self.assertEqual(entry.prepare_locations(torch.arange(4, 6)), [4])
+        ptrs, sizes, offsets = entry.get_prepared_layer_range_meta([4], 1)
+        self.assertEqual(
+            ptrs,
+            [
+                [
+                    draft.k_buffer[0].data_ptr() + 4 * 4,
+                    draft.v_buffer[0].data_ptr() + 4 * 4,
+                ]
+            ],
+        )
+        self.assertEqual(sizes, [[8, 8]])
+        self.assertEqual(offsets, [[0, 8]])
+        # The target KV entry is unchanged by the draft.
+        self.assertEqual(group.entry_map[PoolName.KV].layer_mapping, {1: 0})
+
+        load = group.resolve_transfers(
+            [
+                PoolTransfer(
+                    name=PoolName.KV, keys=["k0"], device_indices=torch.arange(4, 6)
+                ),
+                PoolTransfer(
+                    name=PoolName.MAMBA, keys=["k0"], device_indices=torch.tensor([3])
+                ),
+            ]
+        )
+        self.assertEqual(
+            {t.name for t in load}, {PoolName.KV, PoolName.DRAFT, PoolName.MAMBA}
+        )
+
+    def test_mamba_keeps_the_draft_uncollapsed_under_dcp(self):
+        kvcache, params, _, _, _ = self._mamba_stack()
+        # A draft worker pages the widened loc space: its page is the tree's.
+        draft = self._dspark_draft()
+        draft.page_size = 4
+        params.mtp_draft_device_pools = (draft,)
+        with get_parallel().override(attn_dcp_size=2):
+            group = self._resolve_mamba(kvcache, params, page_size=4)
+
+        # The same widened page [8, 12): rows 4..5 of the sharded target KV,
+        # rows 8..11 of the draft, which holds every token.
+        self.assertEqual(
+            group.entry_map[PoolName.KV].prepare_locations(torch.arange(8, 12)), [4]
+        )
+        entry = group.entry_map[PoolName.DRAFT]
+        self.assertEqual(entry.prepare_locations(torch.arange(8, 12)), [8])
+        ptrs, sizes, offsets = entry.get_prepared_layer_range_meta([8], 1)
+        self.assertEqual(
+            ptrs,
+            [
+                [
+                    draft.k_buffer[0].data_ptr() + 8 * 4,
+                    draft.v_buffer[0].data_ptr() + 8 * 4,
+                ]
+            ],
+        )
+        self.assertEqual(sizes, [[16, 16]])
+        self.assertEqual(offsets, [[0, 16]])
+
+    def test_mamba_rejects_draft_it_cannot_store(self):
+        kvcache, params, _, _, _ = self._mamba_stack()
+        params.mtp_draft_device_pools = (self._dspark_draft(num_layers=2),)
+        with get_parallel().override(attn_dcp_size=1):
+            with self.assertRaisesRegex(ValueError, "exceed the 1 full-attention"):
+                self._resolve_mamba(kvcache, params)
+
+    def test_linker_packs_dspark_draft_only_for_hybrid_linear_targets(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+        )
+        from sglang.srt.speculative import base_spec_worker as spec
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        draft = SimpleNamespace(
+            token_to_kv_pool=MHATokenToKVPool.__new__(MHATokenToKVPool),
+            model_config=SimpleNamespace(
+                num_nextn_predict_layers=0,
+                hf_config=SimpleNamespace(architectures=["DSparkDraftModel"]),
+            ),
+        )
+        for target_pool, packed in (
+            (HybridLinearKVPool.__new__(HybridLinearKVPool), True),
+            (object(), False),
+        ):
+            target = SimpleNamespace(
+                spec_algorithm=SpeculativeAlgorithm.DSPARK, token_to_kv_pool=target_pool
+            )
+            worker = SimpleNamespace(
+                target_worker=SimpleNamespace(model_runner=target),
+                _draft_model_runners=lambda: (draft,),
+            )
+            with (
+                self.subTest(packed=packed),
+                patch.object(
+                    spec,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        enable_hierarchical_cache=False,
+                        enable_unified_cache_external_linker=True,
+                    ),
+                ),
+            ):
+                if packed:
+                    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+                    self.assertEqual(plan.mode, spec.HiCacheDraftMode.PACKED)
+                    self.assertEqual(
+                        target.mtp_draft_device_pools, (draft.token_to_kv_pool,)
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "only supports packed"
+                    ):
+                        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
 
     def test_mamba_rejects_unsupported_configurations(self):
         kvcache, params, _, _, _ = self._mamba_stack()
