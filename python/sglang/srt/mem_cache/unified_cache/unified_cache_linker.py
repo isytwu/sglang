@@ -241,7 +241,18 @@ class UnifiedCacheLinkerWrapper:
             else 0
         )
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
-        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+        # Only claim it when the whole probed tail is restorable: LOOKUP asked
+        # for the state at tail_hashes[-1], but load_back will ask for the one
+        # at tail_hashes[hit_pages - 1], and on a truncated hit those are
+        # different keys. Claiming the hit anyway makes the load request a key
+        # nothing ever validated, and the UMBP backend raises on the miss
+        # instead of degrading -- `UMBP get failed for pool=mamba, success=0/1`
+        # on all eight ranks, 24 minutes into DCP8/conc=48.
+        mamba_host_hit_length = (
+            1
+            if PoolName.MAMBA in by_pool and hit_pages == len(tail_hashes)
+            else 0
+        )
 
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             prefix_key=key[: device_hit_len + hit_tokens],
