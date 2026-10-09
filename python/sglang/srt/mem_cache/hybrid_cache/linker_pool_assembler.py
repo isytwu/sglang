@@ -612,6 +612,12 @@ def _build_mamba_device_pool_group(
         ),
         mamba_entry,
     ]
+    if params.mtp_draft_device_pools:
+        entries.append(
+            _mamba_draft_pool_entry(
+                params.mtp_draft_device_pools, full_layer_mapping, page_size
+            )
+        )
     # Not rank_replicated: the MLA KV is TP-replicated but the KDA state is not.
     # The KV alone stays identical across attention TP ranks unless DCP shards it.
     return DevicePoolGroup(
@@ -619,6 +625,54 @@ def _build_mamba_device_pool_group(
         len(full_layer_mapping | mamba_entry.layer_mapping),
         page_size,
         kv_rank_replicated=get_parallel().attn_dcp_size == 1,
+    )
+
+
+def _mamba_draft_pool_entry(
+    draft_pools: Sequence[Any], full_layer_mapping: dict[int, int], page_size: int
+) -> DevicePoolEntry:
+    """A DSPARK draft's MHA KV, indexed like the target KV it follows.
+
+    The draft forward runs after the target forward, so draft layer d only has
+    to be readable once the target is: it rides on the d-th full-attention
+    layer's transfer. A separate pool keeps every layer mapped to exactly one
+    buffer, which the UMBP layer-wise loader requires.
+    """
+    if get_parallel().attn_dcp_size > 1:
+        # The draft KV is TP-sharded but not DCP-sharded, so its rows cannot
+        # share the target's DCP collapse.
+        raise ValueError(
+            "The direct external linker does not support draft KV with "
+            "--dcp-size > 1 yet."
+        )
+    if any(pool.page_size != page_size for pool in draft_pools):
+        raise ValueError("Draft KV page size must match the tree page size.")
+    if any(
+        pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None
+        for pool in draft_pools
+    ):
+        raise ValueError(
+            "The direct external linker does not support scaled draft KV caches yet."
+        )
+    k_buffers = [buffer for pool in draft_pools for buffer in pool.k_buffer]
+    v_buffers = [buffer for pool in draft_pools for buffer in pool.v_buffer]
+    target_layers = sorted(full_layer_mapping)
+    if len(k_buffers) > len(target_layers):
+        raise ValueError(
+            f"{len(k_buffers)} draft KV layers exceed the {len(target_layers)} "
+            "full-attention layers they are loaded with."
+        )
+    _require_contiguous_rows(PoolName.DRAFT, [*k_buffers, *v_buffers])
+    return DevicePoolEntry(
+        name=PoolName.DRAFT,
+        indices_from_pool=PoolName.KV,
+        device_pool=draft_pools[0],
+        components=[k_buffers, v_buffers],
+        layer_mapping={
+            layer: depth for depth, layer in enumerate(target_layers[: len(k_buffers)])
+        },
+        page_size=page_size,
+        rows_are_pages=False,
     )
 
 
