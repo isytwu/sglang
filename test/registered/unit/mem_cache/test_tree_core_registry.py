@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
 from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
 
 from sglang.srt.environ import envs
@@ -590,6 +591,54 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "extension load failed"):
                 create_tree_core("rust", _cache_init_params(), {})
         python_factory.assert_not_called()
+
+
+class TestTreeCoreSelectionAcrossRanks(CustomTestCase):
+    def _select(self, *, local_reason, peer_usable, requested="rust"):
+        def all_reduce(tensor, op=None, group=None):
+            tensor.copy_(torch.minimum(tensor, torch.tensor([peer_usable])))
+
+        with (
+            mock.patch.object(
+                tree_core_registry,
+                "_rust_fallback_reason",
+                return_value=local_reason,
+            ),
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(
+                torch.distributed, "all_reduce", side_effect=all_reduce
+            ) as reduce,
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(requested),
+        ):
+            backend = select_tree_core_backend(
+                _cache_init_params(tp_cache_group=object())
+            )
+        return backend, reduce
+
+    def test_rust_is_kept_when_every_rank_can_use_it(self):
+        backend, reduce = self._select(local_reason=None, peer_usable=1)
+        self.assertEqual(backend, "rust")
+        reduce.assert_called_once()
+
+    def test_a_peer_falling_back_moves_this_rank_to_python(self):
+        backend, _ = self._select(local_reason=None, peer_usable=0)
+        self.assertEqual(backend, "python")
+
+    def test_a_rank_that_falls_back_still_joins_the_reduction(self):
+        # Skipping it would leave the peers that can use Rust blocked in it.
+        backend, reduce = self._select(
+            local_reason="the Rust TreeCore toolchain is unavailable", peer_usable=1
+        )
+        self.assertEqual(backend, "python")
+        reduce.assert_called_once()
+
+    def test_a_python_request_needs_no_reduction(self):
+        backend, reduce = self._select(
+            local_reason=None, peer_usable=0, requested="python"
+        )
+        self.assertEqual(backend, "python")
+        reduce.assert_not_called()
 
 
 if __name__ == "__main__":
