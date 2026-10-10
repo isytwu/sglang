@@ -128,7 +128,37 @@ def select_tree_core_backend(params: CacheInitParams) -> str:
         if params.tree_core_backend is not None
         else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
     )
-    return resolve_tree_core_backend(name, params)
+    backend = resolve_tree_core_backend(name, params)
+    if name == "rust":
+        backend = _agree_with_peer_ranks(backend, params)
+    return backend
+
+
+def _agree_with_peer_ranks(backend: str, params: CacheInitParams) -> str:
+    """Fall back on every rank of the cache when any one of them falls back.
+
+    The toolchain probe is per rank and time-bound, so ranks that race the same
+    rustup install can disagree, and ranks sharing a cache must run one TreeCore.
+    """
+    if not torch.distributed.is_initialized():
+        return backend
+    usable = torch.tensor([int(backend == "rust")], dtype=torch.int32)
+    for group in (
+        params.tp_cache_group,
+        params.attn_cp_cache_group,
+        params.attn_tp_cache_group,
+        params.pp_cache_group,
+    ):
+        if group is not None and torch.distributed.get_world_size(group=group) > 1:
+            torch.distributed.all_reduce(
+                usable, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+    if backend == "rust" and not usable.item():
+        logger.info(
+            "Using the Python TreeCore: another rank cannot use the Rust TreeCore"
+        )
+        return "python"
+    return backend
 
 
 def register_tree_core_backend(name: str, factory: TreeCoreFactory) -> None:
