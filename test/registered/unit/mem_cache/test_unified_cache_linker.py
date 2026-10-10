@@ -1340,5 +1340,142 @@ def test_linker_load_preserves_swa_boundaries(
         swa.update_external_linker_load.assert_not_called()
 
 
+def _mamba_offload_cache(pool_size, nodes, transfers):
+    """A wrapper cache whose tree carries MAMBA, so the offload cap is live."""
+    return _cache_for_wrapper(
+        components={ComponentType.MAMBA: object()},
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+        tree_core=_FakeExternalTreeCore(nodes, transfers),
+        req_to_token_pool=SimpleNamespace(
+            mamba_allocator=SimpleNamespace(size=pool_size)
+        ),
+        inc_lock_ref=MagicMock(
+            return_value=SimpleNamespace(to_dec_params=lambda: object())
+        ),
+        dec_lock_ref=MagicMock(),
+    )
+
+
+def _offload_node_ids(count):
+    return {
+        i: SimpleNamespace(
+            id=i, external_cache_stored=False, write_through_pending_id=None
+        )
+        for i in range(count)
+    }
+
+
+def test_mamba_offload_queue_stops_before_pinning_the_whole_pool():
+    """Queued offloads must never hold every mamba checkpoint at once.
+
+    Each queued offload keeps its node locked until the backend acks, and a
+    locked node is not reclaimable. With the queue unbounded, a backend that
+    drains slower than prefill donates checkpoints ends up holding all of
+    them, and the next mamba allocation fails with nothing left to evict.
+    """
+    pool_size = 8
+    nodes = _offload_node_ids(pool_size)
+    cache = _mamba_offload_cache(
+        pool_size,
+        nodes,
+        [
+            PoolTransfer(name=PoolName.KV, keys=["page"]),
+            PoolTransfer(name=PoolName.MAMBA, keys=["page"]),
+        ],
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    wrapper.offload_nodes(list(nodes))
+
+    cap = pool_size - max(1, pool_size // 4)
+    assert cap == 6
+    assert len(wrapper.pending_offloads) == cap
+    # The skipped nodes keep no lock and stay evictable, which is the whole
+    # point: they are simply not persisted.
+    assert all(nodes[i].write_through_pending_id is None for i in range(cap, pool_size))
+
+
+def test_offload_queue_is_uncapped_without_a_mamba_component():
+    """The cap must not throttle a tree whose offloads hold no mamba state.
+
+    Guards the negative branch: a predicate that degraded to always-on would
+    silently stop persisting three quarters of every FULL-only write-through
+    chain, which no positive-path test would notice.
+    """
+    pool_size = 8
+    nodes = _offload_node_ids(pool_size)
+    cache = _mamba_offload_cache(
+        pool_size, nodes, [PoolTransfer(name=PoolName.KV, keys=["page"])]
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    # Same cache, but these transfers carry no mamba state, so nothing the
+    # queue holds can pin the mamba pool and the cap must not apply.
+    wrapper.offload_nodes(list(nodes))
+
+    assert len(wrapper.pending_offloads) == pool_size
+
+
+@pytest.mark.parametrize(
+    "restorable, expected_mamba_hit",
+    [(2, 1), (1, 0)],
+    ids=["full-tail-restorable", "truncated-hit"],
+)
+def test_mamba_hit_is_claimed_only_at_the_key_lookup_validated(
+    full_linker_component, restorable, expected_mamba_hit
+):
+    """A mamba hit may only be claimed at the key LOOKUP actually validated.
+
+    LOOKUP probes the state at the end of the whole tail, but the load that
+    follows asks for the state at the end of the *hit*. When the hit is a
+    strict prefix of the tail those are different keys, so claiming the hit
+    makes the load request a key nothing validated. A backend that raises on
+    a miss rather than degrading then takes down every rank.
+    """
+    full = full_linker_component
+    mamba = SimpleNamespace(
+        component_type=ComponentType.MAMBA,
+        linker_indices_are_paged=False,
+        build_external_linker_transfer=MagicMock(
+            side_effect=lambda phase, node, keys: PoolTransfer(
+                name=PoolName.MAMBA, keys=[list(keys)[-1]]
+            )
+        ),
+    )
+    node = SimpleNamespace(id=1, external_cache_stored=False)
+    cache = _cache_for_wrapper(
+        _components_tuple=(full, mamba),
+        components={ComponentType.FULL: full, ComponentType.MAMBA: mamba},
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        req_to_token_pool=SimpleNamespace(mamba_allocator=SimpleNamespace(size=120)),
+        page_size=2,
+        _all_reduce_attn_groups=lambda value, op: None,
+        get_last_hash_value=lambda node: None,
+        resolve_node_handle=lambda node_id: node,
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: object()),
+        dec_lock_ref=MagicMock(),
+    )
+    backend = _FakeLinker()
+    # Four tokens at page 2 => a two-page tail. `restorable` says how much of
+    # it the store can actually restore.
+    backend.restorable = [restorable]
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+
+    matched = wrapper.match(
+        RadixKey(array("q", [1, 2, 3, 4])),
+        SimpleNamespace(rid="mamba-match"),
+        MatchResult(
+            device_prefix_len=0,
+            last_device_node=0,
+            last_host_node=0,
+            best_match_node=0,
+        ),
+    )
+
+    assert matched.host_hit_length == restorable * 2
+    assert matched.mamba_host_hit_length == expected_mamba_hit
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

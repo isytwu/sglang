@@ -249,9 +249,7 @@ class UnifiedCacheLinkerWrapper:
         # instead of degrading -- `UMBP get failed for pool=mamba, success=0/1`
         # on all eight ranks, 24 minutes into DCP8/conc=48.
         mamba_host_hit_length = (
-            1
-            if PoolName.MAMBA in by_pool and hit_pages == len(tail_hashes)
-            else 0
+            1 if PoolName.MAMBA in by_pool and hit_pages == len(tail_hashes) else 0
         )
 
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
