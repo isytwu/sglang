@@ -666,6 +666,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(group.num_layers, 3)
         # The MLA KV is TP-replicated but the KDA state is not.
         self.assertFalse(group.rank_replicated)
+        self.assertTrue(group.kv_rank_replicated)
         self.assertEqual(
             group.sources, {name: name for name in (PoolName.KV, PoolName.MAMBA)}
         )
@@ -695,6 +696,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         with get_parallel().override(attn_dcp_size=2):
             group = self._resolve_mamba(kvcache, params, page_size=4)
 
+        # DCP shards the KV across ranks, so it is not replicated either.
+        self.assertFalse(group.kv_rank_replicated)
         # The widened page [8, 12) is rows 4..5 on this rank.
         self.assertEqual(
             group.entry_map[PoolName.KV].prepare_locations(torch.arange(8, 12)), [4]

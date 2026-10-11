@@ -59,6 +59,26 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+def _pool_suffix_overrides(
+    *, pool_group, tp_rank: int, attn_cp_rank: int, pp_rank: int
+) -> dict:
+    # A FULL + MAMBA group is not rank-replicated because the KDA state is
+    # TP-sharded, but its MLA KV is identical on every attention TP rank. One
+    # shared key per KV page stores it once instead of once per rank.
+    if pool_group.rank_replicated or not getattr(
+        pool_group, "kv_rank_replicated", False
+    ):
+        return {}
+    return {
+        PoolName.KV: _storage_suffix(
+            rank_replicated=True,
+            tp_rank=tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+        )
+    }
+
+
 def _ordered_layers(entry) -> list[int]:
     component_lengths = {len(component) for component in entry.components}
     if len(component_lengths) != 1:
@@ -348,6 +368,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
             self.storage.mla_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
+            self.storage.pool_suffix_overrides = _pool_suffix_overrides(
+                pool_group=self.pool_group,
+                tp_rank=tp_rank,
+                attn_cp_rank=params.attn_cp_rank,
+                pp_rank=params.pp_rank,
+            )
             self._register_buffers()
             # Report the mode rather than asserting it in the text: the line is
             # what every acceptance check greps to prove the linker attached at
@@ -355,11 +381,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # it could not have shown an embedded run for what it was.
             logger.info(
                 "UMBPDirectLinker topology=%s+%s ranged_io=yes "
-                "rank_replicated=%s suffix=%s",
+                "rank_replicated=%s suffix=%s pool_suffix_overrides=%s",
                 mode.name,
                 self.backend_mode.name if self.backend_mode is not None else None,
                 rank_replicated,
                 rank_suffix,
+                {
+                    name.value: suffix
+                    for name, suffix in self.storage.pool_suffix_overrides.items()
+                },
             )
         except BaseException:
             self.storage.close()

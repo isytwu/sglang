@@ -6,10 +6,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
+    _pool_suffix_overrides,
     _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -89,6 +93,58 @@ class TestEveryRankWrites(CustomTestCase):
         self.assertFalse(linker.offload([]))
         self.assertEqual(linker._offload_results.qsize(), 0)
         self.assertEqual(linker._offload_queue.qsize(), 0)
+
+
+class TestSharedKvKeys(CustomTestCase):
+    def test_every_rank_shares_the_kv_key_of_a_kv_replicated_group(self):
+        group = SimpleNamespace(rank_replicated=False, kv_rank_replicated=True)
+        overrides = [
+            _pool_suffix_overrides(
+                pool_group=group, tp_rank=rank, attn_cp_rank=0, pp_rank=0
+            )
+            for rank in range(8)
+        ]
+        self.assertEqual(overrides, [{PoolName.KV: "cp0_pp0"}] * 8)
+
+    def test_sharded_and_fully_replicated_groups_keep_their_suffix(self):
+        for group in (
+            SimpleNamespace(rank_replicated=False, kv_rank_replicated=False),
+            SimpleNamespace(rank_replicated=True, kv_rank_replicated=True),
+        ):
+            self.assertEqual(
+                _pool_suffix_overrides(
+                    pool_group=group, tp_rank=3, attn_cp_rank=0, pp_rank=0
+                ),
+                {},
+            )
+
+    def test_the_override_renames_only_the_kv_objects(self):
+        store = UMBPStore.__new__(UMBPStore)
+        store.registered_pools = {
+            PoolName.KV: SimpleNamespace(components=[object()]),
+            PoolName.DRAFT: SimpleNamespace(components=[object()]),
+            PoolName.MAMBA: DevicePoolEntry.__new__(DevicePoolEntry),
+        }
+        store.mla_suffix = store.mha_suffix = "tp3_cp0_pp0"
+        store.is_mla_backend = True
+        store.config_prefix = ""
+
+        def keys(pool):
+            return store._get_hybrid_page_component_keys(
+                ["page"], SimpleNamespace(name=pool)
+            )[0]
+
+        before = {pool: keys(pool) for pool in store.registered_pools}
+        store.pool_suffix_overrides = {PoolName.KV: "cp0_pp0"}
+        after = {pool: keys(pool) for pool in store.registered_pools}
+
+        self.assertNotEqual(after[PoolName.KV], before[PoolName.KV])
+        self.assertNotIn("tp3", after[PoolName.KV][0])
+        self.assertIn("_cp0_pp0_", after[PoolName.KV][0])
+        # The draft and the KDA state differ per rank and keep their keyspace.
+        self.assertEqual(after[PoolName.DRAFT], before[PoolName.DRAFT])
+        self.assertEqual(after[PoolName.MAMBA], before[PoolName.MAMBA])
+        self.assertIn("tp3", after[PoolName.MAMBA][0])
 
 
 if __name__ == "__main__":
