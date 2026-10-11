@@ -183,6 +183,7 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
+        kv_rank_replicated: bool = False,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -192,6 +193,9 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
+        # The KV pool alone can be identical on every attention TP rank in a
+        # group that is not (FULL + MAMBA: MLA KV next to a TP-sharded state).
+        self.kv_rank_replicated = rank_replicated or kv_rank_replicated
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -609,8 +613,12 @@ def _build_mamba_device_pool_group(
         mamba_entry,
     ]
     # Not rank_replicated: the MLA KV is TP-replicated but the KDA state is not.
+    # The KV alone stays identical across attention TP ranks unless DCP shards it.
     return DevicePoolGroup(
-        entries, len(full_layer_mapping | mamba_entry.layer_mapping), page_size
+        entries,
+        len(full_layer_mapping | mamba_entry.layer_mapping),
+        page_size,
+        kv_rank_replicated=get_parallel().attn_dcp_size == 1,
     )
 
 

@@ -1359,6 +1359,13 @@ class UMBPStore(HiCacheStorage):
             if rank_suffix is None
             else rank_suffix
         )
+        override = (
+            getattr(self, "pool_suffix_overrides", {}).get(pool_name)
+            if rank_suffix is None
+            else None
+        )
+        if override is not None:
+            mla_suffix = mha_suffix = override
 
         components = getattr(host_pool, "components", None)
         if pool_name == PoolName.MAMBA:
