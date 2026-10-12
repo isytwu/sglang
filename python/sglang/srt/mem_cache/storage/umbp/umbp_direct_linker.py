@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -23,6 +25,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
@@ -40,6 +43,12 @@ CHUNK_PAGES = int(os.getenv("UMBP_CHUNK_PAGES", "64"))
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+
+# Recency hints (on_device_hit): how often one device node's prefix may be
+# re-sent, in seconds; 0 turns them off.  Keys per batch_touch call.
+TOUCH_INTERVAL_S = float(os.getenv("UMBP_TOUCH_INTERVAL_S", "0"))
+TOUCH_KEYS_PER_CALL = int(os.getenv("UMBP_TOUCH_KEYS_PER_CALL", "8192"))
+TOUCH_TRACKED_NODES = 65536
 
 
 def _storage_suffix(
@@ -467,8 +476,133 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             name=f"umbp-offload-tp{tp_rank}",
         )
         self._closed = False
+        self._touch_interval = TOUCH_INTERVAL_S
+        if self._touch_interval > 0 and not hasattr(self.storage.client, "batch_touch"):
+            logger.warning(
+                "UMBP_TOUCH_INTERVAL_S=%s but this mori client has no batch_touch; "
+                "recency hints are off",
+                self._touch_interval,
+            )
+            self._touch_interval = 0.0
+        self._touched_at: collections.OrderedDict[int, float] = (
+            collections.OrderedDict()
+        )
+        self._touch_busy = False
+        self._touch_lock = threading.Lock()
+        self._touch_diag: collections.Counter = collections.Counter()
+        self._touch_diag_last = time.monotonic()
+        self._touch_executor = (
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"umbp-touch-tp{tp_rank}"
+            )
+            if self._touch_interval > 0
+            else None
+        )
+        if self._touch_interval > 0:
+            logger.info(
+                "UMBPDirectLinker recency hints on: once per %.0f s per device node",
+                self._touch_interval,
+            )
         self._load_thread.start()
         self._offload_thread.start()
+
+    # ---- recency hints: device hits UMBP's eviction cannot see ----
+
+    def on_device_hit(
+        self,
+        rid: str,
+        key: Any,
+        device_hit_len: int,
+        device_node: int,
+        lookup_transfers: Callable[[list[str]], list[PoolTransfer] | None],
+    ) -> None:
+        # Runs on the scheduler's match path: never raise, never block on mori.
+        if self._touch_interval <= 0 or self._closed:
+            return
+        try:
+            now = time.monotonic()
+            last = self._touched_at.get(device_node)
+            if last is not None and now - last < self._touch_interval:
+                self._touch_count("skipped_recent")
+                return
+            if self._touch_busy:
+                # The previous hint is still on the wire; this node is retried
+                # on its next hit rather than queued behind it.
+                self._touch_count("dropped_busy")
+                return
+            self._touched_at[device_node] = now
+            self._touched_at.move_to_end(device_node)
+            while len(self._touched_at) > TOUCH_TRACKED_NODES:
+                self._touched_at.popitem(last=False)
+            pages = device_hit_len // self.page_size
+            hashes = get_storage_hash_str(
+                key[: pages * self.page_size], None, page_size=self.page_size
+            )
+            transfers = lookup_transfers(list(hashes)) if hashes else None
+            if not transfers:
+                self._touch_count("no_transfer")
+                return
+            expanded = self.pool_group.resolve_transfers(transfers)
+            # Each pool's own LOOKUP keys: every page for the contiguous pools
+            # (KV, draft KV), but only the boundary page for Mamba -- the one
+            # state a restore of this prefix resumes from.  The checkpoints
+            # inside the prefix keep aging by write time.
+            object_keys: list[str] = []
+            for transfer in expanded:
+                keys, _ = self._object_keys_for_pages(
+                    list(transfer.keys or hashes), transfer
+                )
+                object_keys.extend(keys)
+            self._touch_busy = True
+            self._touch_executor.submit(self._send_touch, object_keys)
+            self._touch_count("hints")
+            self._touch_count("pages", pages)
+            self._touch_count("keys", len(object_keys))
+            prep_ms = int((time.monotonic() - now) * 1000)
+            self._touch_count("prep_ms_sum", prep_ms)
+            self._touch_max("prep_ms_max", prep_ms)
+        except Exception:
+            logger.exception("UMBP recency hint failed for rid=%s; hints are off", rid)
+            self._touch_interval = 0.0
+        finally:
+            self._touch_diag_tick()
+
+    def _send_touch(self, object_keys: list[str]) -> None:
+        start = time.monotonic()
+        try:
+            held = 0
+            for i in range(0, len(object_keys), TOUCH_KEYS_PER_CALL):
+                held += int(
+                    self.storage.client.batch_touch(
+                        object_keys[i : i + TOUCH_KEYS_PER_CALL]
+                    )
+                )
+            self._touch_count("held", held)
+        except Exception:
+            self._touch_count("rpc_errors")
+        finally:
+            rpc_ms = int((time.monotonic() - start) * 1000)
+            self._touch_count("rpc_ms_sum", rpc_ms)
+            self._touch_max("rpc_ms_max", rpc_ms)
+            self._touch_busy = False
+
+    def _touch_count(self, name: str, value: int = 1) -> None:
+        with self._touch_lock:
+            self._touch_diag[name] += value
+
+    def _touch_max(self, name: str, value: int) -> None:
+        with self._touch_lock:
+            self._touch_diag[name] = max(self._touch_diag[name], value)
+
+    def _touch_diag_tick(self) -> None:
+        now = time.monotonic()
+        if now - self._touch_diag_last < 60:
+            return
+        with self._touch_lock:
+            line = " ".join(f"{k}={v}" for k, v in sorted(self._touch_diag.items()))
+            self._touch_diag.clear()
+        self._touch_diag_last = now
+        logger.info("UMBP_DIAG touch %s", line)
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -1183,6 +1317,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 thread.join()
         if self._rpc_pool is not None:
             self._rpc_pool.shutdown(wait=True)
+        if self._touch_executor is not None:
+            self._touch_executor.shutdown(wait=True)
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until
