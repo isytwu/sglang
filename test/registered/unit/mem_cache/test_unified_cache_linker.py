@@ -1517,6 +1517,43 @@ def test_linker_filters_request_relative_swa_from_lookup(
     swa.build_external_linker_transfer.assert_not_called()
 
 
+class _DeviceHitRecordingLinker(_FakeLinker):
+    def __init__(self):
+        super().__init__()
+        self.device_hits = []
+
+    def on_device_hit(self, rid, key, device_hit_len, device_node, lookup_transfers):
+        self.device_hits.append(
+            (rid, list(key.token_ids), device_hit_len, device_node, lookup_transfers)
+        )
+
+
+@pytest.mark.parametrize(
+    "device_hit_len, offered", [(4, True), (2, True), (1, False)], ids=str
+)
+def test_match_offers_device_hits_of_a_page_or_more(device_hit_len, offered):
+    cache = _cache_for_wrapper(
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        page_size=2,
+        get_last_hash_value=lambda node: None,
+    )
+    linker = _DeviceHitRecordingLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    result = MatchResult(
+        device_prefix_len=device_hit_len,
+        last_device_node=5,
+        last_host_node=5,
+        best_match_node=5,
+    )
+
+    wrapper.match(
+        RadixKey(array("q", [1, 2, 3, 4])), SimpleNamespace(rid="hit"), result
+    )
+
+    expected = [("hit", [1, 2, 3, 4], device_hit_len, 5, wrapper._lookup_transfers)]
+    assert linker.device_hits == (expected if offered else [])
+
+
 @pytest.mark.parametrize("swa_req_ring", [False, True], ids=["paged", "request-ring"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]
