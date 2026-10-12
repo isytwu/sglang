@@ -269,6 +269,18 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer] | None:
+        """Every component's LOOKUP transfer for these page hashes, or None."""
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return None
+            transfers.append(transfer)
+        return transfers
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -276,6 +288,17 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        # Optional: a store whose eviction cannot see device hits may ask for
+        # them. Linkers without the hook are not called.
+        on_device_hit = getattr(self.cache_linker, "on_device_hit", None)
+        if on_device_hit is not None and device_hit_len >= page:
+            on_device_hit(
+                req.rid,
+                key,
+                device_hit_len,
+                result.last_device_node,
+                self._lookup_transfers,
+            )
         if device_hit_len >= len(key):
             return result
 
