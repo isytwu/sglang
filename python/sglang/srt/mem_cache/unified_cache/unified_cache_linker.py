@@ -54,6 +54,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -155,7 +156,7 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
@@ -176,6 +177,18 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Ceiling on in-flight offloads that pin a mamba state; None when the
+        # tree has no MAMBA component. See _mamba_offload_has_headroom. The
+        # quarter left over is what eviction reclaims from, and it is a floor
+        # rather than a tuning knob: the pool only has to stay non-empty.
+        mamba_pool_size = (
+            self.cache.req_to_token_pool.mamba_allocator.size
+            if ComponentType.MAMBA in cache.components
+            else 0
+        )
+        self._mamba_offload_cap = (
+            mamba_pool_size - max(1, mamba_pool_size // 4) if mamba_pool_size else None
+        )
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -187,6 +200,18 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer] | None:
+        """Every component's LOOKUP transfer for these page hashes, or None."""
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return None
+            transfers.append(transfer)
+        return transfers
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -194,6 +219,17 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        # Optional: a store whose eviction cannot see device hits may ask for
+        # them. Linkers without the hook are not called.
+        on_device_hit = getattr(self.cache_linker, "on_device_hit", None)
+        if on_device_hit is not None and device_hit_len >= page:
+            on_device_hit(
+                req.rid,
+                key,
+                device_hit_len,
+                result.last_device_node,
+                self._lookup_transfers,
+            )
         if device_hit_len >= len(key):
             return result
 
@@ -367,10 +403,6 @@ class UnifiedCacheLinkerWrapper:
                 track_adopted_ranges=True,
             )
         )
-        if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
             insert_result.last_device_node, req.last_node
@@ -430,7 +462,10 @@ class UnifiedCacheLinkerWrapper:
         )
         for component, transfer in transfers:
             component_canonical = canonical_full
-            if phase == ExternalLinkerLoadPhase.COMMIT:
+            if (
+                phase == ExternalLinkerLoadPhase.COMMIT
+                and component.linker_indices_are_paged
+            ):
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
@@ -510,7 +545,33 @@ class UnifiedCacheLinkerWrapper:
             if transfers is not None:
                 if self._skip_swa:
                     transfers = [t for t in transfers if t.name != PoolName.SWA]
+                if not self._mamba_offload_has_headroom(transfers):
+                    continue
                 self._offload_node(node_id, transfers)
+
+    def _mamba_offload_has_headroom(self, transfers: list[PoolTransfer]) -> bool:
+        """Refuse an offload that would pin the last reclaimable mamba states.
+
+        A queued offload holds `inc_lock_ref` on its node until the backend
+        acknowledges it, and a locked node is invisible to the MAMBA LRU's
+        unlocked walk. Nothing else bounds the queue, so once the backend
+        drains slower than prefill donates checkpoints, the queue grows until
+        every checkpoint in the tree is locked. Measured at DCP8/conc=8:
+        117 of a 120-slot pool locked by 117 pending offloads, the LRU walk
+        starting from None, and the next allocation -- in
+        prepare_for_caching_req, not in the linker -- asserting on all eight
+        ranks. Unlike FULL, a mamba state has no second tier to fall back to,
+        so losing the whole evictable set is fatal rather than slow.
+
+        Skipping leaves the checkpoint device-resident and evictable; it is
+        just not persisted. That is the same outcome the backend already
+        produces when `offload()` declines to queue.
+        """
+        if self._mamba_offload_cap is None:
+            return True
+        if not any(transfer.name == PoolName.MAMBA for transfer in transfers):
+            return True
+        return len(self.pending_offloads) < self._mamba_offload_cap
 
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache

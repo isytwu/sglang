@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -23,6 +25,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
@@ -35,11 +38,17 @@ device_module = get_device_module()
 
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
 # This is a logical-page count; existence queries carry keys only, no ranges.
-CHUNK_PAGES = 64
+CHUNK_PAGES = int(os.getenv("UMBP_CHUNK_PAGES", "64"))
 
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+
+# Recency hints (on_device_hit): how often one device node's prefix may be
+# re-sent, in seconds; 0 turns them off.  Keys per batch_touch call.
+TOUCH_INTERVAL_S = float(os.getenv("UMBP_TOUCH_INTERVAL_S", "0"))
+TOUCH_KEYS_PER_CALL = int(os.getenv("UMBP_TOUCH_KEYS_PER_CALL", "8192"))
+TOUCH_TRACKED_NODES = 65536
 
 
 def _storage_suffix(
@@ -54,6 +63,26 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
+
+
+def _pool_suffix_overrides(
+    *, pool_group, tp_rank: int, attn_cp_rank: int, pp_rank: int
+) -> dict:
+    # A FULL + MAMBA group is not rank-replicated because the KDA state is
+    # TP-sharded, but its MLA KV is identical on every attention TP rank. One
+    # shared key per KV page stores it once instead of once per rank.
+    if pool_group.rank_replicated or not getattr(
+        pool_group, "kv_rank_replicated", False
+    ):
+        return {}
+    return {
+        PoolName.KV: _storage_suffix(
+            rank_replicated=True,
+            tp_rank=tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+        )
+    }
 
 
 def _ordered_layers(entry) -> list[int]:
@@ -198,6 +227,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
+        # The offload/load queues are drained by ONE background thread each, so
+        # a batch's chunk-by-chunk calls (each a synchronous RPC/local-call
+        # round trip) previously ran strictly one at a time: reducing per-call
+        # cost (bigger chunks, embedded mode) only ever hit the same serial
+        # ceiling. Chunks within one batch touch disjoint keys/pointers, so
+        # dispatching them concurrently from a small pool is safe; 1 preserves
+        # the old fully-serial behavior.
+        self._rpc_parallelism = max(1, int(os.getenv("UMBP_RPC_PARALLELISM", "1")))
+        self._rpc_pool = (
+            ThreadPoolExecutor(
+                max_workers=self._rpc_parallelism, thread_name_prefix="umbp-rpc"
+            )
+            if self._rpc_parallelism > 1
+            else None
+        )
         # Coalesce queued offload tasks up to this many pages; offload_nodes
         # queues one task per node, so they arrive a page or two at a time.
         self._offload_coalesce_pages = max(
@@ -374,6 +418,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
             self.storage.mla_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
+            self.storage.pool_suffix_overrides = _pool_suffix_overrides(
+                pool_group=self.pool_group,
+                tp_rank=tp_rank,
+                attn_cp_rank=params.attn_cp_rank,
+                pp_rank=params.pp_rank,
+            )
             self._register_buffers()
             # Report the mode rather than asserting it in the text: the line is
             # what every acceptance check greps to prove the linker attached at
@@ -381,11 +431,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # it could not have shown an embedded run for what it was.
             logger.info(
                 "UMBPDirectLinker topology=%s+%s ranged_io=yes "
-                "rank_replicated=%s suffix=%s",
+                "rank_replicated=%s suffix=%s pool_suffix_overrides=%s",
                 mode.name,
                 self.backend_mode.name if self.backend_mode is not None else None,
                 rank_replicated,
                 rank_suffix,
+                {
+                    name.value: suffix
+                    for name, suffix in self.storage.pool_suffix_overrides.items()
+                },
             )
         except BaseException:
             self.storage.close()
@@ -422,8 +476,133 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             name=f"umbp-offload-tp{tp_rank}",
         )
         self._closed = False
+        self._touch_interval = TOUCH_INTERVAL_S
+        if self._touch_interval > 0 and not hasattr(self.storage.client, "batch_touch"):
+            logger.warning(
+                "UMBP_TOUCH_INTERVAL_S=%s but this mori client has no batch_touch; "
+                "recency hints are off",
+                self._touch_interval,
+            )
+            self._touch_interval = 0.0
+        self._touched_at: collections.OrderedDict[int, float] = (
+            collections.OrderedDict()
+        )
+        self._touch_busy = False
+        self._touch_lock = threading.Lock()
+        self._touch_diag: collections.Counter = collections.Counter()
+        self._touch_diag_last = time.monotonic()
+        self._touch_executor = (
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"umbp-touch-tp{tp_rank}"
+            )
+            if self._touch_interval > 0
+            else None
+        )
+        if self._touch_interval > 0:
+            logger.info(
+                "UMBPDirectLinker recency hints on: once per %.0f s per device node",
+                self._touch_interval,
+            )
         self._load_thread.start()
         self._offload_thread.start()
+
+    # ---- recency hints: device hits UMBP's eviction cannot see ----
+
+    def on_device_hit(
+        self,
+        rid: str,
+        key: Any,
+        device_hit_len: int,
+        device_node: int,
+        lookup_transfers: Callable[[list[str]], list[PoolTransfer] | None],
+    ) -> None:
+        # Runs on the scheduler's match path: never raise, never block on mori.
+        if self._touch_interval <= 0 or self._closed:
+            return
+        try:
+            now = time.monotonic()
+            last = self._touched_at.get(device_node)
+            if last is not None and now - last < self._touch_interval:
+                self._touch_count("skipped_recent")
+                return
+            if self._touch_busy:
+                # The previous hint is still on the wire; this node is retried
+                # on its next hit rather than queued behind it.
+                self._touch_count("dropped_busy")
+                return
+            self._touched_at[device_node] = now
+            self._touched_at.move_to_end(device_node)
+            while len(self._touched_at) > TOUCH_TRACKED_NODES:
+                self._touched_at.popitem(last=False)
+            pages = device_hit_len // self.page_size
+            hashes = get_storage_hash_str(
+                key[: pages * self.page_size], None, page_size=self.page_size
+            )
+            transfers = lookup_transfers(list(hashes)) if hashes else None
+            if not transfers:
+                self._touch_count("no_transfer")
+                return
+            expanded = self.pool_group.resolve_transfers(transfers)
+            # Each pool's own LOOKUP keys: every page for the contiguous pools
+            # (KV, draft KV), but only the boundary page for Mamba -- the one
+            # state a restore of this prefix resumes from.  The checkpoints
+            # inside the prefix keep aging by write time.
+            object_keys: list[str] = []
+            for transfer in expanded:
+                keys, _ = self._object_keys_for_pages(
+                    list(transfer.keys or hashes), transfer
+                )
+                object_keys.extend(keys)
+            self._touch_busy = True
+            self._touch_executor.submit(self._send_touch, object_keys)
+            self._touch_count("hints")
+            self._touch_count("pages", pages)
+            self._touch_count("keys", len(object_keys))
+            prep_ms = int((time.monotonic() - now) * 1000)
+            self._touch_count("prep_ms_sum", prep_ms)
+            self._touch_max("prep_ms_max", prep_ms)
+        except Exception:
+            logger.exception("UMBP recency hint failed for rid=%s; hints are off", rid)
+            self._touch_interval = 0.0
+        finally:
+            self._touch_diag_tick()
+
+    def _send_touch(self, object_keys: list[str]) -> None:
+        start = time.monotonic()
+        try:
+            held = 0
+            for i in range(0, len(object_keys), TOUCH_KEYS_PER_CALL):
+                held += int(
+                    self.storage.client.batch_touch(
+                        object_keys[i : i + TOUCH_KEYS_PER_CALL]
+                    )
+                )
+            self._touch_count("held", held)
+        except Exception:
+            self._touch_count("rpc_errors")
+        finally:
+            rpc_ms = int((time.monotonic() - start) * 1000)
+            self._touch_count("rpc_ms_sum", rpc_ms)
+            self._touch_max("rpc_ms_max", rpc_ms)
+            self._touch_busy = False
+
+    def _touch_count(self, name: str, value: int = 1) -> None:
+        with self._touch_lock:
+            self._touch_diag[name] += value
+
+    def _touch_max(self, name: str, value: int) -> None:
+        with self._touch_lock:
+            self._touch_diag[name] = max(self._touch_diag[name], value)
+
+    def _touch_diag_tick(self) -> None:
+        now = time.monotonic()
+        if now - self._touch_diag_last < 60:
+            return
+        with self._touch_lock:
+            line = " ".join(f"{k}={v}" for k, v in sorted(self._touch_diag.items()))
+            self._touch_diag.clear()
+        self._touch_diag_last = now
+        logger.info("UMBP_DIAG touch %s", line)
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -468,8 +647,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         max_objects = CHUNK_PAGES * self.num_layers
         pages_per_call = max(1, max_objects // objects_per_page)
 
-        page_exists = []
-        for start in range(0, len(page_keys), pages_per_call):
+        def _exists_chunk(start: int) -> list[bool]:
             chunk_pages = page_keys[start : start + pages_per_call]
             object_keys, _ = self._object_keys_for_pages(chunk_pages, transfer)
             exists = list(self.storage.client.batch_exists(object_keys))
@@ -478,10 +656,22 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     f"UMBP exists result-size mismatch for pool {transfer.name}: "
                     f"expected={len(object_keys)} actual={len(exists)}."
                 )
-            page_exists.extend(
+            return [
                 all(exists[index : index + objects_per_page])
                 for index in range(0, len(exists), objects_per_page)
-            )
+            ]
+
+        # Order matters: _apply_hit_policy walks this as a positional prefix,
+        # so chunk results must land in page order regardless of which
+        # finishes first -- _map_chunks returns them in submission order.
+        page_exists = []
+        for chunk in self._map_chunks(
+            [
+                (lambda s=start: _exists_chunk(s))
+                for start in range(0, len(page_keys), pages_per_call)
+            ]
+        ):
+            page_exists.extend(chunk)
         return page_exists
 
     @staticmethod
@@ -567,11 +757,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         pending = self._pending
         rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
+        self._pending = {}
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
         self._load_queue.put((counter_index, rids, plans, ready_event))
-        self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
 
@@ -626,7 +816,30 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         else _materialize_cpu_indices(indices)
                     )
                     cpu_indices[source_id] = prepared_indices
-                locations.extend(entry.prepare_locations(prepared_indices))
+                # Was tripped by the DCP-widened loc space reaching this pool
+                # uncollapsed, so a loc past max_total_num_tokens was walked as
+                # a row (fixed by DevicePoolEntry's dcp_size collapse in
+                # linker_pool_assembler.py). Kept as a forensic aid since the
+                # caller already treats a raised ValueError here as a soft
+                # offload failure, not a crash -- and because that softness is
+                # why the original symptom was a silently decaying hit rate
+                # rather than an error.
+                try:
+                    locations.extend(entry.prepare_locations(prepared_indices))
+                except ValueError:
+                    logger.warning(
+                        "UMBP pool %s prepare_locations failed: keys=%s "
+                        "indices_numel=%d indices_min=%d indices_max=%d "
+                        "row_count=%d page_size=%d",
+                        name,
+                        transfer.keys,
+                        prepared_indices.numel(),
+                        int(prepared_indices.min()),
+                        int(prepared_indices.max()),
+                        entry._row_count,
+                        entry.page_size,
+                    )
+                    raise
             if len(keys) != len(locations) * entries_per_page:
                 raise ValueError(
                     f"UMBP pool {name} plan mismatch: keys={len(keys)} "
@@ -835,6 +1048,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         offsets = [[layer[index][3] for layer in items] for index in range(components)]
         return ptrs, sizes * len(rows), offsets * len(rows)
 
+    def _map_chunks(self, jobs: list[Callable[[], Any]]) -> list[Any]:
+        """Run each zero-arg job and return its results in submission order.
+
+        Bounded by UMBP_RPC_PARALLELISM concurrent workers when pooling is
+        enabled; sequential (the original behavior) otherwise. Jobs are
+        independent chunk-level RPC/local calls with disjoint keys and
+        pointers, so concurrent dispatch is safe -- the offload/load queues
+        each still have exactly one draining thread, but that thread no
+        longer waits for one chunk's round trip before starting the next.
+        """
+        if self._rpc_pool is None or len(jobs) <= 1:
+            return [job() for job in jobs]
+        futures = [self._rpc_pool.submit(job) for job in jobs]
+        return [future.result() for future in futures]
+
     @staticmethod
     def _entries_per_call(sizes: list[list[int]]) -> int:
         """Objects per RPC, budgeted by the ranges they actually carry.
@@ -864,7 +1092,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         continue
                     ptrs, sizes, offsets = meta
                     step = self._entries_per_call(sizes)
-                    for start in range(0, len(plan.keys), step):
+
+                    def _get_chunk(start: int) -> None:
                         end = start + step
                         chunk_keys = plan.keys[start:end]
                         results = list(
@@ -886,6 +1115,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
+
+                    self._map_chunks(
+                        [
+                            (lambda s=start: _get_chunk(s))
+                            for start in range(0, len(plan.keys), step)
+                        ]
+                    )
                 # Only now is every layer in the group readable, so they are
                 # released together. A group wider than 1 trades overlap
                 # granularity for fewer times each object is named on the wire.
@@ -999,7 +1235,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # An object's ranges must tile it exactly, so a chunk boundary may
             # fall between objects but never inside one.
             step = self._entries_per_call(sizes)
-            for start in range(0, len(plan.keys), step):
+
+            def _put_chunk(start: int) -> bool:
                 end = start + step
                 chunk_keys = plan.keys[start:end]
                 results = list(
@@ -1023,6 +1260,16 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         len(results),
                     )
                     return False
+                return True
+
+            chunk_ok = self._map_chunks(
+                [
+                    (lambda s=start: _put_chunk(s))
+                    for start in range(0, len(plan.keys), step)
+                ]
+            )
+            if not all(chunk_ok):
+                return False
 
         self._stats["offload"] += len(tasks)
         self._stats["offload_batches"] += 1
@@ -1068,6 +1315,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if thread.is_alive():
                 queue.put(None)
                 thread.join()
+        if self._rpc_pool is not None:
+            self._rpc_pool.shutdown(wait=True)
+        if self._touch_executor is not None:
+            self._touch_executor.shutdown(wait=True)
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until
