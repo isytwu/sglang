@@ -771,13 +771,37 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             {t.name for t in load}, {PoolName.KV, PoolName.DRAFT, PoolName.MAMBA}
         )
 
+    def test_mamba_keeps_the_draft_uncollapsed_under_dcp(self):
+        kvcache, params, _, _, _ = self._mamba_stack()
+        # A draft worker pages the widened loc space: its page is the tree's.
+        draft = self._dspark_draft()
+        draft.page_size = 4
+        params.mtp_draft_device_pools = (draft,)
+        with get_parallel().override(attn_dcp_size=2):
+            group = self._resolve_mamba(kvcache, params, page_size=4)
+
+        # The same widened page [8, 12): rows 4..5 of the sharded target KV,
+        # rows 8..11 of the draft, which holds every token.
+        self.assertEqual(
+            group.entry_map[PoolName.KV].prepare_locations(torch.arange(8, 12)), [4]
+        )
+        entry = group.entry_map[PoolName.DRAFT]
+        self.assertEqual(entry.prepare_locations(torch.arange(8, 12)), [8])
+        ptrs, sizes, offsets = entry.get_prepared_layer_range_meta([8], 1)
+        self.assertEqual(
+            ptrs,
+            [
+                [
+                    draft.k_buffer[0].data_ptr() + 8 * 4,
+                    draft.v_buffer[0].data_ptr() + 8 * 4,
+                ]
+            ],
+        )
+        self.assertEqual(sizes, [[16, 16]])
+        self.assertEqual(offsets, [[0, 16]])
+
     def test_mamba_rejects_draft_it_cannot_store(self):
         kvcache, params, _, _, _ = self._mamba_stack()
-        params.mtp_draft_device_pools = (self._dspark_draft(),)
-        with get_parallel().override(attn_dcp_size=2):
-            with self.assertRaisesRegex(ValueError, "draft KV with --dcp-size"):
-                self._resolve_mamba(kvcache, params, page_size=4)
-
         params.mtp_draft_device_pools = (self._dspark_draft(num_layers=2),)
         with get_parallel().override(attn_dcp_size=1):
             with self.assertRaisesRegex(ValueError, "exceed the 1 full-attention"):

@@ -637,14 +637,12 @@ def _mamba_draft_pool_entry(
     to be readable once the target is: it rides on the d-th full-attention
     layer's transfer. A separate pool keeps every layer mapped to exactly one
     buffer, which the UMBP layer-wise loader requires.
+
+    Under DCP the draft is not sharded: it indexes the shared allocator's
+    widened locs raw, and its pools span and page that space (see
+    ``KVCacheConfigurator.loc_space_scale``). So this entry keeps
+    ``dcp_size=1`` while the target KV entry collapses the same indices.
     """
-    if get_parallel().attn_dcp_size > 1:
-        # The draft KV is TP-sharded but not DCP-sharded, so its rows cannot
-        # share the target's DCP collapse.
-        raise ValueError(
-            "The direct external linker does not support draft KV with "
-            "--dcp-size > 1 yet."
-        )
     if any(pool.page_size != page_size for pool in draft_pools):
         raise ValueError("Draft KV page size must match the tree page size.")
     if any(
