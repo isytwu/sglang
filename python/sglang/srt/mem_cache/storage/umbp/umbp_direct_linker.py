@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -43,6 +44,12 @@ CHUNK_PAGES = int(os.getenv("UMBP_CHUNK_PAGES", "64"))
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+
+# An unreachable standalone server shows up as refused writes and misses, so a
+# run of offload batches that store nothing is reported as an unavailable store
+# once it lasts this many batches and seconds.
+OFFLOAD_DRY_ALERT_BATCHES = 64
+OFFLOAD_DRY_ALERT_S = 60.0
 
 
 def _storage_suffix(
@@ -166,6 +173,11 @@ def _parse_storage_extra_config(raw_config):
 
 
 class UMBPDirectLinker(UnifiedCacheLinker):
+    # Offload batches in a row that stored nothing, and when that run began.
+    _offload_dry_batches = 0
+    _offload_dry_since = 0.0
+    _offload_dry_alerted_at = float("-inf")
+
     def __init__(
         self,
         server_args,
@@ -971,8 +983,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             success = False
         finally:
             # One result per task in submission order: the tree pairs them
-            # positionally. A batch resolves as a unit because the first failed
-            # pool stops the rest, leaving every task in it incomplete.
+            # positionally. A batch resolves as a unit: one failed pool fails
+            # every task in it.
             for _ in tasks:
                 self._offload_results.put(success)
 
@@ -991,68 +1003,140 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             [expanded for expanded, _ in tasks],
             materialize_indices=materialize_indices,
         )
+        shared = self._shared_pool_names()
+        stored_any = False
+        ok = True
+        refused_shared: list[str] = []
         # Over plans, not transfers: a plan already carries every task's keys
         # for its pool, so walking transfers would put that pool once per task.
+        # Every pool is written even after one fails: when only the KV key is
+        # shared, the per-rank pools are this rank's only copy.
         for plan in plans:
-            entry = self.pools[plan.name]
-            # From the pool layout, never from the ranges below: see
-            # _object_sizes_per_page.
-            per_page = _object_sizes_per_page(entry)
-            if len(per_page) != plan.entries_per_page:
-                raise ValueError(
-                    f"UMBP pool {plan.name} declares {len(per_page)} object "
-                    f"sizes per page but yields {plan.entries_per_page} objects."
+            failed = self._put_plan(plan, log_failures=plan.name not in shared)
+            stored_any |= len(failed) < len(plan.keys)
+            if plan.name in shared:
+                refused_shared.extend(failed)
+            elif failed:
+                ok = False
+        if refused_shared:
+            # Every rank writes a shared key, and the store refuses the other
+            # writers while the first write is in flight; a refused key the
+            # store holds afterwards was written by another rank.
+            missing = self._missing_keys(refused_shared)
+            stored_any |= len(missing) < len(refused_shared)
+            if missing:
+                logger.warning(
+                    "UMBP offload failed: %d/%d shared objects are not stored, e.g. %s",
+                    len(missing),
+                    len(refused_shared),
+                    missing[0],
                 )
-            object_sizes = [
-                per_page[index % plan.entries_per_page]
-                for index in range(len(plan.keys))
-            ]
-            ptrs, sizes, offsets = self._all_layer_ranges(plan)
-
-            # Preserve page order so the tier can collapse a layer into a strided copy.
-
-            # An object's ranges must tile it exactly, so a chunk boundary may
-            # fall between objects but never inside one.
-            step = self._entries_per_call(sizes)
-
-            def _put_chunk(start: int) -> bool:
-                end = start + step
-                chunk_keys = plan.keys[start:end]
-                results = list(
-                    self.storage.client.batch_put_ranges_from_ptr(
-                        chunk_keys,
-                        object_sizes[start:end],
-                        ptrs[start:end],
-                        sizes[start:end],
-                        offsets[start:end],
-                    )
-                )
-                if len(results) != len(chunk_keys) or not all(results):
-                    logger.warning(
-                        "UMBP offload failed: pool=%s object_range=[%d,%d) "
-                        "success=%d/%d returned=%d",
-                        plan.name,
-                        start,
-                        min(end, len(plan.keys)),
-                        sum(bool(value) for value in results),
-                        len(chunk_keys),
-                        len(results),
-                    )
-                    return False
-                return True
-
-            chunk_ok = self._map_chunks(
-                [
-                    (lambda s=start: _put_chunk(s))
-                    for start in range(0, len(plan.keys), step)
-                ]
-            )
-            if not all(chunk_ok):
-                return False
+                ok = False
+        self._note_offload_outcome(stored_any)
+        if not ok:
+            return False
 
         self._stats["offload"] += len(tasks)
         self._stats["offload_batches"] += 1
         return True
+
+    def _shared_pool_names(self) -> set[PoolName]:
+        """Pools whose objects every rank of the group writes under one key."""
+        if self.pool_group.rank_replicated:
+            return set(self.pools)
+        return set(getattr(self.storage, "pool_suffix_overrides", {}))
+
+    def _put_plan(self, plan: _PoolRangePlan, *, log_failures: bool) -> list[str]:
+        """Write one pool's objects; return the keys the store refused."""
+        entry = self.pools[plan.name]
+        # From the pool layout, never from the ranges below: see
+        # _object_sizes_per_page.
+        per_page = _object_sizes_per_page(entry)
+        if len(per_page) != plan.entries_per_page:
+            raise ValueError(
+                f"UMBP pool {plan.name} declares {len(per_page)} object "
+                f"sizes per page but yields {plan.entries_per_page} objects."
+            )
+        object_sizes = [
+            per_page[index % plan.entries_per_page] for index in range(len(plan.keys))
+        ]
+        ptrs, sizes, offsets = self._all_layer_ranges(plan)
+
+        # Preserve page order so the tier can collapse a layer into a strided copy.
+
+        # An object's ranges must tile it exactly, so a chunk boundary may
+        # fall between objects but never inside one.
+        step = self._entries_per_call(sizes)
+
+        def _put_chunk(start: int) -> list[str]:
+            end = start + step
+            chunk_keys = plan.keys[start:end]
+            results = list(
+                self.storage.client.batch_put_ranges_from_ptr(
+                    chunk_keys,
+                    object_sizes[start:end],
+                    ptrs[start:end],
+                    sizes[start:end],
+                    offsets[start:end],
+                )
+            )
+            if len(results) == len(chunk_keys) and all(results):
+                return []
+            if log_failures:
+                logger.warning(
+                    "UMBP offload failed: pool=%s object_range=[%d,%d) "
+                    "success=%d/%d returned=%d",
+                    plan.name,
+                    start,
+                    min(end, len(plan.keys)),
+                    sum(bool(value) for value in results),
+                    len(chunk_keys),
+                    len(results),
+                )
+            if len(results) != len(chunk_keys):
+                return list(chunk_keys)
+            return [key for key, stored in zip(chunk_keys, results) if not stored]
+
+        chunks = self._map_chunks(
+            [
+                (lambda s=start: _put_chunk(s))
+                for start in range(0, len(plan.keys), step)
+            ]
+        )
+        return [key for chunk in chunks for key in chunk]
+
+    def _missing_keys(self, keys: list[str]) -> list[str]:
+        missing: list[str] = []
+        for start in range(0, len(keys), RANGES_PER_CALL):
+            chunk = keys[start : start + RANGES_PER_CALL]
+            exists = list(self.storage.client.batch_exists(chunk))
+            if len(exists) != len(chunk):
+                missing.extend(chunk)
+                continue
+            missing.extend(key for key, held in zip(chunk, exists) if not held)
+        return missing
+
+    def _note_offload_outcome(self, stored_any: bool) -> None:
+        if stored_any:
+            self._offload_dry_batches = 0
+            return
+        now = time.monotonic()
+        if self._offload_dry_batches == 0:
+            self._offload_dry_since = now
+        self._offload_dry_batches += 1
+        if (
+            self._offload_dry_batches >= OFFLOAD_DRY_ALERT_BATCHES
+            and now - self._offload_dry_since >= OFFLOAD_DRY_ALERT_S
+            and now - self._offload_dry_alerted_at >= 5 * OFFLOAD_DRY_ALERT_S
+        ):
+            self._offload_dry_alerted_at = now
+            logger.error(
+                "UMBP stored nothing in the last %d offload batches (%.0f s): "
+                "the store is unavailable or full (is the standalone server "
+                "running?). External cache hits will not grow until it recovers.",
+                self._offload_dry_batches,
+                now - self._offload_dry_since,
+            )
 
     def _freeze_gc_once(self) -> None:
         if self._gc_frozen:
