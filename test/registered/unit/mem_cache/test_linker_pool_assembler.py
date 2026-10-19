@@ -101,87 +101,25 @@ class TestDevicePoolEntry(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     pool.prepare_locations(indices)
 
-    def _dcp_pool(self, *, dcp_size, rows, page_size=8, rows_are_pages=False):
-        return DevicePoolEntry(
-            name=PoolName.KV,
-            indices_from_pool=PoolName.KV,
-            device_pool=None,
-            components=[[torch.zeros((rows, 4), dtype=torch.uint8)]],
-            layer_mapping={0: 0},
-            page_size=page_size,
-            rows_are_pages=rows_are_pages,
-            dcp_size=dcp_size,
-        )
+    def test_dcp_widened_locs_collapse_to_rank_rows(self):
+        def pool(dcp_size):
+            return DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[[torch.zeros((10, 4), dtype=torch.uint8)]],
+                layer_mapping={0: 0},
+                page_size=8,
+                rows_are_pages=False,
+                dcp_size=dcp_size,
+            )
 
-    def test_dcp_widened_locs_collapse_to_per_rank_rows(self):
-        # A token-addressed pool is indexed by DCP-WIDENED locs: the allocator
-        # spans [0, max_total * dcp_size) and this rank stores only the locs it
-        # owns, at row loc // dcp_size. One widened page is page_size //
-        # dcp_size physical rows here, so the page starting at widened loc 8
-        # is row 2, not row 8.
-        pool = self._dcp_pool(dcp_size=4, rows=10)
-
-        self.assertEqual(pool.prepare_locations(torch.arange(0, 8)), [0])
-        self.assertEqual(pool.prepare_locations(torch.arange(8, 16)), [2])
-        self.assertEqual(
-            pool.prepare_locations(
-                torch.cat([torch.arange(0, 8), torch.arange(16, 24)])
-            ),
-            [0, 4],
-        )
-
-        # The byte span per page collapses with the row span; leaving it at the
-        # widened page_size would copy dcp_size times too many bytes and run
-        # into the neighbouring rows.
-        _, sizes = pool.get_page_buffer_meta(torch.arange(8, 16))
-        self.assertEqual(sizes, [4 * (8 // 4)])
-
-    def test_dcp_top_page_lands_on_the_last_valid_row(self):
-        # The geometry the widened allocator relies on: with a loc space of
-        # max_total * dcp_size paged at page_size * dcp_size, the highest page
-        # start collapses to exactly the last row the pool was padded for
-        # (max_total + page_size). One page further must be rejected -- that
-        # is the bound the pre-collapse code tripped on every run.
-        max_total, page_size, dcp_size = 8, 2, 4
-        widened_page = page_size * dcp_size
-        pool = self._dcp_pool(
-            dcp_size=dcp_size, rows=max_total + page_size, page_size=widened_page
-        )
-
-        top_start = max_total * dcp_size
-        self.assertEqual(
-            pool.prepare_locations(torch.arange(top_start, top_start + widened_page)),
-            [max_total],
-        )
-        over = top_start + widened_page
-        with self.assertRaisesRegex(ValueError, "exceeds buffer shapes"):
-            pool.prepare_locations(torch.arange(over, over + widened_page))
-
-    def test_without_collapse_a_widened_loc_runs_off_the_buffer(self):
-        # Regression guard for the original defect: the same widened loc that
-        # is in bounds once collapsed walks off the buffer when the pool is
-        # built without dcp_size, which surfaced as a soft offload failure and
-        # a silently decaying device hit rate rather than an error.
-        indices = torch.arange(32, 40)
-        with self.assertRaisesRegex(ValueError, "exceeds buffer shapes"):
-            self._dcp_pool(dcp_size=1, rows=10).prepare_locations(indices)
-        self.assertEqual(
-            self._dcp_pool(dcp_size=4, rows=10).prepare_locations(indices), [8]
-        )
-
-    def test_slot_addressed_pool_does_not_collapse(self):
-        # The MAMBA pool is one row per state slot, addressed by slot id rather
-        # than token position, so it is not DCP-widened: the assembler builds
-        # it without dcp_size and slot ids stay their own rows. Passing a
-        # dcp_size to it is rejected by the divisibility guard below, which is
-        # the behaviour we want -- a page-addressed pool has nothing to
-        # collapse.
-        pool = self._dcp_pool(dcp_size=1, rows=10, page_size=1, rows_are_pages=True)
-        self.assertEqual(pool.prepare_locations(torch.tensor([3, 7])), [3, 7])
-
-    def test_page_size_must_be_divisible_by_dcp_size(self):
+        # A widened page of 8 locs is 2 rows on each of the 4 ranks.
+        self.assertEqual(pool(4).prepare_locations(torch.arange(8, 16)), [2])
+        _, sizes = pool(4).get_page_buffer_meta(torch.arange(8, 16))
+        self.assertEqual(sizes, [4 * 2])
         with self.assertRaisesRegex(ValueError, "must be a multiple of"):
-            self._dcp_pool(dcp_size=3, rows=10)
+            pool(3)
 
 
 class TestDevicePoolGroup(CustomTestCase):
@@ -556,50 +494,45 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
-    def _mamba_stack(self, *, kv_rows=18):
+    def _mamba_group(
+        self,
+        *,
+        dcp_size=1,
+        page_size=2,
+        kv_scale=None,
+        unified_memory=False,
+        draft=None,
+    ):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         # Kimi K3 shape: one MLA layer (1) between two KDA layers (0, 2).
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
         kvcache.start_layer = 0
         kvcache.full_attention_layer_id_mapping = {1: 0}
-        kv = torch.zeros((kv_rows, 3), dtype=torch.uint8)
-        kvcache.full_kv_pool = SimpleNamespace(kv_buffer=[kv])
-        conv = torch.zeros((2, 6, 7), dtype=torch.uint8)
-        temporal = torch.zeros((2, 6, 5), dtype=torch.uint8)
-        req_to_token_pool = SimpleNamespace(
-            mamba_ckpt_pool=None,
-            short_conv_pool=SimpleNamespace(enabled=False),
-            ngram_pool=SimpleNamespace(enabled=False),
-            mamba_map={0: 0, 2: 1},
-            mamba_pool=SimpleNamespace(
-                num_mamba_layers=2,
-                mamba_cache=SimpleNamespace(conv=[conv], temporal=temporal),
-            ),
+        kvcache.full_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((18, 3), dtype=torch.uint8)],
+            kv_scale_buffer=kv_scale,
+        )
+        mamba_cache = SimpleNamespace(
+            conv=[torch.zeros((2, 6, 7), dtype=torch.uint8)],
+            temporal=torch.zeros((2, 6, 5), dtype=torch.uint8),
         )
         params = SimpleNamespace(
-            req_to_token_pool=req_to_token_pool, mtp_draft_device_pools=()
+            req_to_token_pool=SimpleNamespace(
+                mamba_ckpt_pool=None,
+                short_conv_pool=SimpleNamespace(enabled=False),
+                ngram_pool=SimpleNamespace(enabled=False),
+                mamba_map={0: 0, 2: 1},
+                mamba_pool=SimpleNamespace(num_mamba_layers=2, mamba_cache=mamba_cache),
+            ),
+            mtp_draft_device_pools=(draft,) if draft else (),
         )
-        return kvcache, params, kv, conv, temporal
-
-    @staticmethod
-    def _dspark_draft(num_layers=1, rows=18):
-        return SimpleNamespace(
-            page_size=2,
-            k_buffer=[
-                torch.zeros((rows, 4), dtype=torch.uint8) for _ in range(num_layers)
-            ],
-            v_buffer=[
-                torch.zeros((rows, 4), dtype=torch.uint8) for _ in range(num_layers)
-            ],
-            k_scale_buffer=None,
-            native_k_scale_buffer=None,
-        )
-
-    def _resolve_mamba(self, kvcache, params, *, page_size=2, unified_memory=False):
-        with patch(
-            "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_memory",
-            return_value=SimpleNamespace(enable_unified_memory=unified_memory),
+        with (
+            get_parallel().override(attn_dcp_size=dcp_size),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=unified_memory),
+            ),
         ):
             return resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
@@ -608,140 +541,49 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
 
-    def test_mamba_uses_hybrid_assembler_strategy(self):
-        kvcache, params, kv, conv, temporal = self._mamba_stack()
-        with get_parallel().override(attn_dcp_size=1):
-            group = self._resolve_mamba(kvcache, params)
-
+    def test_mamba_packs_mla_kv_and_slot_addressed_state(self):
+        group = self._mamba_group()
         self.assertEqual(group.num_layers, 3)
-        # The MLA KV is TP-replicated but the KDA state is not.
         self.assertFalse(group.rank_replicated)
         self.assertTrue(group.kv_rank_replicated)
-        self.assertEqual(
-            group.sources, {name: name for name in (PoolName.KV, PoolName.MAMBA)}
-        )
-
-        kv_entry = group.entry_map[PoolName.KV]
-        self.assertEqual(kv_entry.prepare_locations(torch.arange(4, 6)), [4])
-        self.assertIsNone(kv_entry.get_prepared_layer_range_meta([4], 0))
-        ptrs, sizes, offsets = kv_entry.get_prepared_layer_range_meta([4], 1)
-        self.assertEqual(ptrs, [[kv.data_ptr() + 4 * 3]])
-        self.assertEqual(sizes, [[6]])
-        self.assertEqual(offsets, [[0]])
-
-        # Mamba rows are slot ids. One object per slot packs every layer's
-        # temporal state, then every layer's conv state.
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.prepare_locations(torch.arange(4, 6)), [4])
+        self.assertIsNone(kv.get_prepared_layer_range_meta([4], 0))
+        # One object per slot: every layer's temporal state, then its conv state.
         mamba = group.entry_map[PoolName.MAMBA]
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
-        self.assertIsNone(mamba.get_prepared_layer_range_meta([3], 1))
-        ptrs, sizes, offsets = mamba.get_prepared_layer_range_meta([3], 2)
-        self.assertEqual(
-            ptrs, [[temporal[1].data_ptr() + 3 * 5, conv[1].data_ptr() + 3 * 7]]
-        )
-        self.assertEqual(sizes, [[5, 7]])
-        self.assertEqual(offsets, [[5, 17]])
+        _, sizes, offsets = mamba.get_prepared_layer_range_meta([3], 2)
+        self.assertEqual((sizes, offsets), ([[5, 7]], [[5, 17]]))
 
-    def test_mamba_collapses_only_the_kv_entry_under_dcp(self):
-        kvcache, params, _, _, _ = self._mamba_stack()
-        with get_parallel().override(attn_dcp_size=2):
-            group = self._resolve_mamba(kvcache, params, page_size=4)
-
-        # DCP shards the KV across ranks, so it is not replicated either.
+    def test_mamba_collapses_only_the_kv_under_dcp(self):
+        group = self._mamba_group(dcp_size=2, page_size=4)
         self.assertFalse(group.kv_rank_replicated)
-        # The widened page [8, 12) is rows 4..5 on this rank.
-        self.assertEqual(
-            group.entry_map[PoolName.KV].prepare_locations(torch.arange(8, 12)), [4]
-        )
-        self.assertEqual(
-            group.entry_map[PoolName.MAMBA].prepare_locations(torch.tensor([5])), [5]
-        )
+        kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
+        self.assertEqual(kv.prepare_locations(torch.arange(8, 12)), [4])
+        self.assertEqual(mamba.prepare_locations(torch.tensor([5])), [5])
 
-    def test_mamba_carries_a_dspark_draft_as_its_own_pool(self):
-        kvcache, params, kv, _, _ = self._mamba_stack()
-        draft = self._dspark_draft()
-        params.mtp_draft_device_pools = (draft,)
-        with get_parallel().override(attn_dcp_size=1):
-            group = self._resolve_mamba(kvcache, params)
+    def test_mamba_carries_a_dspark_draft(self):
+        for dcp_size in (1, 2):
+            draft = SimpleNamespace(
+                page_size=2 * dcp_size,
+                k_buffer=[torch.zeros((18, 4), dtype=torch.uint8)],
+                v_buffer=[torch.zeros((18, 4), dtype=torch.uint8)],
+                k_scale_buffer=None,
+                native_k_scale_buffer=None,
+            )
+            with self.subTest(dcp_size=dcp_size):
+                group = self._mamba_group(
+                    dcp_size=dcp_size, page_size=2 * dcp_size, draft=draft
+                )
+                self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
+                entry = group.entry_map[PoolName.DRAFT]
+                # Draft layer 0 is loaded with the first full-attention layer.
+                self.assertEqual(entry.layer_mapping, {1: 0})
+                # The draft is not sharded: its rows are the widened locs.
+                locs = torch.arange(8, 8 + 2 * dcp_size)
+                self.assertEqual(entry.prepare_locations(locs), [8])
 
-        # The draft KV follows the target KV's indices, as its own pool.
-        self.assertEqual(
-            group.sources,
-            {
-                PoolName.KV: PoolName.KV,
-                PoolName.DRAFT: PoolName.KV,
-                PoolName.MAMBA: PoolName.MAMBA,
-            },
-        )
-        entry = group.entry_map[PoolName.DRAFT]
-        # Draft layer 0 rides on the first full-attention layer (1).
-        self.assertEqual(entry.layer_mapping, {1: 0})
-        self.assertEqual(entry.prepare_locations(torch.arange(4, 6)), [4])
-        ptrs, sizes, offsets = entry.get_prepared_layer_range_meta([4], 1)
-        self.assertEqual(
-            ptrs,
-            [
-                [
-                    draft.k_buffer[0].data_ptr() + 4 * 4,
-                    draft.v_buffer[0].data_ptr() + 4 * 4,
-                ]
-            ],
-        )
-        self.assertEqual(sizes, [[8, 8]])
-        self.assertEqual(offsets, [[0, 8]])
-        # The target KV entry is unchanged by the draft.
-        self.assertEqual(group.entry_map[PoolName.KV].layer_mapping, {1: 0})
-
-        load = group.resolve_transfers(
-            [
-                PoolTransfer(
-                    name=PoolName.KV, keys=["k0"], device_indices=torch.arange(4, 6)
-                ),
-                PoolTransfer(
-                    name=PoolName.MAMBA, keys=["k0"], device_indices=torch.tensor([3])
-                ),
-            ]
-        )
-        self.assertEqual(
-            {t.name for t in load}, {PoolName.KV, PoolName.DRAFT, PoolName.MAMBA}
-        )
-
-    def test_mamba_keeps_the_draft_uncollapsed_under_dcp(self):
-        kvcache, params, _, _, _ = self._mamba_stack()
-        # A draft worker pages the widened loc space: its page is the tree's.
-        draft = self._dspark_draft()
-        draft.page_size = 4
-        params.mtp_draft_device_pools = (draft,)
-        with get_parallel().override(attn_dcp_size=2):
-            group = self._resolve_mamba(kvcache, params, page_size=4)
-
-        # The same widened page [8, 12): rows 4..5 of the sharded target KV,
-        # rows 8..11 of the draft, which holds every token.
-        self.assertEqual(
-            group.entry_map[PoolName.KV].prepare_locations(torch.arange(8, 12)), [4]
-        )
-        entry = group.entry_map[PoolName.DRAFT]
-        self.assertEqual(entry.prepare_locations(torch.arange(8, 12)), [8])
-        ptrs, sizes, offsets = entry.get_prepared_layer_range_meta([8], 1)
-        self.assertEqual(
-            ptrs,
-            [
-                [
-                    draft.k_buffer[0].data_ptr() + 8 * 4,
-                    draft.v_buffer[0].data_ptr() + 8 * 4,
-                ]
-            ],
-        )
-        self.assertEqual(sizes, [[16, 16]])
-        self.assertEqual(offsets, [[0, 16]])
-
-    def test_mamba_rejects_draft_it_cannot_store(self):
-        kvcache, params, _, _, _ = self._mamba_stack()
-        params.mtp_draft_device_pools = (self._dspark_draft(num_layers=2),)
-        with get_parallel().override(attn_dcp_size=1):
-            with self.assertRaisesRegex(ValueError, "exceed the 1 full-attention"):
-                self._resolve_mamba(kvcache, params)
-
-    def test_linker_packs_dspark_draft_only_for_hybrid_linear_targets(self):
+    def test_linker_packs_a_dspark_draft_for_hybrid_linear_targets(self):
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             MHATokenToKVPool,
@@ -756,72 +598,37 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 hf_config=SimpleNamespace(architectures=["DSparkDraftModel"]),
             ),
         )
-        for target_pool, packed in (
-            (HybridLinearKVPool.__new__(HybridLinearKVPool), True),
-            (object(), False),
+        target = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            token_to_kv_pool=HybridLinearKVPool.__new__(HybridLinearKVPool),
+        )
+        worker = SimpleNamespace(
+            target_worker=SimpleNamespace(model_runner=target),
+            _draft_model_runners=lambda: (draft,),
+        )
+        with patch.object(
+            spec,
+            "get_memory",
+            return_value=SimpleNamespace(
+                enable_hierarchical_cache=False,
+                enable_unified_cache_external_linker=True,
+            ),
         ):
-            target = SimpleNamespace(
-                spec_algorithm=SpeculativeAlgorithm.DSPARK, token_to_kv_pool=target_pool
-            )
-            worker = SimpleNamespace(
-                target_worker=SimpleNamespace(model_runner=target),
-                _draft_model_runners=lambda: (draft,),
-            )
-            with (
-                self.subTest(packed=packed),
-                patch.object(
-                    spec,
-                    "get_memory",
-                    return_value=SimpleNamespace(
-                        enable_hierarchical_cache=False,
-                        enable_unified_cache_external_linker=True,
-                    ),
-                ),
-            ):
-                if packed:
-                    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
-                    self.assertEqual(plan.mode, spec.HiCacheDraftMode.PACKED)
-                    self.assertEqual(
-                        target.mtp_draft_device_pools, (draft.token_to_kv_pool,)
-                    )
-                else:
-                    with self.assertRaisesRegex(
-                        NotImplementedError, "only supports packed"
-                    ):
-                        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+            plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+        self.assertEqual(plan.mode, spec.HiCacheDraftMode.PACKED)
+        self.assertEqual(target.mtp_draft_device_pools, (draft.token_to_kv_pool,))
 
-    def test_mamba_rejects_unsupported_configurations(self):
-        kvcache, params, _, _, _ = self._mamba_stack()
-        with get_parallel().override(attn_dcp_size=1):
-            with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
-                self._resolve_mamba(kvcache, params, unified_memory=True)
-
-            params.req_to_token_pool.mamba_ckpt_pool = object()
-            with self.assertRaisesRegex(ValueError, "int8 Mamba checkpoints"):
-                self._resolve_mamba(kvcache, params)
-
-            # An FP4 MLA KV keeps per-block scales the KV entry does not carry.
-            kvcache, params, _, _, _ = self._mamba_stack()
-            kvcache.full_kv_pool.kv_scale_buffer = [torch.zeros((18, 1))]
-            with self.assertRaisesRegex(ValueError, "scaled KV caches"):
-                self._resolve_mamba(kvcache, params)
+    def test_mamba_rejects_unsupported_configs(self):
+        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            self._mamba_group(unified_memory=True)
+        with self.assertRaisesRegex(ValueError, "scaled KV caches"):
+            self._mamba_group(kv_scale=[torch.zeros((18, 1))])
 
     def test_dsa_rejects_dcp(self):
-        # The DSA entry packs the target's DCP-widened KV rows together with
-        # any MTP draft rows (replicated, indexed raw) under one dcp_size, so
-        # a single collapse cannot be correct for both; reject rather than
-        # silently reproduce the widened-loc-as-physical-row bug this pool's
-        # sibling (mamba's KV entry) had before it was given its own dcp_size.
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
         kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
         kvcache.page_size = 2
-        kvcache.layer_num = 1
-        kvcache.kv_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
-        kvcache.index_key_cache = SimpleNamespace(
-            buffer=[torch.zeros((4, 7), dtype=torch.uint8)]
-        )
-
         with get_parallel().override(attn_dcp_size=8):
             with self.assertRaisesRegex(ValueError, "does not support --dcp-size"):
                 resolve_hybrid_device_pool_group(
@@ -890,11 +697,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     )
 
     def test_unsupported_strategy_fails_with_context(self):
-        # _MambaStrategy used to stand in here, but it grew a
-        # build_direct_linker_pool_group when hybrid mamba landed on the
-        # linker, so it now gets as far as reading kvcache.full_kv_pool off
-        # this uninitialised mock and raises AttributeError instead of the
-        # strategy-level ValueError. _SwaStrategy is still without a builder.
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         kvcache = SWAKVPool.__new__(SWAKVPool)

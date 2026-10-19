@@ -2598,17 +2598,9 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        # DCP-widened on purpose: this allocator hands out
-                        # virtual locs, not rows. Every consumer that turns a
-                        # loc into a row collapses it by attn_dcp_size
-                        # (`rebind_write_loc`, `translate_dcp_read_ids`,
-                        # `set_mla_kv_buffer_dcp_sharded_triton`), and the
-                        # radix tree pages at the widened page size too.
-                        # Narrowing it keeps the page count but strands
-                        # (dcp_size - 1) / dcp_size of the KV tensor.
-                        # `_derive_pool_sizes` already applied loc_space_scale
-                        # (dcp_size for a replicated draft, 1 for the sharded
-                        # target), so only the remaining factor is applied here.
+                        # Locs stay DCP-widened (consumers collapse them to rows by
+                        # attn_dcp_size); `_derive_pool_sizes` already applied
+                        # loc_space_scale, so only the remaining factor is applied.
                         loc_span = get_parallel().attn_dcp_size // self.loc_space_scale
                         paged_allocator_cls = (
                             current_platform.get_paged_allocator_cls()

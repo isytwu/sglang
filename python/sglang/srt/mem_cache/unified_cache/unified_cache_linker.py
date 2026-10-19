@@ -246,9 +246,8 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
-        # Ceiling on in-flight offloads that pin a mamba state; None when the
-        # tree has no MAMBA component. The quarter left over is what eviction
-        # reclaims from: the pool only has to stay non-empty.
+        # In-flight offloads that pin a mamba state leave a quarter of the pool to
+        # eviction; None without a MAMBA component.
         mamba_pool_size = (
             self.cache.req_to_token_pool.mamba_allocator.size
             if ComponentType.MAMBA in cache.components
@@ -492,12 +491,8 @@ class UnifiedCacheLinkerWrapper:
     def _mamba_offload_has_headroom(self, transfers: list[PoolTransfer]) -> bool:
         """Refuse an offload that would pin the last reclaimable mamba states.
 
-        A queued offload holds `inc_lock_ref` on its node until the backend
-        acknowledges it, and the MAMBA LRU skips locked nodes. Unbounded, the
-        queue can lock every checkpoint once the backend drains slower than
-        prefill donates them, and the next mamba allocation then fails on
-        every rank. Skipping leaves the checkpoint device-resident and
-        evictable, just not persisted, as when `offload()` declines to queue.
+        A queued offload locks its node until the store acknowledges it, and the
+        MAMBA LRU skips locked nodes.
         """
         if self._mamba_offload_cap is None:
             return True

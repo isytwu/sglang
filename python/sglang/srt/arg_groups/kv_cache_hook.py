@@ -363,15 +363,10 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool does not "
             "support --dcp-size > 1."
         )
-    # The SWA allocator family hands out un-widened locs (only the generic
-    # paged branch in kv_cache_configurator.py widens by dcp_size), and the
-    # full->swa mapping is not DCP-sharded. No bounds check would fire: the
-    # server would compute over the wrong KV.
+    # SWA allocators do not widen their locs for DCP, and nothing range-checks them.
     if cfg.dcp_size > 1 and model_config_of(server_args).is_hybrid_swa:
         raise ValueError(
-            "--dcp-size > 1 does not support hybrid sliding-window models "
-            "(e.g. DeepSeek V4): the SWA KV allocator does not widen its loc "
-            "space and the full->swa mapping is not DCP-sharded."
+            "--dcp-size > 1 does not support hybrid sliding-window models yet."
         )
     if (
         cfg.disaggregation_decode_retraction_backup == "host_pool"

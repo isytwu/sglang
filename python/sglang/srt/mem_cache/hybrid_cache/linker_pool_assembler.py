@@ -43,11 +43,8 @@ class DevicePoolEntry:
         self.packed = packed
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
-        # Token-addressed indices are DCP-widened locs: the allocator spans
-        # [0, max_total * dcp_size) and each rank stores the locs it owns
-        # (`loc % dcp_size == dcp_rank`) at row `loc // dcp_size` (see
-        # `set_mla_kv_buffer_dcp_sharded_triton`), so a widened page of
-        # `page_size` locs is `page_size // dcp_size` rows here.
+        # Token-addressed indices are DCP-widened locs; this rank keeps its own
+        # locs at row `loc // dcp_size`.
         if page_size % dcp_size:
             raise ValueError(
                 f"Pool {name}: page_size={page_size} must be a multiple of "
@@ -106,11 +103,7 @@ class DevicePoolEntry:
             pages, starts[:, None] + self._page_offsets
         ):
             raise ValueError(f"Pool {self.name} requires aligned contiguous pages.")
-        # A page-addressed pool (mamba state slots, the DSA indexer) is indexed
-        # by slot id and is never DCP-widened, so it keeps the page divide.
-        # A token-addressed pool collapses the widened loc: the page start is
-        # page_size-aligned and page_size % dcp_size == 0, so every rank's first
-        # owned loc in the page floors to the same physical row.
+        # Slot-addressed pools are never DCP-widened.
         rows = (
             starts.div(self.page_size, rounding_mode="floor")
             if self._row_span == 1
@@ -194,8 +187,7 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
-        # The KV pool alone can be identical on every attention TP rank in a
-        # group that is not (FULL + MAMBA: MLA KV next to a TP-sharded state).
+        # FULL + MAMBA: the MLA KV is TP-replicated, the KDA state is not.
         self.kv_rank_replicated = rank_replicated or kv_rank_replicated
         self.kv_buffer = None
 
@@ -423,9 +415,7 @@ def _build_dsa_device_pool_group(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
-    # This entry packs the target's DCP-widened KV rows together with any MTP
-    # draft rows (replicated, indexed raw) under one set of rows; a single
-    # dcp_size cannot collapse both correctly.
+    # The rows mix the sharded target KV with replicated MTP draft KV.
     if get_parallel().attn_dcp_size > 1:
         raise ValueError(
             "The direct external linker's DSA pool group does not support "
@@ -594,7 +584,6 @@ def _build_mamba_device_pool_group(
             layer_mapping=full_layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
-            # The MLA KV is the DCP-sharded pool: its indices are widened locs.
             dcp_size=get_parallel().attn_dcp_size,
         ),
         mamba_entry,
@@ -605,8 +594,7 @@ def _build_mamba_device_pool_group(
                 params.mtp_draft_device_pools, full_layer_mapping, page_size
             )
         )
-    # Not rank_replicated: the MLA KV is TP-replicated but the KDA state is not.
-    # The KV alone stays identical across attention TP ranks unless DCP shards it.
+    # Only the MLA KV is replicated across attention TP ranks, and not under DCP.
     return DevicePoolGroup(
         entries,
         len(full_layer_mapping | mamba_entry.layer_mapping),
@@ -618,17 +606,10 @@ def _build_mamba_device_pool_group(
 def _mamba_draft_pool_entry(
     draft_pools: Sequence[Any], full_layer_mapping: dict[int, int], page_size: int
 ) -> DevicePoolEntry:
-    """A DSPARK draft's MHA KV, indexed like the target KV it follows.
+    """A DSPARK draft's MHA KV, indexed by the target KV's transfer.
 
-    The draft forward runs after the target forward, so draft layer d only has
-    to be readable once the target is: it rides on the d-th full-attention
-    layer's transfer. A separate pool keeps every layer mapped to exactly one
-    buffer, which the UMBP layer-wise loader requires.
-
-    Under DCP the draft is not sharded: it indexes the shared allocator's
-    widened locs raw, and its pools span and page that space (see
-    ``KVCacheConfigurator.loc_space_scale``). So this entry keeps
-    ``dcp_size=1`` while the target KV entry collapses the same indices.
+    Draft layer d is loaded with the d-th full-attention layer. Under DCP the
+    draft is not sharded, so its entry keeps the widened locs (dcp_size=1).
     """
     if any(pool.page_size != page_size for pool in draft_pools):
         raise ValueError("Draft KV page size must match the tree page size.")

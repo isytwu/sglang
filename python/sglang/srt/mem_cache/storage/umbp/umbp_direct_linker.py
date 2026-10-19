@@ -45,9 +45,8 @@ CHUNK_PAGES = int(os.getenv("UMBP_CHUNK_PAGES", "64"))
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
-# An unreachable standalone server shows up as refused writes and misses, so a
-# run of offload batches that store nothing is reported as an unavailable store
-# once it lasts this many batches and seconds.
+# Report an unavailable store once this many offload batches in a row, over
+# at least this long, stored nothing.
 OFFLOAD_DRY_ALERT_BATCHES = 64
 OFFLOAD_DRY_ALERT_S = 60.0
 
@@ -68,13 +67,10 @@ def _storage_suffix(
 
 def _pool_suffix_overrides(
     *, pool_group, tp_rank: int, attn_cp_rank: int, pp_rank: int
-) -> dict:
-    # A FULL + MAMBA group is not rank-replicated because the KDA state is
-    # TP-sharded, but its MLA KV is identical on every attention TP rank. One
-    # shared key per KV page stores it once instead of once per rank.
-    if pool_group.rank_replicated or not getattr(
-        pool_group, "kv_rank_replicated", False
-    ):
+) -> dict[PoolName, str]:
+    # The MLA KV of a FULL + MAMBA group is identical on every attention TP rank,
+    # so one shared key per page stores it once.
+    if pool_group.rank_replicated or not pool_group.kv_rank_replicated:
         return {}
     return {
         PoolName.KV: _storage_suffix(
@@ -189,8 +185,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
-        # Chunks of one batch touch disjoint keys and pointers, so their calls
-        # may run concurrently; 1 keeps them serial on the draining thread.
+        # Calls of one batch touch disjoint keys and pointers; 1 runs them serially.
         self._rpc_parallelism = max(1, int(os.getenv("UMBP_RPC_PARALLELISM", "1")))
         self._rpc_pool = (
             ThreadPoolExecutor(
@@ -492,17 +487,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 for index in range(0, len(exists), objects_per_page)
             ]
 
-        # _apply_hit_policy reads this as a positional prefix, so the chunk
-        # results must stay in page order (_map_chunks keeps submission order).
-        page_exists = []
-        for chunk in self._map_chunks(
+        chunks = self._map_chunks(
             [
                 (lambda s=start: _exists_chunk(s))
                 for start in range(0, len(page_keys), pages_per_call)
             ]
-        ):
-            page_exists.extend(chunk)
-        return page_exists
+        )
+        return [exists for chunk in chunks for exists in chunk]
 
     @staticmethod
     def _apply_hit_policy(
@@ -847,8 +838,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return ptrs, sizes * len(rows), offsets * len(rows)
 
     def _map_chunks(self, jobs: list[Callable[[], Any]]) -> list[Any]:
-        """Run each zero-arg job, at most UMBP_RPC_PARALLELISM at a time, and
-        return the results in submission order."""
+        """Run the jobs UMBP_RPC_PARALLELISM at a time; results keep their order."""
         if self._rpc_pool is None or len(jobs) <= 1:
             return [job() for job in jobs]
         futures = [self._rpc_pool.submit(job) for job in jobs]
@@ -1009,8 +999,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         refused_shared: list[str] = []
         # Over plans, not transfers: a plan already carries every task's keys
         # for its pool, so walking transfers would put that pool once per task.
-        # Every pool is written even after one fails: when only the KV key is
-        # shared, the per-rank pools are this rank's only copy.
+        # Write every pool even after one fails: per-rank pools have no other writer.
         for plan in plans:
             failed = self._put_plan(plan, log_failures=plan.name not in shared)
             stored_any |= len(failed) < len(plan.keys)
@@ -1019,9 +1008,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             elif failed:
                 ok = False
         if refused_shared:
-            # Every rank writes a shared key, and the store refuses the other
-            # writers while the first write is in flight; a refused key the
-            # store holds afterwards was written by another rank.
+            # The store refuses every writer of a shared key but the first; a refused
+            # key it holds afterwards was written by another rank.
             missing = self._missing_keys(refused_shared)
             stored_any |= len(missing) < len(refused_shared)
             if missing:
@@ -1131,9 +1119,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ):
             self._offload_dry_alerted_at = now
             logger.error(
-                "UMBP stored nothing in the last %d offload batches (%.0f s): "
-                "the store is unavailable or full (is the standalone server "
-                "running?). External cache hits will not grow until it recovers.",
+                "UMBP stored nothing in the last %d offload batches (%.0f s); "
+                "is the standalone server running?",
                 self._offload_dry_batches,
                 now - self._offload_dry_since,
             )

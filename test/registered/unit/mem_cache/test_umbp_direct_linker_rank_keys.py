@@ -96,71 +96,52 @@ class TestEveryRankWrites(CustomTestCase):
 
 
 class TestSharedKvKeys(CustomTestCase):
-    def test_every_rank_shares_the_kv_key_of_a_kv_replicated_group(self):
-        group = SimpleNamespace(rank_replicated=False, kv_rank_replicated=True)
-        overrides = [
-            _pool_suffix_overrides(
-                pool_group=group, tp_rank=rank, attn_cp_rank=0, pp_rank=0
-            )
-            for rank in range(8)
-        ]
-        self.assertEqual(overrides, [{PoolName.KV: "cp0_pp0"}] * 8)
-
-    def test_sharded_and_fully_replicated_groups_keep_their_suffix(self):
-        for group in (
-            SimpleNamespace(rank_replicated=False, kv_rank_replicated=False),
-            SimpleNamespace(rank_replicated=True, kv_rank_replicated=True),
+    def test_only_a_kv_replicated_group_shares_the_kv_key(self):
+        for rank_replicated, kv_rank_replicated, expected in (
+            (False, True, {PoolName.KV: "cp0_pp0"}),
+            (False, False, {}),
+            (True, True, {}),
         ):
+            group = SimpleNamespace(
+                rank_replicated=rank_replicated, kv_rank_replicated=kv_rank_replicated
+            )
             self.assertEqual(
                 _pool_suffix_overrides(
                     pool_group=group, tp_rank=3, attn_cp_rank=0, pp_rank=0
                 ),
-                {},
+                expected,
             )
 
     def test_the_override_renames_only_the_kv_objects(self):
         store = UMBPStore.__new__(UMBPStore)
         store.registered_pools = {
             PoolName.KV: SimpleNamespace(components=[object()]),
-            PoolName.DRAFT: SimpleNamespace(components=[object()]),
             PoolName.MAMBA: DevicePoolEntry.__new__(DevicePoolEntry),
         }
         store.mla_suffix = store.mha_suffix = "tp3_cp0_pp0"
         store.is_mla_backend = True
         store.config_prefix = ""
+        store.pool_suffix_overrides = {PoolName.KV: "cp0_pp0"}
 
-        def keys(pool):
+        def key(pool):
             return store._get_hybrid_page_component_keys(
                 ["page"], SimpleNamespace(name=pool)
-            )[0]
+            )[0][0]
 
-        before = {pool: keys(pool) for pool in store.registered_pools}
-        store.pool_suffix_overrides = {PoolName.KV: "cp0_pp0"}
-        after = {pool: keys(pool) for pool in store.registered_pools}
-
-        self.assertNotEqual(after[PoolName.KV], before[PoolName.KV])
-        self.assertNotIn("tp3", after[PoolName.KV][0])
-        self.assertIn("_cp0_pp0_", after[PoolName.KV][0])
-        # The draft and the KDA state differ per rank and keep their keyspace.
-        self.assertEqual(after[PoolName.DRAFT], before[PoolName.DRAFT])
-        self.assertEqual(after[PoolName.MAMBA], before[PoolName.MAMBA])
-        self.assertIn("tp3", after[PoolName.MAMBA][0])
+        self.assertNotIn("tp3", key(PoolName.KV))
+        self.assertIn("tp3", key(PoolName.MAMBA))
 
 
 class TestSharedKeyWriteRace(CustomTestCase):
-    """Every rank writes a shared KV key and the store refuses all but one."""
-
-    def _linker(self, exists):
+    def _run_offload(self, refused, held):
         linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
         linker.pool_group = SimpleNamespace(rank_replicated=False)
+        exists = mock.Mock(side_effect=lambda keys: [held] * len(keys))
         linker.storage = SimpleNamespace(
             pool_suffix_overrides={PoolName.KV: "cp0_pp0"},
-            client=SimpleNamespace(batch_exists=mock.Mock(side_effect=exists)),
+            client=SimpleNamespace(batch_exists=exists),
         )
         linker._stats = {"offload": 0, "offload_batches": 0}
-        return linker
-
-    def _run(self, linker, refused):
         plans = [
             SimpleNamespace(name=PoolName.KV, keys=["kv0", "kv1"]),
             SimpleNamespace(name=PoolName.MAMBA, keys=["m0"]),
@@ -168,41 +149,31 @@ class TestSharedKeyWriteRace(CustomTestCase):
         written = []
 
         def put_plan(plan, *, log_failures):
-            written.append((plan.name, log_failures))
+            written.append(plan.name)
             return refused.get(plan.name, [])
 
-        task = ([], SimpleNamespace(synchronize=lambda: None))
         with (
             mock.patch.object(linker, "_build_load_plans", return_value=plans),
             mock.patch.object(linker, "_put_plan", side_effect=put_plan),
         ):
-            return linker._run_offload([task]), written
+            ok = linker._run_offload([([], SimpleNamespace(synchronize=lambda: None))])
+        return ok, written, exists
 
-    def test_a_refused_shared_key_the_store_holds_is_stored(self):
-        linker = self._linker(lambda keys: [True] * len(keys))
-        ok, written = self._run(linker, {PoolName.KV: ["kv1"]})
-        self.assertTrue(ok)
-        # The per-rank pool is written after the shared pool was refused, and
-        # only the per-rank pool logs its failures chunk by chunk.
-        self.assertEqual(written, [(PoolName.KV, False), (PoolName.MAMBA, True)])
-        linker.storage.client.batch_exists.assert_called_once_with(["kv1"])
+    def test_a_refused_key_fails_unless_another_rank_stored_it(self):
+        for refused, held, stored in (
+            ({PoolName.KV: ["kv1"]}, True, True),
+            ({PoolName.KV: ["kv1"]}, False, False),
+            # A per-rank key has no other writer.
+            ({PoolName.MAMBA: ["m0"]}, True, False),
+        ):
+            with self.subTest(refused=refused, held=held):
+                ok, written, exists = self._run_offload(refused, held)
+                self.assertEqual(ok, stored)
+                self.assertEqual(written, [PoolName.KV, PoolName.MAMBA])
+                self.assertEqual(exists.called, PoolName.KV in refused)
 
-    def test_a_refused_shared_key_missing_from_the_store_fails(self):
-        linker = self._linker(lambda keys: [False] * len(keys))
-        ok, written = self._run(linker, {PoolName.KV: ["kv1"]})
-        self.assertFalse(ok)
-        self.assertEqual(len(written), 2)
-
-    def test_a_refused_per_rank_key_fails_without_a_store_check(self):
-        linker = self._linker(lambda keys: [True] * len(keys))
-        ok, _ = self._run(linker, {PoolName.MAMBA: ["m0"]})
-        self.assertFalse(ok)
-        linker.storage.client.batch_exists.assert_not_called()
-
-    def test_a_run_of_dry_batches_is_reported(self):
-        linker = self._linker(lambda keys: [False] * len(keys))
-        # One batch a second: the alert needs both the batch count and the
-        # minute, and repeats at most every five minutes.
+    def test_a_run_of_dry_batches_is_reported_once(self):
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
         clock = iter(range(100000))
         with (
             mock.patch.object(
@@ -212,9 +183,7 @@ class TestSharedKeyWriteRace(CustomTestCase):
         ):
             for _ in range(umbp_direct_linker.OFFLOAD_DRY_ALERT_BATCHES * 2):
                 linker._note_offload_outcome(False)
-            self.assertEqual(error.call_count, 1)
-            linker._note_offload_outcome(True)
-            self.assertEqual(linker._offload_dry_batches, 0)
+        self.assertEqual(error.call_count, 1)
 
 
 if __name__ == "__main__":

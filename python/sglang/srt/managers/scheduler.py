@@ -4087,10 +4087,7 @@ class Scheduler(
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
         adder = self.get_prefill_adder_class()(
-            # Not self.page_size: under dcp_enabled the tree's own page_size is
-            # widened to page_size * dcp_size, and the adder must chunk against
-            # that same unit or it hands the tree page ranges that straddle a
-            # dcp page boundary.
+            # Under DCP the tree pages at page_size * dcp_size.
             self.tree_cache.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,

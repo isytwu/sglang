@@ -58,12 +58,7 @@ def _can_pack_linker_draft(
     draft_runners: tuple[ModelRunner, ...],
     target_runner: ModelRunner,
 ) -> bool:
-    """Draft KV the direct linker stores next to the target's.
-
-    Only the FULL + Mamba pool group (hybrid linear targets such as Kimi K3)
-    carries a DSPARK draft's MHA KV, as its own DRAFT pool; every other group
-    still rejects a draft it would omit from storage.
-    """
+    """Only the FULL + Mamba linker group stores a DSPARK draft's MHA KV."""
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MHATokenToKVPool,

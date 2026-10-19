@@ -1369,8 +1369,7 @@ class UMBPStore(HiCacheStorage):
 
         components = getattr(host_pool, "components", None)
         if pool_name == PoolName.MAMBA:
-            # Deferred: mamba.py pulls in triton via memory_pool.py, which a
-            # CPU-only unit test importing this module should not need.
+            # Deferred: pool_host.mamba pulls in triton, which CPU-only tests lack.
             from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 
             if isinstance(host_pool, MambaPoolHost):
@@ -1379,9 +1378,7 @@ class UMBPStore(HiCacheStorage):
                 if host_pool.temporal_state_elem_size > 0:
                     suffixes = [f"_{mha_suffix}_temporal"] + suffixes
             elif isinstance(host_pool, DevicePoolEntry):
-                # The direct linker's mamba entry packs the temporal state and
-                # every conv buffer of a slot into one object (packed=True, see
-                # linker_pool_assembler._mamba_device_pool_entry).
+                # The linker's mamba entry packs all states of a slot into one object.
                 suffixes = [f"_{mha_suffix}_temporal"]
             else:
                 raise ValueError(

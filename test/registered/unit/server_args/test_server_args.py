@@ -2410,6 +2410,22 @@ class TestHiCacheArgs(CustomTestCase):
 
         handle_cache_compatibility(args)
 
+    def test_dcp_rejects_hybrid_swa_models(self):
+        for dcp_size, is_hybrid_swa in ((8, True), (8, False), (1, True)):
+            args = self._make_args(dcp_size=dcp_size)
+            with (
+                self.subTest(dcp_size=dcp_size, is_hybrid_swa=is_hybrid_swa),
+                patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+                    return_value=SimpleNamespace(is_hybrid_swa=is_hybrid_swa),
+                ),
+            ):
+                if dcp_size > 1 and is_hybrid_swa:
+                    with self.assertRaisesRegex(ValueError, "hybrid sliding-window"):
+                        handle_cache_compatibility(args)
+                else:
+                    handle_cache_compatibility(args)
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

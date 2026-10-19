@@ -1,13 +1,8 @@
 """KL for the UMBP direct linker on Kimi Linear (FULL + Mamba: MLA + KDA).
 
-Turn 1 offloads to a local UMBP standalone server, /flush_cache drops the
-device tree, and turn 2 restores every prefix from UMBP alone: the MLA KV pages
-and the KDA state at the restore boundary. Turn 2's outputs are then replayed
-against a full recompute. Under TP every rank shares one key per MLA KV page;
-under DCP each rank keeps its own keys and the DCP-widened KV rows collapse.
-
-Turn 2 is scored a few tokens past the restore boundary: the MLA layers see the
-whole prefix, so further out they mask a wrong KDA state.
+Mirrors test_unified_cache_linker_kl_inkling.py with a local UMBP standalone
+server. Turn 2 is scored right after the restore boundary: further out, the MLA
+layers mask a wrong KDA state.
 """
 
 import json
@@ -46,68 +41,35 @@ _MODEL_PATH = os.environ.get(
 # one that left the KDA state zeroed about 5e-2.
 KL_DIV_THRESHOLD = 1e-2
 PAGE_SIZE = 64
-# A multiple of the DCP4-widened tree page (4 * PAGE_SIZE).
+# A multiple of the DCP4-widened tree page.
 TRACK_INTERVAL = 512
 # Turn 1's continuation and turn 2's suffix.
 TAIL_TOKENS = 16
 
 
-class _UMBPStandaloneServer:
-    """A node-local UMBP standalone server on a Unix socket."""
+def _start_umbp_standalone_server(socket_path):
+    import mori
 
-    def __init__(self, dram_gib: int = 64):
-        import mori
-
-        self.binary = os.path.join(
-            os.path.dirname(mori.__file__), "umbp_standalone_server"
-        )
-        self.dir = tempfile.mkdtemp(prefix="umbp-sa-")
-        self.socket_path = os.path.join(self.dir, "sa.sock")
-        self.address = f"unix://{self.socket_path}"
-        self.log_path = os.path.join(self.dir, "sa.log")
-        self.dram_gib = dram_gib
-        self.process = None
-
-    def start(self):
-        env = {
+    binary = os.path.join(os.path.dirname(mori.__file__), "umbp_standalone_server")
+    process = subprocess.Popen(
+        [binary, f"unix://{socket_path}"],
+        env={
             **os.environ,
-            "UMBP_DRAM_CAPACITY": str(self.dram_gib << 30),
+            "UMBP_DRAM_CAPACITY": str(64 << 30),
             "UMBP_SSD_ENABLED": "0",
             "HSA_USERPTR_FOR_PAGED_MEM": "0",
             "HSA_ENABLE_IPC_MODE_LEGACY": "1",
-            "MORI_UMBP_LOG_LEVEL": "info",
-        }
-        with open(self.log_path, "w") as log:
-            self.process = subprocess.Popen(
-                [self.binary, self.address],
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-        # The server binds its socket once it serves.
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if os.path.exists(self.socket_path):
-                return
-            if self.process.poll() is not None:
-                with open(self.log_path) as f:
-                    raise RuntimeError(
-                        f"UMBP standalone server exited:\n{f.read()[-2000:]}"
-                    )
-            time.sleep(1)
-        raise RuntimeError("UMBP standalone server did not start in 300 s")
-
-    def stop(self):
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+        },
+    )
+    deadline = time.monotonic() + 300
+    while not os.path.exists(socket_path):
+        if process.poll() is not None or time.monotonic() > deadline:
+            raise RuntimeError("The UMBP standalone server did not start.")
+        time.sleep(1)
+    return process
 
 
 class _KimiLinearUMBPLinkerKLMixin:
-    tp_size = 4
     dcp_size = 1
     extra_args: tuple[str, ...] = ()
 
@@ -115,17 +77,16 @@ class _KimiLinearUMBPLinkerKLMixin:
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = f"http://127.0.0.1:{find_available_port(30000)}"
-        cls.umbp = _UMBPStandaloneServer()
-        cls.addClassCleanup(cls.umbp.stop)
-        cls.umbp.start()
+        socket_path = os.path.join(tempfile.mkdtemp(prefix="umbp-sa-"), "sa.sock")
+        cls.umbp = _start_umbp_standalone_server(socket_path)
+        cls.addClassCleanup(terminate_and_kill_process_tree, cls.umbp, wait_timeout=30)
         other_args = [
             "--trust-remote-code",
             "--tp-size",
-            str(cls.tp_size),
+            "4",
             *(["--dcp-size", str(cls.dcp_size)] if cls.dcp_size > 1 else []),
             "--page-size",
             str(PAGE_SIZE),
-            # The Triton backend's DCP decode does not run MLA on ROCm.
             "--attention-backend",
             "aiter",
             "--mamba-track-interval",
@@ -139,7 +100,7 @@ class _KimiLinearUMBPLinkerKLMixin:
             "--unified-cache-external-linker-backend",
             "mori",
             "--hicache-storage-backend-extra-config",
-            json.dumps({"standalone_address": cls.umbp.address}),
+            json.dumps({"standalone_address": f"unix://{socket_path}"}),
             *cls.extra_args,
         ]
         cls.process = popen_launch_server(
@@ -189,7 +150,7 @@ class _KimiLinearUMBPLinkerKLMixin:
             KL_DIV_THRESHOLD,
             sequences,
             logprobs,
-            label=f"umbp_linker_load_back_tp{self.tp_size}_dcp{self.dcp_size}",
+            label=f"umbp_linker_load_back_dcp{self.dcp_size}",
             sampling_temperature=0,
         )
 

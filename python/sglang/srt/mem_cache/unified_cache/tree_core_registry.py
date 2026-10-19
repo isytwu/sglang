@@ -135,10 +135,9 @@ def select_tree_core_backend(params: CacheInitParams) -> str:
 
 
 def _agree_with_peer_ranks(backend: str, params: CacheInitParams) -> str:
-    """Fall back on every rank of the cache when any one of them falls back.
+    """Use the Python TreeCore on every rank of the cache if any rank must.
 
-    The toolchain probe is per rank and time-bound, so ranks that race the same
-    rustup install can disagree, and ranks sharing a cache must run one TreeCore.
+    The per-rank toolchain probe can disagree while rustup installs a toolchain.
     """
     if not torch.distributed.is_initialized():
         return backend
