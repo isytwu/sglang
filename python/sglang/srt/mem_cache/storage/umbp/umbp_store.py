@@ -917,6 +917,8 @@ class UMBPStore(HiCacheStorage):
 
         # Initialize before the optional constructor-time pool registration.
         self.registered_pools: dict = {}
+        # The direct linker's rank suffixes for pools whose ranks share keys.
+        self.pool_suffix_overrides: dict[PoolName, str] = {}
         self._kv_anchor_is_logical = False
         self._kv_anchor_is_page_envelope = False
         self._registered_regions: set = set()
@@ -1354,54 +1356,42 @@ class UMBPStore(HiCacheStorage):
             raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
 
         mla_suffix = self.mla_suffix if rank_suffix is None else rank_suffix
-        mha_suffix = (
-            getattr(self, "mha_suffix", mla_suffix)
-            if rank_suffix is None
-            else rank_suffix
-        )
+        mha_suffix = self.mha_suffix if rank_suffix is None else rank_suffix
         override = (
-            getattr(self, "pool_suffix_overrides", {}).get(pool_name)
-            if rank_suffix is None
-            else None
+            self.pool_suffix_overrides.get(pool_name) if rank_suffix is None else None
         )
         if override is not None:
             mla_suffix = mha_suffix = override
 
-        components = getattr(host_pool, "components", None)
-        if pool_name == PoolName.MAMBA:
-            # Deferred: pool_host.mamba pulls in triton, which CPU-only tests lack.
-            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-
-            if isinstance(host_pool, MambaPoolHost):
-                conv_num = len(host_pool.conv_buffer)
-                suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
-                if host_pool.temporal_state_elem_size > 0:
-                    suffixes = [f"_{mha_suffix}_temporal"] + suffixes
-            elif isinstance(host_pool, DevicePoolEntry):
-                # The linker's mamba entry packs all states of a slot into one object.
+        if isinstance(host_pool, DevicePoolEntry):
+            components = len(host_pool.components)
+            if pool_name == PoolName.MAMBA:
+                # One object packs the temporal and every conv state of a slot. The
+                # linker's tp/cp/pp rank suffix keeps its key apart from a host
+                # pool's temporal-only object.
                 suffixes = [f"_{mha_suffix}_temporal"]
+            elif components == 1:
+                suffixes = [f"_{mla_suffix}_{pool_name}"]
+            elif components == 2:
+                # Packed K/V components share one stored object.
+                suffixes = (
+                    [f"_{mha_suffix}_{pool_name}"]
+                    if host_pool.packed
+                    else [
+                        f"_{mha_suffix}_{pool_name}_k",
+                        f"_{mha_suffix}_{pool_name}_v",
+                    ]
+                )
             else:
                 raise ValueError(
-                    f"Unsupported UMBP mamba host_pool type for pool "
-                    f"{pool_name}: {type(host_pool).__name__}"
+                    f"Unsupported UMBP component count for pool {pool_name}: "
+                    f"{components}"
                 )
-        elif components is not None and len(components) == 1:
-            suffixes = [f"_{mla_suffix}_{pool_name}"]
-        elif components is not None and len(components) == 2:
-            # Packed DevicePoolEntry K/V components share one stored object.
-            suffixes = (
-                [f"_{mha_suffix}_{pool_name}"]
-                if host_pool.packed
-                else [
-                    f"_{mha_suffix}_{pool_name}_k",
-                    f"_{mha_suffix}_{pool_name}_v",
-                ]
-            )
-        elif components is not None:
-            raise ValueError(
-                f"Unsupported UMBP component count for pool {pool_name}: "
-                f"{len(components)}"
-            )
+        elif pool_name == PoolName.MAMBA:
+            conv_num = len(host_pool.conv_buffer)
+            suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
+            if host_pool.temporal_state_elem_size > 0:
+                suffixes = [f"_{mha_suffix}_temporal"] + suffixes
         elif self.is_mla_backend:
             suffixes = [f"_{mla_suffix}_{pool_name}"]
         elif getattr(host_pool, "v_buffer", None) is not None:
@@ -1410,6 +1400,7 @@ class UMBPStore(HiCacheStorage):
                 f"_{mha_suffix}_{pool_name}_v",
             ]
         else:
+            # A K-only host pool has no v_buffer.
             suffixes = [f"_{mha_suffix}_{pool_name}"]
 
         component_keys = [

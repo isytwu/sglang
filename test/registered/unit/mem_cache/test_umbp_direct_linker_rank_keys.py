@@ -1,13 +1,16 @@
-"""Unit tests for the UMBP direct linker's rank-replicated key handling."""
+"""Unit tests for UMBP object keys and the direct linker's rank keys."""
 
 import unittest
 from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _pool_suffix_overrides,
@@ -111,24 +114,84 @@ class TestSharedKvKeys(CustomTestCase):
                 expected,
             )
 
-    def test_the_override_renames_only_the_kv_objects(self):
+
+def _linker_entry(name, components, packed=True):
+    return DevicePoolEntry(
+        name=name,
+        indices_from_pool=PoolName.KV,
+        device_pool=None,
+        components=[[torch.zeros(1, 1)]] * components,
+        layer_mapping={0: 0},
+        page_size=1,
+        rows_are_pages=True,
+        packed=packed,
+    )
+
+
+def _mamba_host(conv_states, temporal_elem_size):
+    pool = MambaPoolHost.__new__(MambaPoolHost)
+    pool.conv_buffer = [torch.zeros(1)] * conv_states
+    pool.temporal_state_elem_size = temporal_elem_size
+    return pool
+
+
+class TestObjectKeys(CustomTestCase):
+    """Pin every pool layout's object keys: a renamed key strands stored objects."""
+
+    def _keys(self, name, pool, rank_suffixes, *, mla_backend=False, overrides=None):
         store = UMBPStore.__new__(UMBPStore)
-        store.registered_pools = {
-            PoolName.KV: SimpleNamespace(components=[object()]),
-            PoolName.MAMBA: DevicePoolEntry.__new__(DevicePoolEntry),
-        }
-        store.mla_suffix = store.mha_suffix = "tp3_cp0_pp0"
-        store.is_mla_backend = True
-        store.config_prefix = ""
-        store.pool_suffix_overrides = {PoolName.KV: "tp0_cp0_pp0"}
+        store.registered_pools = {name: pool}
+        store.mla_suffix, store.mha_suffix = rank_suffixes
+        store.pool_suffix_overrides = overrides or {}
+        store.is_mla_backend = mla_backend
+        store.config_prefix = "m"
+        keys, per_page = store._get_hybrid_page_component_keys(
+            ["p"], SimpleNamespace(name=name)
+        )
+        self.assertEqual(per_page, len(keys))
+        return keys
 
-        def key(pool):
-            return store._get_hybrid_page_component_keys(
-                ["page"], SimpleNamespace(name=pool)
-            )[0][0]
+    def test_direct_linker_pools(self):
+        # The linker's suffix on rank 3, with the MLA KV declaring shard 0.
+        suffixes = ("tp3_cp0_pp0", "tp3_cp0_pp0")
+        overrides = {PoolName.KV: "tp0_cp0_pp0"}
+        for name, components, packed, expected in (
+            (PoolName.KV, 1, True, ["m_p_tp0_cp0_pp0_kv"]),
+            (PoolName.MAMBA, 3, True, ["m_p_tp3_cp0_pp0_temporal"]),
+            (PoolName.DRAFT, 2, True, ["m_p_tp3_cp0_pp0_draft"]),
+            (
+                PoolName.SWA,
+                2,
+                False,
+                ["m_p_tp3_cp0_pp0_swa_k", "m_p_tp3_cp0_pp0_swa_v"],
+            ),
+        ):
+            with self.subTest(pool=name):
+                entry = _linker_entry(name, components, packed)
+                keys = self._keys(name, entry, suffixes, overrides=overrides)
+                self.assertEqual(keys, expected)
+        with self.assertRaisesRegex(ValueError, "component count"):
+            self._keys(PoolName.SWA, _linker_entry(PoolName.SWA, 3), suffixes)
 
-        self.assertIn("_tp0_cp0_pp0_", key(PoolName.KV))
-        self.assertIn("_tp3_cp0_pp0_", key(PoolName.MAMBA))
+    def test_hicache_host_pools(self):
+        # HiCache's suffixes on TP rank 3 without PP: none for MLA, the rank for MHA.
+        mamba, conv_only = _mamba_host(2, 4), _mamba_host(1, 0)
+        kv, no_v = SimpleNamespace(v_buffer=torch.zeros(1)), SimpleNamespace()
+        for name, pool, mla_backend, expected in (
+            (
+                PoolName.MAMBA,
+                mamba,
+                False,
+                ["m_p_3_temporal", "m_p_3_conv_0", "m_p_3_conv_1"],
+            ),
+            (PoolName.MAMBA, conv_only, False, ["m_p_3_conv_0"]),
+            (PoolName.INDEXER, no_v, True, ["m_p__indexer"]),
+            (PoolName.SWA, kv, False, ["m_p_3_swa_k", "m_p_3_swa_v"]),
+            (PoolName.SWA, no_v, False, ["m_p_3_swa"]),
+        ):
+            with self.subTest(expected=expected):
+                keys = self._keys(name, pool, ("", "3"), mla_backend=mla_backend)
+                self.assertEqual(keys, expected)
 
 
 class TestSharedKeyWriteRace(CustomTestCase):

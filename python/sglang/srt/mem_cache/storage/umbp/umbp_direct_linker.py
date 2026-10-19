@@ -1033,7 +1033,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         """Pools whose objects every rank of the group writes under one key."""
         if self.pool_group.rank_replicated:
             return set(self.pools)
-        return set(getattr(self.storage, "pool_suffix_overrides", {}))
+        return set(self.storage.pool_suffix_overrides)
 
     def _put_plan(self, plan: _PoolRangePlan, *, log_failures: bool) -> list[str]:
         """Write one pool's objects; return the keys the store refused."""

@@ -380,6 +380,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         store.is_mla_backend = True
         store.mla_suffix = ""
         store.mha_suffix = "0"
+        store.pool_suffix_overrides = {}
         store.config_prefix = None
         store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C4)
         return store
