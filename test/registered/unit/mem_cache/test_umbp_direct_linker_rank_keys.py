@@ -96,19 +96,18 @@ class TestEveryRankWrites(CustomTestCase):
 
 
 class TestSharedKvKeys(CustomTestCase):
-    def test_only_a_kv_replicated_group_shares_the_kv_key(self):
-        for rank_replicated, kv_rank_replicated, expected in (
-            (False, True, {PoolName.KV: "cp0_pp0"}),
-            (False, False, {}),
-            (True, True, {}),
+    def test_a_pool_shard_replaces_the_rank_in_its_keys(self):
+        entries = [
+            SimpleNamespace(name=PoolName.KV, shard=1),
+            SimpleNamespace(name=PoolName.MAMBA, shard=None),
+        ]
+        for rank_replicated, expected in (
+            (False, {PoolName.KV: "tp1_cp0_pp0"}),
+            (True, {}),
         ):
-            group = SimpleNamespace(
-                rank_replicated=rank_replicated, kv_rank_replicated=kv_rank_replicated
-            )
+            group = SimpleNamespace(rank_replicated=rank_replicated, entries=entries)
             self.assertEqual(
-                _pool_suffix_overrides(
-                    pool_group=group, tp_rank=3, attn_cp_rank=0, pp_rank=0
-                ),
+                _pool_suffix_overrides(pool_group=group, attn_cp_rank=0, pp_rank=0),
                 expected,
             )
 
@@ -121,15 +120,15 @@ class TestSharedKvKeys(CustomTestCase):
         store.mla_suffix = store.mha_suffix = "tp3_cp0_pp0"
         store.is_mla_backend = True
         store.config_prefix = ""
-        store.pool_suffix_overrides = {PoolName.KV: "cp0_pp0"}
+        store.pool_suffix_overrides = {PoolName.KV: "tp0_cp0_pp0"}
 
         def key(pool):
             return store._get_hybrid_page_component_keys(
                 ["page"], SimpleNamespace(name=pool)
             )[0][0]
 
-        self.assertNotIn("tp3", key(PoolName.KV))
-        self.assertIn("tp3", key(PoolName.MAMBA))
+        self.assertIn("_tp0_cp0_pp0_", key(PoolName.KV))
+        self.assertIn("_tp3_cp0_pp0_", key(PoolName.MAMBA))
 
 
 class TestSharedKeyWriteRace(CustomTestCase):

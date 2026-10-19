@@ -66,19 +66,21 @@ def _storage_suffix(
 
 
 def _pool_suffix_overrides(
-    *, pool_group, tp_rank: int, attn_cp_rank: int, pp_rank: int
+    *, pool_group, attn_cp_rank: int, pp_rank: int
 ) -> dict[PoolName, str]:
-    # The MLA KV of a FULL + MAMBA group is identical on every attention TP rank,
-    # so one shared key per page stores it once.
-    if pool_group.rank_replicated or not pool_group.kv_rank_replicated:
+    # A pool's shard stands in for the rank: ranks holding the same objects share
+    # their keys, so the store keeps one copy.
+    if pool_group.rank_replicated:
         return {}
     return {
-        PoolName.KV: _storage_suffix(
-            rank_replicated=True,
-            tp_rank=tp_rank,
+        entry.name: _storage_suffix(
+            rank_replicated=False,
+            tp_rank=entry.shard,
             attn_cp_rank=attn_cp_rank,
             pp_rank=pp_rank,
         )
+        for entry in pool_group.entries
+        if entry.shard is not None
     }
 
 
@@ -372,7 +374,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.mha_suffix = rank_suffix
             self.storage.pool_suffix_overrides = _pool_suffix_overrides(
                 pool_group=self.pool_group,
-                tp_rank=tp_rank,
                 attn_cp_rank=params.attn_cp_rank,
                 pp_rank=params.pp_rank,
             )

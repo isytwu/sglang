@@ -498,21 +498,26 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self,
         *,
         dcp_size=1,
+        dcp_rank=0,
         page_size=2,
         kv_scale=None,
         unified_memory=False,
         draft=None,
+        full_pool_cls=None,
     ):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MLATokenToKVPool,
+        )
 
         # Kimi K3 shape: one MLA layer (1) between two KDA layers (0, 2).
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
         kvcache.start_layer = 0
         kvcache.full_attention_layer_id_mapping = {1: 0}
-        kvcache.full_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((18, 3), dtype=torch.uint8)],
-            kv_scale_buffer=kv_scale,
-        )
+        full_pool_cls = full_pool_cls or MLATokenToKVPool
+        kvcache.full_kv_pool = full_pool_cls.__new__(full_pool_cls)
+        kvcache.full_kv_pool.kv_buffer = [torch.zeros((18, 3), dtype=torch.uint8)]
+        kvcache.full_kv_pool.kv_scale_buffer = kv_scale
         mamba_cache = SimpleNamespace(
             conv=[torch.zeros((2, 6, 7), dtype=torch.uint8)],
             temporal=torch.zeros((2, 6, 5), dtype=torch.uint8),
@@ -528,7 +533,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             mtp_draft_device_pools=(draft,) if draft else (),
         )
         with (
-            get_parallel().override(attn_dcp_size=dcp_size),
+            get_parallel().override(attn_dcp_size=dcp_size, attn_dcp_rank=dcp_rank),
             patch(
                 "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_memory",
                 return_value=SimpleNamespace(enable_unified_memory=unified_memory),
@@ -545,20 +550,21 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         group = self._mamba_group()
         self.assertEqual(group.num_layers, 3)
         self.assertFalse(group.rank_replicated)
-        self.assertTrue(group.kv_rank_replicated)
-        kv = group.entry_map[PoolName.KV]
+        kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
+        # Every rank shares the MLA KV; the KDA state is per rank.
+        self.assertEqual((kv.shard, mamba.shard), (0, None))
         self.assertEqual(kv.prepare_locations(torch.arange(4, 6)), [4])
         self.assertIsNone(kv.get_prepared_layer_range_meta([4], 0))
         # One object per slot: every layer's temporal state, then its conv state.
-        mamba = group.entry_map[PoolName.MAMBA]
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
         _, sizes, offsets = mamba.get_prepared_layer_range_meta([3], 2)
         self.assertEqual((sizes, offsets), ([[5, 7]], [[5, 17]]))
 
     def test_mamba_collapses_only_the_kv_under_dcp(self):
-        group = self._mamba_group(dcp_size=2, page_size=4)
-        self.assertFalse(group.kv_rank_replicated)
+        group = self._mamba_group(dcp_size=2, dcp_rank=1, page_size=4)
         kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
+        # Ranks with the same DCP rank share the MLA KV.
+        self.assertEqual(kv.shard, 1)
         self.assertEqual(kv.prepare_locations(torch.arange(8, 12)), [4])
         self.assertEqual(mamba.prepare_locations(torch.tensor([5])), [5])
 
@@ -619,10 +625,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(target.mtp_draft_device_pools, (draft.token_to_kv_pool,))
 
     def test_mamba_rejects_unsupported_configs(self):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
+
         with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
             self._mamba_group(unified_memory=True)
         with self.assertRaisesRegex(ValueError, "scaled KV caches"):
             self._mamba_group(kv_scale=[torch.zeros((18, 1))])
+        for pool_cls in (MHATokenToKVPool, DSATokenToKVPool):
+            with self.assertRaisesRegex(ValueError, "only with an MLA KV cache"):
+                self._mamba_group(full_pool_cls=pool_cls)
 
     def test_dsa_rejects_dcp(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool

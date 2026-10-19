@@ -33,10 +33,14 @@ class DevicePoolEntry:
         packed: bool = True,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
         dcp_size: int = 1,
+        shard: int | None = None,
     ):
         self.name = name
         self.indices_from_pool = indices_from_pool
         self.device_pool = device_pool
+        # Ranks that declare the same shard hold identical objects; None means
+        # every rank holds its own.
+        self.shard = shard
         self.components = [list(component) for component in components]
         self.layer_mapping = layer_mapping
         self.page_size = page_size
@@ -177,7 +181,6 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
-        kv_rank_replicated: bool = False,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -187,8 +190,6 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
-        # FULL + MAMBA: the MLA KV is TP-replicated, the KDA state is not.
-        self.kv_rank_replicated = rank_replicated or kv_rank_replicated
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -561,9 +562,18 @@ def _build_mamba_device_pool_group(
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _stage_local_layer_mapping,
     )
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
 
     _reject_unsupported_mamba_configs(params.req_to_token_pool)
     full_kv_pool = kvcache.full_kv_pool
+    # A DSA pool also needs its indexer keys moved, which this group does not do.
+    if not isinstance(full_kv_pool, MLATokenToKVPool) or isinstance(
+        full_kv_pool, DSATokenToKVPool
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + Mamba only with an MLA "
+            f"KV cache, not {type(full_kv_pool).__name__}."
+        )
     if getattr(full_kv_pool, "kv_scale_buffer", None) is not None:
         raise ValueError(
             "The direct external linker does not support scaled KV caches yet."
@@ -585,6 +595,8 @@ def _build_mamba_device_pool_group(
             page_size=page_size,
             rows_are_pages=False,
             dcp_size=get_parallel().attn_dcp_size,
+            # The MLA KV is identical on every attention TP rank of a DCP rank.
+            shard=get_parallel().attn_dcp_rank,
         ),
         mamba_entry,
     ]
@@ -594,12 +606,8 @@ def _build_mamba_device_pool_group(
                 params.mtp_draft_device_pools, full_layer_mapping, page_size
             )
         )
-    # Only the MLA KV is replicated across attention TP ranks, and not under DCP.
     return DevicePoolGroup(
-        entries,
-        len(full_layer_mapping | mamba_entry.layer_mapping),
-        page_size,
-        kv_rank_replicated=get_parallel().attn_dcp_size == 1,
+        entries, len(full_layer_mapping | mamba_entry.layer_mapping), page_size
     )
 
 
