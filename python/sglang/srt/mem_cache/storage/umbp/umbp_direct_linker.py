@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -58,6 +59,10 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+def _buffer_indices(mapped: int | Sequence[int]) -> list[int]:
+    return [mapped] if isinstance(mapped, int) else list(mapped)
+
+
 def _ordered_layers(entry) -> list[int]:
     component_lengths = {len(component) for component in entry.components}
     if len(component_lengths) != 1:
@@ -67,8 +72,7 @@ def _ordered_layers(entry) -> list[int]:
     pool_layer_count = component_lengths.pop()
     by_buffer = {}
     for logical_layer, mapped in entry.layer_mapping.items():
-        indices = [mapped] if isinstance(mapped, int) else list(mapped)
-        for index in indices:
+        for index in _buffer_indices(mapped):
             if index in by_buffer:
                 raise ValueError(
                     f"UMBP pool {entry.name} maps buffer {index} more than once."
@@ -704,27 +708,34 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _range_items(self, plan: _PoolRangePlan, layers: list[int]):
         """(base_ptr, row_stride, size, offset) per emitted range, in wire order.
 
-        Grouped by layer, and within a layer by component. Every object emits
-        this same tuple sequence; the only thing that varies across objects is
-        the pointer, by ``row * row_stride``. That invariant is what the
-        vectorized builder rests on.
+        Grouped by buffer, and within a buffer by component. A layer mapped to
+        several buffers is emitted one position at a time across the layers:
+        every layer's first buffer, then every second one. The assemblers lay
+        out target layers before draft layers, and K before V, so each of those
+        runs stays contiguous in the object and the store can coalesce it.
+        Every object emits this same tuple sequence; the only thing that varies
+        across objects is the pointer, by ``row * row_stride``. That invariant
+        is what the vectorized builder rests on.
         """
         entry = self.pools[plan.name]
+        layer_buffers = [
+            _buffer_indices(entry.layer_mapping[layer])
+            for layer in layers
+            if layer in entry.layer_mapping
+        ]
         items: list[list[tuple[int, int, int, int]]] = []
-        for logical_layer in layers:
-            mapped = entry.layer_mapping.get(logical_layer)
-            if mapped is None:
-                continue
-            indices = [mapped] if isinstance(mapped, int) else list(mapped)
-            items.append(
-                [
-                    (*component[index], offsets[index])
-                    for component, offsets in zip(
-                        entry.buffer_meta, entry._component_offsets
+        for position in range(max(map(len, layer_buffers), default=0)):
+            for indices in layer_buffers:
+                if position < len(indices):
+                    index = indices[position]
+                    items.append(
+                        [
+                            (*component[index], offsets[index])
+                            for component, offsets in zip(
+                                entry.buffer_meta, entry._component_offsets
+                            )
+                        ]
                     )
-                    for index in indices
-                ]
-            )
         return items
 
     def _layer_group_ranges(self, plan: _PoolRangePlan, layers: list[int]):
@@ -761,8 +772,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
 
         if self.pools[plan.name].packed:
-            # One object per page, its ranges running (layer, component).
-            flat = [item for layer_items in items for item in layer_items]
+            # One object per page, its ranges running (buffer, component).
+            flat = [item for buffer_items in items for item in buffer_items]
             base = np.fromiter((item[0] for item in flat), np.int64, len(flat))
             stride = np.fromiter((item[1] for item in flat), np.int64, len(flat))
             ptrs = (rows[:, None] * stride[None, :] + base[None, :]).tolist()
@@ -772,17 +783,19 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             offsets = [item[3] for item in flat]
             return ptrs, [sizes] * len(rows), [offsets] * len(rows)
 
-        # One object per (page, component), its ranges running over the layers.
+        # One object per (page, component), its ranges running over the buffers.
         components = len(items[0])
-        base = np.array([[i[0] for i in layer] for layer in items], np.int64).T
-        stride = np.array([[i[1] for i in layer] for layer in items], np.int64).T
+        base = np.array([[i[0] for i in buffer] for buffer in items], np.int64).T
+        stride = np.array([[i[1] for i in buffer] for buffer in items], np.int64).T
         ptrs = (
             (rows[:, None, None] * stride[None, :, :] + base[None, :, :])
             .reshape(len(rows) * components, -1)
             .tolist()
         )
-        sizes = [[layer[index][2] for layer in items] for index in range(components)]
-        offsets = [[layer[index][3] for layer in items] for index in range(components)]
+        sizes = [[buffer[index][2] for buffer in items] for index in range(components)]
+        offsets = [
+            [buffer[index][3] for buffer in items] for index in range(components)
+        ]
         return ptrs, sizes * len(rows), offsets * len(rows)
 
     @staticmethod

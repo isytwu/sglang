@@ -80,23 +80,61 @@ class TestPackedDraftRanges(CustomTestCase):
                 [[0, 8]],
             ),
         )
+        # The draft buffer follows the group's target buffers, as in the object.
         self.assertEqual(
             linker._layer_group_ranges(plan, [3, 5]),
             (
                 [
                     [
                         buffers[0][1].data_ptr(),
-                        buffers[2][1].data_ptr(),
                         buffers[1][1].data_ptr(),
+                        buffers[2][1].data_ptr(),
                     ]
                 ],
-                [[3, 7, 5]],
-                [[0, 8, 3]],
+                [[3, 5, 7]],
+                [[0, 3, 8]],
             ),
         )
         entry.layer_mapping = {3: (0, 1), 5: 1}
         with self.assertRaisesRegex(ValueError, "maps buffer 1 more than once"):
             _ordered_layers(entry)
+
+    def test_write_ranges_tile_every_object_in_order(self):
+        """The store takes a put only if its ranges tile the object exactly."""
+        k = [torch.zeros((4, 3), dtype=torch.uint8) for _ in range(3)]
+        v = [torch.zeros((4, 5), dtype=torch.uint8) for _ in range(3)]
+        for components, layer_mapping, packed in (
+            # As _mha_device_pool_entry builds it: one packed component [*k, *v].
+            ([[*k[:2], *v[:2]]], {0: (0, 2), 1: (1, 3)}, True),
+            # One object per component, with a draft packed onto layer 0.
+            ([k, v], {0: (0, 2), 1: 1}, False),
+        ):
+            entry = DevicePoolEntry(
+                name=PoolName.DRAFT,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=components,
+                layer_mapping=layer_mapping,
+                page_size=2,
+                rows_are_pages=False,
+                packed=packed,
+            )
+            linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+            linker.pools = {entry.name: entry}
+            linker.pool_layers = {entry.name: _ordered_layers(entry)}
+            per_page = 1 if packed else len(components)
+            plan = _PoolRangePlan(entry.name, ["key"] * 2 * per_page, [0, 2], per_page)
+            ptrs, sizes, offsets = linker._all_layer_ranges(plan)
+            object_sizes = umbp_direct_linker._object_sizes_per_page(entry)
+            with self.subTest(packed=packed):
+                self.assertEqual(len(ptrs), 2 * per_page)
+                # The first object walks its component's buffers in object order.
+                self.assertEqual(
+                    ptrs[0], [buffer[0].data_ptr() for buffer in components[0]]
+                )
+                for index, (size, offset) in enumerate(zip(sizes, offsets)):
+                    self.assertEqual(offset, [sum(size[:i]) for i in range(len(size))])
+                    self.assertEqual(sum(size), object_sizes[index % per_page])
 
 
 class TestEveryRankWrites(CustomTestCase):
