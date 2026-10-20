@@ -1,5 +1,6 @@
 """Unit tests for the UMBP direct linker's rank-replicated key handling."""
 
+import ctypes
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -8,14 +9,18 @@ from unittest import mock
 import torch
 
 import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    _build_dsa_device_pool_group,
+)
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _ordered_layers,
     _PoolRangePlan,
     _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -135,6 +140,118 @@ class TestPackedDraftRanges(CustomTestCase):
                 for index, (size, offset) in enumerate(zip(sizes, offsets)):
                     self.assertEqual(offset, [sum(size[:i]) for i in range(len(size))])
                     self.assertEqual(sum(size), object_sizes[index % per_page])
+
+
+class _RangedStore:
+    """In-memory UMBP client. Like mori, a put has to tile its object exactly."""
+
+    def __init__(self):
+        self.objects: dict[str, bytearray] = {}
+
+    def batch_put_ranges_from_ptr(self, keys, object_sizes, ptrs, sizes, offsets):
+        results = []
+        for key, object_size, range_ptrs, range_sizes, range_offsets in zip(
+            keys, object_sizes, ptrs, sizes, offsets
+        ):
+            cursor = 0
+            for offset, length in sorted(zip(range_offsets, range_sizes)):
+                if offset != cursor:
+                    break
+                cursor += length
+            results.append(cursor == object_size)
+            if cursor != object_size:
+                continue
+            data = self.objects.setdefault(key, bytearray(object_size))
+            for ptr, length, offset in zip(range_ptrs, range_sizes, range_offsets):
+                view = (ctypes.c_char * length).from_buffer(data, offset)
+                ctypes.memmove(view, ptr, length)
+        return results
+
+    def batch_get_ranges_into_ptr(self, keys, ptrs, sizes, offsets):
+        results = []
+        for key, range_ptrs, range_sizes, range_offsets in zip(
+            keys, ptrs, sizes, offsets
+        ):
+            data = self.objects.get(key)
+            results.append(data is not None)
+            if data is None:
+                continue
+            for ptr, length, offset in zip(range_ptrs, range_sizes, range_offsets):
+                view = (ctypes.c_char * length).from_buffer(data, offset)
+                ctypes.memmove(ptr, view, length)
+        return results
+
+    def batch_exists(self, keys):
+        return [key in self.objects for key in keys]
+
+
+class TestPackedLayerRoundTrip(CustomTestCase):
+    """Offload, look up and load packed layers through the linker's own paths."""
+
+    def _round_trip(self, group, pages):
+        storage = UMBPStore.__new__(UMBPStore)
+        storage.client = _RangedStore()
+        storage.registered_pools = group.entry_map
+        storage.mla_suffix = storage.mha_suffix = "tp0_cp0_pp0"
+        storage.is_mla_backend = True
+        storage.config_prefix = None
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker.storage = storage
+        linker.pool_group = group
+        linker.pools = group.entry_map
+        linker.num_layers = group.num_layers
+        linker.pool_layers = {
+            name: _ordered_layers(entry) for name, entry in group.entry_map.items()
+        }
+        linker.layer_group = 2
+        linker.layer_done_counter = mock.Mock()
+        linker._stats = {"lookup": 0, "load": 0, "offload": 0, "offload_batches": 0}
+        linker._pending = {}
+        linker._async_offload_index_snapshot = False
+
+        tokens = torch.arange(pages * group.page_size)
+        keys = [f"page{i}" for i in range(pages)]
+        transfers = [PoolTransfer(name=PoolName.KV, keys=keys, device_indices=tokens)]
+        ready = SimpleNamespace(synchronize=lambda: None)
+        expanded = group.resolve_transfers(transfers, allow_partial=True)
+        self.assertTrue(linker._run_offload([(expanded, ready)]))
+        self.assertEqual(linker.lookup("rid", transfers), list(range(1, pages + 1)))
+
+        buffers = [
+            buffer
+            for entry in group.entries
+            for component in entry.components
+            for buffer in component
+        ]
+        stored = [buffer.clone() for buffer in buffers]
+        for buffer in buffers:
+            buffer.zero_()
+        self.assertTrue(linker.load("rid", transfers))
+        plans = linker._build_load_plans(list(linker._pending.values()))
+        linker._run_layer_wise_batch(0, plans, ready)
+        linker.layer_done_counter.fail.assert_not_called()
+        for buffer, want in zip(buffers, stored):
+            self.assertTrue(torch.equal(buffer, want))
+
+    def test_dsa_target_and_mtp_draft(self):
+        page_size, layers, pages = 2, 3, 4
+
+        def pool(layer_count, rows, width):
+            return [
+                torch.randint(0, 256, (rows, width), dtype=torch.uint8)
+                for _ in range(layer_count)
+            ]
+
+        def kvcache(layer_count):
+            return SimpleNamespace(
+                page_size=page_size,
+                layer_num=layers,
+                kv_buffer=pool(layer_count, pages * page_size, 6),
+                index_k_with_scale_buffer=pool(layer_count, pages, 5),
+            )
+
+        group = _build_dsa_device_pool_group(kvcache(layers), page_size, (kvcache(1),))
+        self._round_trip(group, pages)
 
 
 class TestEveryRankWrites(CustomTestCase):
