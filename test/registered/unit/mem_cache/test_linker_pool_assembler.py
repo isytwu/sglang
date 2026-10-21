@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _dcp_row_mapper,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -99,6 +100,31 @@ class TestDevicePoolEntry(CustomTestCase):
             with self.subTest(indices=indices.tolist()):
                 with self.assertRaisesRegex(ValueError, error):
                     pool.prepare_locations(indices)
+
+    def test_dcp_rows_come_only_from_whole_widened_pages(self):
+        # At physical page 1 the entry's own alignment check cannot see these.
+        for page_size, dcp_size in ((1, 8), (2, 4)):
+            span = page_size * dcp_size
+            pages = torch.tensor([1, 3])
+            slots = (pages[:, None] * span + torch.arange(span)).flatten()
+            for dcp_rank in range(dcp_size):
+                pool = DevicePoolEntry(
+                    name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[[torch.zeros((4 * page_size, 3), dtype=torch.uint8)]],
+                    layer_mapping={0: 0},
+                    page_size=page_size,
+                    rows_are_pages=False,
+                    index_mapper=_dcp_row_mapper(page_size, dcp_size, dcp_rank),
+                )
+                self.assertEqual(
+                    pool.prepare_locations(pool.translate_indices(slots)),
+                    (pages * page_size).tolist(),
+                )
+                for bad in (slots + 1, slots + page_size, slots[:-1], slots.flip(0)):
+                    with self.assertRaises(ValueError):
+                        pool.prepare_locations(pool.translate_indices(bad))
 
 
 class TestDevicePoolGroup(CustomTestCase):
@@ -743,6 +769,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.start_layer = 0
         kvcache.full_attention_layer_id_mapping = {1: 0, 3: 1}
         kvcache.full_kv_pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        kvcache.full_kv_pool.page_size = 2
         kvcache.full_kv_pool.kv_buffer = [
             torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
         ]
@@ -767,7 +794,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             ),
         )
 
-        def resolve(dcp_size=1):
+        def resolve(dcp_size=1, dcp_rank=0):
             with (
                 patch.object(
                     linker_pool_assembler,
@@ -777,7 +804,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 patch.object(
                     linker_pool_assembler,
                     "get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                    return_value=SimpleNamespace(
+                        attn_dcp_size=dcp_size, attn_dcp_rank=dcp_rank
+                    ),
                 ),
             ):
                 return resolve_hybrid_device_pool_group(
@@ -790,6 +819,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         group = resolve()
         self.assertEqual(group.num_layers, 4)
         self.assertFalse(group.rank_replicated)
+        self.assertEqual((group.dcp_rank, group.dcp_size), (0, 1))
         kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
         self.assertEqual(kv.layer_mapping, {1: 0, 3: 1})
         self.assertEqual(mamba.layer_mapping, {0: 0, 2: 1})
@@ -798,8 +828,21 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
         self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
 
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
+        # Under DCP the tree page spans one physical KV page per DCP rank, while
+        # the replicated draft pages the widened slots as they are.
+        with self.assertRaisesRegex(ValueError, "must match the tree page size"):
             resolve(dcp_size=2)
+        kvcache.full_kv_pool.page_size = 1
+        group = resolve(dcp_size=2, dcp_rank=1)
+        self.assertEqual((group.dcp_rank, group.dcp_size), (1, 2))
+        kv, draft = group.entry_map[PoolName.KV], group.entry_map[PoolName.DRAFT]
+        self.assertEqual(kv.page_size, 1)
+        self.assertEqual(
+            kv.prepare_locations(kv.translate_indices(torch.tensor([2, 3]))), [1]
+        )
+        self.assertEqual(
+            draft.prepare_locations(draft.translate_indices(torch.tensor([2, 3]))), [2]
+        )
         params.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()

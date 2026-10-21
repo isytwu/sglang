@@ -45,7 +45,13 @@ RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
 
 def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    dcp_rank: int = 0,
+    dcp_size: int = 1,
 ) -> str:
     # A rank-replicated group (MLA / DSA) holds byte-identical pages on every
     # attention TP rank, so a tp term stores tp_size copies of the same page.
@@ -54,6 +60,10 @@ def _storage_suffix(
     parts = []
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
+    if dcp_size > 1:
+        # A DCP rank holds every dcp_size-th token of a page, so what an object
+        # holds depends on both its rank and the DCP size.
+        parts.append(f"dcp{dcp_rank}of{dcp_size}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
 
@@ -329,6 +339,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 tp_rank=tp_rank,
                 attn_cp_rank=params.attn_cp_rank,
                 pp_rank=params.pp_rank,
+                dcp_rank=self.pool_group.dcp_rank,
+                dcp_size=self.pool_group.dcp_size,
             )
             self.storage.mla_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
