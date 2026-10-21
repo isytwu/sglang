@@ -418,6 +418,11 @@ def _build_dsa_device_pool_group(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
+    if getattr(kvcache, "layer_shard_size", 1) > 1:
+        raise ValueError(
+            "The direct external linker does not support DSA cache layer split: "
+            "each CP rank holds only its own layers."
+        )
     num_layers = kvcache.layer_num
     if any(pool.page_size != page_size for pool in mtp_draft_device_pools):
         raise ValueError("DSA MTP page size must match the tree page size.")

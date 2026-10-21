@@ -48,14 +48,13 @@ def _storage_suffix(
     *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
 ) -> str:
     # A rank-replicated group (MLA / DSA) holds byte-identical pages on every
-    # attention TP rank, so a tp term stores tp_size copies of the same page.
+    # attention TP rank, and prefill CP gathers the whole sequence into every
+    # CP rank's pool, so a tp or cp term stores copies of the same page.
     # Only the key collapses -- every rank still writes, because a Local-mode
     # tier is private to its rank and a standalone server is per node.
-    parts = []
-    if not rank_replicated:
-        parts.append(f"tp{tp_rank}")
-    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
-    return "_".join(parts)
+    if rank_replicated:
+        return f"pp{pp_rank}"
+    return f"tp{tp_rank}_cp{attn_cp_rank}_pp{pp_rank}"
 
 
 def _ordered_layers(entry) -> list[int]:

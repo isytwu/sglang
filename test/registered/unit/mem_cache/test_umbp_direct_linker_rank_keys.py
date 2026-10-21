@@ -23,16 +23,18 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestStorageSuffix(CustomTestCase):
-    def test_replicated_group_drops_the_tp_term(self):
-        # MLA/DSA pages are byte-identical on every attention TP rank, so every
-        # rank has to name the same object or the store holds tp_size copies.
+    def test_replicated_group_drops_the_tp_and_cp_terms(self):
+        # MLA/DSA pages are byte-identical on every attention TP rank, and
+        # prefill CP gathers the whole sequence into every CP rank's pool, so
+        # every rank has to name the same object or the store holds copies.
         suffixes = {
             _storage_suffix(
-                rank_replicated=True, tp_rank=rank, attn_cp_rank=0, pp_rank=0
+                rank_replicated=True, tp_rank=rank, attn_cp_rank=cp, pp_rank=0
             )
-            for rank in range(8)
+            for rank in range(4)
+            for cp in range(2)
         }
-        self.assertEqual(suffixes, {"cp0_pp0"})
+        self.assertEqual(suffixes, {"pp0"})
 
     def test_sharded_group_keeps_one_keyspace_per_rank(self):
         suffixes = [
@@ -44,15 +46,15 @@ class TestStorageSuffix(CustomTestCase):
         self.assertEqual(len(set(suffixes)), 8)
         self.assertEqual(suffixes[3], "tp3_cp0_pp0")
 
-    def test_cp_and_pp_shard_even_when_replicated(self):
-        # CP shards the sequence and PP shards layers, so neither may collapse.
+    def test_pp_shards_even_when_replicated(self):
+        # PP shards layers, so it never collapses.
         self.assertEqual(
             _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=2),
-            "cp1_pp2",
+            "pp2",
         )
         self.assertNotEqual(
             _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_rank=0),
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=0),
+            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_rank=1),
         )
 
 

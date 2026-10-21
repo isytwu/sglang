@@ -681,6 +681,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
+        kvcache.layer_shard_size = 2
+        with self.assertRaisesRegex(ValueError, "layer split"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(mtp_draft_device_pools=()),
+                components={ComponentType.FULL},
+            )
+
     def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

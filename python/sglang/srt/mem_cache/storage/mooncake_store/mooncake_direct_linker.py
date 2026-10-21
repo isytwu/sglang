@@ -40,11 +40,11 @@ device_module = get_device_module()
 def _storage_suffix(
     *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
 ) -> str:
-    parts = []
-    if not rank_replicated:
-        parts.append(f"tp{tp_rank}")
-    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
-    return "_".join(parts)
+    # Prefill CP gathers the whole sequence into every CP rank's pool, so a
+    # rank-replicated group holds the same pages on every TP and CP rank.
+    if rank_replicated:
+        return f"pp{pp_rank}"
+    return f"tp{tp_rank}_cp{attn_cp_rank}_pp{pp_rank}"
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -76,7 +76,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
-        self.offload_owner = not rank_replicated or tp_rank == 0
+        self.offload_owner = not rank_replicated or (
+            tp_rank == 0 and params.attn_cp_rank == 0
+        )
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
