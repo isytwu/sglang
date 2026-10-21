@@ -8,7 +8,7 @@ from unittest import mock
 import torch
 
 import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     _PoolRangePlan,
     _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -97,6 +98,77 @@ class TestPackedDraftRanges(CustomTestCase):
         entry.layer_mapping = {3: (0, 1), 5: 1}
         with self.assertRaisesRegex(ValueError, "maps buffer 1 more than once"):
             _ordered_layers(entry)
+
+
+class TestTouch(CustomTestCase):
+    def _linker(self, batch_touch):
+        pools = {
+            name: SimpleNamespace(packed=True, components=[[]])
+            for name in (PoolName.KV, PoolName.MAMBA)
+        }
+        storage = UMBPStore.__new__(UMBPStore)
+        storage.registered_pools = pools
+        storage.mla_suffix = storage.mha_suffix = "tp0_cp0_pp0"
+        storage.config_prefix = None
+        storage.client = SimpleNamespace(batch_touch=batch_touch)
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker.storage = storage
+        linker.pools = pools
+        linker.num_layers = 1
+        linker.pool_group = SimpleNamespace(
+            resolve_transfers=lambda transfers, allow_partial: transfers
+        )
+        linker._stats = dict.fromkeys(
+            ("touch_keys", "touched", "touch_failures", "touch_dropped"), 0
+        )
+        linker._touch_queue = Queue()
+        return linker
+
+    @staticmethod
+    def _touch(pages):
+        return [
+            PoolTransfer(name=PoolName.KV, keys=pages),
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=pages[-1:],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+        ]
+
+    def test_queued_touches_go_out_once_tail_first(self):
+        sent = []
+        linker = self._linker(lambda keys: sent.append(list(keys)) or len(keys))
+        # Queued behind a slow RPC: coalesced, and the shared head goes last.
+        linker.touch(self._touch(["p0", "p1"]))
+        linker.touch(self._touch(["p0", "p1", "p2"]))
+        linker._touch_queue.put(None)
+        linker._touch_thread_func()
+
+        self.assertEqual(
+            sent,
+            [
+                [
+                    "p1_tp0_cp0_pp0_temporal",
+                    "p2_tp0_cp0_pp0_kv",
+                    "p1_tp0_cp0_pp0_kv",
+                    "p0_tp0_cp0_pp0_kv",
+                    "p2_tp0_cp0_pp0_temporal",
+                ]
+            ],
+        )
+        self.assertEqual(linker._stats["touched"], 5)
+        self.assertEqual(linker._touch_queue.unfinished_tasks, 0)
+
+    def test_a_failing_store_is_counted_not_fatal(self):
+        def batch_touch(keys):
+            raise RuntimeError("store down")
+
+        linker = self._linker(batch_touch)
+        linker.touch(self._touch(["p0"]))
+        linker._touch_queue.put(None)
+        linker._touch_thread_func()
+        self.assertEqual(linker._stats["touch_failures"], 1)
+        self.assertEqual(linker._touch_queue.unfinished_tasks, 0)
 
 
 class TestEveryRankWrites(CustomTestCase):

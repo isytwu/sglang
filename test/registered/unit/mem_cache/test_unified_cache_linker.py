@@ -445,6 +445,43 @@ class TestUnifiedCacheLinkerPythonBackend(
         consumer.check_hicache_events()
         consumer.sanity_check()
 
+    def test_device_hits_touch_the_served_pages_once_per_interval(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        linker.touch_interval_s = 3600.0
+        touches = []
+        linker.touch = touches.append
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 9))
+        self._insert(cache, allocator, req_pool, tokens[:4])
+        self._insert(cache, allocator, req_pool, tokens)
+        (parent,), (child,) = linker.offload_calls
+
+        def match(ids):
+            key = RadixKey(array("q", ids))
+            req = self._make_req(req_pool)
+            return cache.match_prefix(MatchPrefixParams(key=key, req=req))
+
+        # From the sequence head to the device boundary, once per node.
+        match(tokens)
+        match(tokens + [99, 100])
+        self.assertEqual(len(touches), 1)
+        (kv,) = touches[0]
+        self.assertEqual(kv.name, PoolName.KV)
+        self.assertEqual(kv.keys, parent.keys + child.keys)
+        match(tokens[:4])
+        self.assertEqual([t[0].keys for t in touches[1:]], [parent.keys])
+
+        # A failing store stops touching on this rank; the match is unaffected.
+        cache.linker.reset()
+        linker.touch = MagicMock(side_effect=RuntimeError("store down"))
+        self.assertEqual(match(tokens).device_prefix_len, len(tokens))
+        linker.touch.assert_called_once()
+        match(tokens[:4])
+        linker.touch.assert_called_once()
+
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(
             page_size=2,

@@ -23,7 +23,9 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -53,6 +55,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+
+_TOUCH_TRACKED_NODES = 65536
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
@@ -133,6 +137,20 @@ class UnifiedCacheLinker(ABC):
 
     layer_done_counter: object
     pools: dict[PoolName, object]
+    # Seconds between touches of one device node; None never calls touch().
+    touch_interval_s: Optional[float] = None
+
+    def touch(self, transfers: list[PoolTransfer]) -> None:
+        """Best-effort hint that these pages were just served from the device
+        cache, for a store whose eviction cannot see device hits.
+
+        LOOKUP-phase transfers, one per linked component. Their keys start at
+        the sequence head (not at the first uncached page, as for lookup) and
+        end at the device boundary; each transfer's own keys name the pages it
+        holds (TRAILING_PAGES: the window ending at the boundary). Called
+        inside the rank-lockstep match, so it must not block, raise, or
+        communicate across ranks.
+        """
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -245,6 +263,9 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        self._touch_interval_s = cache_linker.touch_interval_s
+        # Device node -> the touch interval bucket it was last touched in.
+        self._touched: OrderedDict[NodeId, int] = OrderedDict()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -263,6 +284,8 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if device_hit_len >= page and self._touch_interval_s is not None:
+            self._touch(result.last_device_node, device_hit_len // page)
         if device_hit_len >= len(key):
             return result
 
@@ -311,6 +334,40 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _touch(self, node_id: NodeId, pages: int) -> None:
+        """Touch the pages up to ``node_id``, once per node and interval.
+
+        Decided from what every rank shares (the node and the wall-clock
+        interval), so the ranks of a group touch the same pages.
+        """
+        try:
+            bucket = int(time.time() // self._touch_interval_s)
+            if self._touched.get(node_id) == bucket:
+                return
+            self._touched[node_id] = bucket
+            self._touched.move_to_end(node_id)
+            if len(self._touched) > _TOUCH_TRACKED_NODES:
+                self._touched.popitem(last=False)
+            tree_core = self.cache.tree_core
+            hashes = tree_core.get_prefix_hash_values(
+                node_id
+            ) + tree_core.get_hash_values(node_id)
+            if len(hashes) != pages:
+                return
+            transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes
+                )
+                if transfer is None:
+                    return
+                transfers.append(transfer)
+            self.cache_linker.touch(transfers)
+        except Exception:
+            # A hint must never break the rank-lockstep match it runs in.
+            logger.exception("External cache touch failed; touches stop on this rank.")
+            self._touch_interval_s = None
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -561,6 +618,7 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self._touched.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()

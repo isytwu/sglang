@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any, Callable
 
 import numpy as np
@@ -42,6 +43,10 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+# Pending touches beyond this are dropped: the store has stopped answering.
+_TOUCH_QUEUE_LIMIT = 1024
+# Warn once when this many touched keys found nothing stored.
+_TOUCH_WARN_KEYS = 4096
 
 
 def _storage_suffix(
@@ -161,6 +166,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._offload_coalesce_pages = max(
             1, int(os.getenv("UMBP_OFFLOAD_COALESCE_PAGES", "1024"))
         )
+        # Seconds between touches of one device-hit prefix; 0 turns them off.
+        touch_interval_s = float(os.getenv("UMBP_TOUCH_INTERVAL_S", "30"))
+        if not math.isfinite(touch_interval_s) or touch_interval_s < 0:
+            raise ValueError(
+                f"UMBP_TOUCH_INTERVAL_S must be finite and >= 0, got {touch_interval_s}."
+            )
         if _config_bool(os.getenv("UMBP_LOAD_SPLIT") or "0", "UMBP_LOAD_SPLIT"):
             raise ValueError(
                 "UMBP_LOAD_SPLIT is not supported by the dedup-after-insert "
@@ -310,6 +321,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     "(both scratch arenas must be non-zero), and note that a "
                     "read-only SharedSSDFollower is whole-object by design."
                 )
+            # The DRAM tier evicts by last write or read, and device hits read
+            # nothing, so the prefixes hottest on the device look oldest here.
+            if touch_interval_s > 0 and callable(getattr(client, "batch_touch", None)):
+                self.touch_interval_s = touch_interval_s
             get_backend_mode = getattr(client, "get_backend_mode", None)
             self.backend_mode = (
                 get_backend_mode() if callable(get_backend_mode) else None
@@ -339,11 +354,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # it could not have shown an embedded run for what it was.
             logger.info(
                 "UMBPDirectLinker topology=%s+%s ranged_io=yes "
-                "rank_replicated=%s suffix=%s",
+                "rank_replicated=%s suffix=%s touch_interval_s=%s",
                 mode.name,
                 self.backend_mode.name if self.backend_mode is not None else None,
                 rank_replicated,
                 rank_suffix,
+                self.touch_interval_s,
             )
         except BaseException:
             self.storage.close()
@@ -367,7 +383,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
+            # touched / touch_keys is how many touched objects were stored.
+            "touch_keys": 0,
+            "touched": 0,
+            "touch_failures": 0,
+            "touch_dropped": 0,
         }
+        self._touch_queue: Queue[list[PoolTransfer] | None] = Queue(
+            maxsize=_TOUCH_QUEUE_LIMIT
+        )
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -378,9 +402,16 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             daemon=True,
             name=f"umbp-offload-tp{tp_rank}",
         )
+        self._touch_thread = threading.Thread(
+            target=self._touch_thread_func,
+            daemon=True,
+            name=f"umbp-touch-tp{tp_rank}",
+        )
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
+        if self.touch_interval_s is not None:
+            self._touch_thread.start()
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -991,8 +1022,75 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self._offload_results.get_nowait()
 
+    def touch(self, transfers: list[PoolTransfer]) -> None:
+        try:
+            self._touch_queue.put_nowait(transfers)
+        except Full:
+            # Only a store that stopped answering backs up this far.
+            self._stats["touch_dropped"] += 1
+
+    def _touch_thread_func(self) -> None:
+        while True:
+            batch = [self._touch_queue.get()]
+            # Coalesce what queued up meanwhile instead of dropping it, so a
+            # rank with slower RPCs still touches the same keys as the others.
+            while True:
+                try:
+                    batch.append(self._touch_queue.get_nowait())
+                except Empty:
+                    break
+            try:
+                self._send_touches([item for item in batch if item is not None])
+            except Exception:
+                self._stats["touch_failures"] += 1
+                failures = self._stats["touch_failures"]
+                if failures == 1 or failures % 1000 == 0:
+                    logger.warning(
+                        "UMBP touch failed (%d so far)", failures, exc_info=True
+                    )
+            finally:
+                for _ in batch:
+                    self._touch_queue.task_done()
+            if None in batch:
+                return
+
+    def _send_touches(self, touches: list[list[PoolTransfer]]) -> None:
+        keys = []
+        for transfers in touches:
+            for transfer in self.pool_group.resolve_transfers(
+                transfers, allow_partial=True
+            ):
+                object_keys, _ = self._object_keys_for_pages(
+                    list(transfer.keys), transfer
+                )
+                # Tail first within each pool: the store moves keys to its
+                # recent end in order, so a prefix head is its pool's last to go.
+                keys.extend(reversed(object_keys))
+        # Keep each key's last place, so a head shared by several touches
+        # lands after their tails.
+        keys = list(dict.fromkeys(reversed(keys)))[::-1]
+        per_call = CHUNK_PAGES * self.num_layers
+        for start in range(0, len(keys), per_call):
+            self._stats["touched"] += self.storage.client.batch_touch(
+                keys[start : start + per_call]
+            )
+        sent = self._stats["touch_keys"]
+        self._stats["touch_keys"] += len(keys)
+        if self._stats["touched"] == 0 and sent < _TOUCH_WARN_KEYS <= sent + len(keys):
+            logger.warning(
+                "UMBP holds none of the %d keys touched so far; the server may "
+                "not support BatchTouch.",
+                self._stats["touch_keys"],
+            )
+
     def reset(self) -> None:
         self._pending.clear()
+        while True:
+            try:
+                self._touch_queue.get_nowait()
+            except Empty:
+                break
+            self._touch_queue.task_done()
         self._load_queue.join()
         self._offload_queue.join()
         while True:
@@ -1007,6 +1105,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return
         self.reset()
         for thread, queue in (
+            (self._touch_thread, self._touch_queue),
             (self._offload_thread, self._offload_queue),
             (self._load_thread, self._load_queue),
         ):
