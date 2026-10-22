@@ -2300,6 +2300,25 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_linker_mamba_offload_requires_the_linker(self):
+        for mode, linker in (
+            ("all", False),
+            ("prompt_end", True),
+            ("prompt_end", False),
+        ):
+            with self.subTest(mode=mode, linker=linker):
+                args = self._make_args(
+                    linker_mamba_offload=mode,
+                    enable_unified_cache_external_linker=linker,
+                )
+                if mode != "all" and not linker:
+                    with self.assertRaisesRegex(
+                        ValueError, "requires --enable-unified-cache-external-linker"
+                    ):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the

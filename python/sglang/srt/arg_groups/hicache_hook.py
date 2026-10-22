@@ -28,6 +28,13 @@ def handle_hicache(server_args: Any):
         or cfg.unified_cache_external_linker_backend != "mooncake"
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
+    if (
+        cfg.linker_mamba_offload != "all"
+        and not cfg.enable_unified_cache_external_linker
+    ):
+        raise ValueError(
+            "--linker-mamba-offload requires --enable-unified-cache-external-linker."
+        )
     if cfg.enable_unified_cache_external_linker:
         if cfg.enable_hierarchical_cache:
             raise ValueError(

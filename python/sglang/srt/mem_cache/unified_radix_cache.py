@@ -649,7 +649,14 @@ class UnifiedRadixCache(BasePrefixCache):
         try:
             step = self.tree_core.begin_insert(params)
             while True:
-                self._apply_cache_actions(step.actions)
+                # Only the last step backs up the insert's own new leaf; the
+                # walk's backups are of nodes earlier inserts left unstored.
+                self._apply_cache_actions(
+                    step.actions,
+                    skip_target_mamba_offload=(
+                        params.skip_mamba_offload and step.result is not None
+                    ),
+                )
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
@@ -1148,6 +1155,12 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            skip_mamba_offload=(
+                self.linker is not None
+                and self.linker.skips_mamba_offload(
+                    req, up_to=up_to, is_finished=is_finished
+                )
+            ),
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1334,17 +1347,27 @@ class UnifiedRadixCache(BasePrefixCache):
     # ---- Internal Helpers ----
 
     def _apply_cache_actions(
-        self, actions: list[CacheAction | ComponentAction]
+        self,
+        actions: list[CacheAction | ComponentAction],
+        *,
+        skip_target_mamba_offload: bool = False,
     ) -> None:
         # Apply and consume one at a time: a spent list cannot be double-applied.
         actions.reverse()
         try:
             while actions:
-                self._apply_cache_action(actions.pop())
+                self._apply_cache_action(
+                    actions.pop(), skip_target_mamba_offload=skip_target_mamba_offload
+                )
         finally:
             actions.reverse()
 
-    def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
+    def _apply_cache_action(
+        self,
+        action: CacheAction | ComponentAction,
+        *,
+        skip_target_mamba_offload: bool = False,
+    ) -> None:
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):
@@ -1370,7 +1393,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
-                self.linker.offload_nodes(action.node_ids)
+                self.linker.offload_nodes(
+                    action.node_ids, skip_target_mamba=skip_target_mamba_offload
+                )
             else:
                 self._execute_and_commit_kv_backup(action)
         else:

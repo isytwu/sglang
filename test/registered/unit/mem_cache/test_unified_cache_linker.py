@@ -5,7 +5,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -13,6 +13,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
@@ -40,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_memory
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -830,6 +832,77 @@ class TestUnifiedCacheLinkerPythonBackend(
         self.assertEqual(consumer.finish_external_linker_loads([req]), [])
         consumer.sanity_check()
 
+    def test_prompt_end_writes_a_prefill_chunk_without_its_state(self):
+        # A 14-token prompt on a 4-token checkpoint grid, prefilled in chunks
+        # ending at 4, 8 and 12; the last 2 tokens donate no state. Under
+        # prompt_end the chunks at 4 and 8 reach the store without their
+        # states, which their writes leave evictable; the chunk at 12 keeps its
+        # state, as no later extend of the prompt donates one.
+        prompt = list(range(1, 15))
+        kv, with_state = {PoolName.KV}, {PoolName.KV, PoolName.MAMBA}
+        skip = (ComponentType.MAMBA,)
+        for mode, pools, skips, evictable, hit_at_8 in (
+            ("all", [with_state] * 3, [(), (), ()], 0, 8),
+            ("prompt_end", [kv, kv, with_state], [skip, skip, ()], 2, 0),
+        ):
+            with self.subTest(mode=mode):
+                self.cfg = CacheConfig(
+                    page_size=4,
+                    components=(ComponentType.FULL, ComponentType.MAMBA),
+                    enable_mamba_extra_buffer=True,
+                    kv_size=64,
+                    max_context_len=64,
+                )
+                stored_keys = defaultdict(set)
+                producer, allocator, producer_req_pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=4
+                )
+                consumer, _, consumer_req_pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=4
+                )
+                consumer.init_cache_linker(_InMemoryUnifiedCacheLinker(stored_keys))
+                producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+                with get_memory().override(linker_mamba_offload=mode):
+                    producer.init_cache_linker(producer_linker)
+
+                req, _ = self._make_inflight_req(
+                    producer, allocator, producer_req_pool, prompt, allocated=True
+                )
+                for up_to, tracked in ((4, 4), (8, 8), (12, 12), (14, None)):
+                    req.kv.mamba_last_track_seqlen = tracked
+                    producer.checkpoint(req, up_to=up_to)
+                self.assertEqual(
+                    [{t.name for t in call} for call in producer_linker.offload_calls],
+                    pools,
+                )
+                self.assertEqual(
+                    [
+                        pending.lock_params.skipped_lock_components
+                        for pending in producer.linker.pending_offloads
+                    ],
+                    skips,
+                )
+                evicted = producer.evict(EvictParams(mamba_num=3))
+                self.assertEqual(evicted.mamba_num_evicted, evictable)
+                for _ in producer_linker.offload_calls:
+                    producer_linker.complete_next_offload(True)
+                producer.check_hicache_events()
+                producer.unlock(req.lock)
+                req.lock = None
+                producer.sanity_check()
+
+                # The store restores the chunk at 8 only if its state was
+                # written, and the deepest state, at 12, either way.
+                for length, hit in ((8, hit_at_8), (12, 12), (len(prompt), 12)):
+                    match = consumer.match_prefix(
+                        MatchPrefixParams(
+                            key=RadixKey(array("q", prompt[:length])),
+                            req=self._make_req(consumer_req_pool),
+                        )
+                    )
+                    self.assertEqual(match.host_hit_length, hit)
+                consumer.sanity_check()
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerTreeCorePythonBackend(
@@ -998,7 +1071,7 @@ def test_async_offload_pins_node_until_completion():
     locks = []
     unlocks = []
 
-    def inc_lock_ref(node):
+    def inc_lock_ref(node, skip_lock_components):
         locks.append(node)
         return SimpleNamespace(to_dec_params=lambda: lock_params)
 
@@ -1040,13 +1113,69 @@ def test_offload_skips_node_already_stored_by_tree_core():
     )
     cache = _cache_for_wrapper(
         tree_core=_FakeExternalTreeCore({node.id: node}),
-        inc_lock_ref=lambda node_id: pytest.fail("stored node must not be locked"),
+        inc_lock_ref=lambda node_id, skip_lock_components: pytest.fail(
+            "stored node must not be locked"
+        ),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
 
     wrapper.offload_nodes([node.id])
 
     assert linker.queued_offloads == []
+
+
+@pytest.mark.parametrize("mode", ["all", "prompt_end"])
+def test_prompt_end_skips_only_states_a_later_extend_supersedes(monkeypatch, mode):
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_memory",
+        lambda: SimpleNamespace(linker_mamba_offload=mode),
+    )
+    cache = _cache_for_wrapper(
+        components={ComponentType.MAMBA: SimpleNamespace(mamba_checkpoint_grid=4)},
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    req = SimpleNamespace(origin_input_ids=array("q", range(14)))
+
+    skipped = [
+        up_to
+        for up_to in range(15)
+        if wrapper.skips_mamba_offload(req, up_to=up_to, is_finished=False)
+    ]
+    # A chunk ending within a grid of the prompt's end may be its last state.
+    assert skipped == (list(range(11)) if mode == "prompt_end" else [])
+    assert not wrapper.skips_mamba_offload(req, up_to=4, is_finished=True)
+
+
+def test_skipped_target_state_leaves_the_rest_of_its_chain_whole():
+    # An ancestor in the chain was left unstored by an earlier insert; only
+    # the insert's own leaf goes without its state, and only its lock skips it.
+    nodes = {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in (7, 8)
+    }
+    transfers = [
+        PoolTransfer(name=PoolName.KV, keys=["page"]),
+        PoolTransfer(name=PoolName.MAMBA, keys=["page"]),
+    ]
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore(nodes, transfers),
+        inc_lock_ref=MagicMock(
+            return_value=SimpleNamespace(to_dec_params=lambda: object())
+        ),
+    )
+    linker = _FakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper.offload_nodes([7, 8], skip_target_mamba=True)
+
+    assert linker.queued_offloads == [transfers, transfers[:1]]
+    assert cache.inc_lock_ref.call_args_list == [
+        call(7, ()),
+        call(8, (ComponentType.MAMBA,)),
+    ]
 
 
 def test_layer_counter_reports_failure_after_the_forward():
@@ -1170,7 +1299,9 @@ def test_failed_offload_rolls_back_split_fragments():
 
     cache = _cache_for_wrapper(
         tree_core=_FakeExternalTreeCore(nodes),
-        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: lock_params),
+        inc_lock_ref=lambda node_id, skip_lock_components: SimpleNamespace(
+            to_dec_params=lambda: lock_params
+        ),
         dec_lock_ref=lambda node_id, params: unlocks.append((node_id, params)),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
@@ -1235,7 +1366,9 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
     )
     cache = _cache_for_wrapper(
         tree_core=_FakeExternalTreeCore({node.id: node}),
-        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=object),
+        inc_lock_ref=lambda node_id, skip_lock_components: SimpleNamespace(
+            to_dec_params=object
+        ),
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id)),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
@@ -1397,7 +1530,9 @@ def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
         _all_reduce_attn_groups=lambda value, op: None,
         get_last_hash_value=lambda node: None,
         resolve_node_handle=lambda node_id: node,
-        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: object()),
+        inc_lock_ref=lambda node_id, skip_lock_components: SimpleNamespace(
+            to_dec_params=lambda: object()
+        ),
         dec_lock_ref=MagicMock(),
     )
     backend = _FakeLinker()
@@ -1457,7 +1592,7 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
     assert core.offload_transfers == transfers
     assert node.write_through_pending_id == node.id
     assert not node.external_cache_stored
-    cache.inc_lock_ref.assert_called_once_with(node.id)
+    cache.inc_lock_ref.assert_called_once_with(node.id, ())
     cache.dec_lock_ref.assert_not_called()
 
     if completion is None:
