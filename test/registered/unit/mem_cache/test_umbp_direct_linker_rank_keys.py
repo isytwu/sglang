@@ -13,9 +13,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEn
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _ordered_layers,
+    _pool_suffixes,
     _PoolRangePlan,
     _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,6 +56,51 @@ class TestStorageSuffix(CustomTestCase):
             _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_rank=0),
             _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=0),
         )
+
+
+class TestPoolSuffixes(CustomTestCase):
+    def test_entries_of_a_replicated_group_drop_the_tp_term(self):
+        group = SimpleNamespace(
+            rank_replicated=True,
+            entries=[SimpleNamespace(name=PoolName.KV, rank_replicated=False)],
+        )
+        self.assertEqual(
+            _pool_suffixes(group, tp_rank=3, attn_cp_rank=0, pp_rank=0),
+            {PoolName.KV: "cp0_pp0"},
+        )
+
+    def test_a_replicated_entry_drops_the_tp_term_in_a_sharded_group(self):
+        # Rank 3 of a group whose MLA KV alone is rank-replicated.
+        pools = {
+            name: SimpleNamespace(
+                name=name, rank_replicated=replicated, packed=True, components=[[]]
+            )
+            for name, replicated in (
+                (PoolName.KV, True),
+                (PoolName.MAMBA, False),
+                (PoolName.DRAFT, False),
+            )
+        }
+        storage = UMBPStore.__new__(UMBPStore)
+        storage.registered_pools = pools
+        storage.is_mla_backend = True
+        storage.config_prefix = None
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker.storage = storage
+        linker.pools = pools
+        group = SimpleNamespace(rank_replicated=False, entries=list(pools.values()))
+        linker._rank_suffixes = _pool_suffixes(
+            group, tp_rank=3, attn_cp_rank=1, pp_rank=2
+        )
+        for name, key in (
+            (PoolName.KV, "page_cp1_pp2_kv"),
+            (PoolName.MAMBA, "page_tp3_cp1_pp2_temporal"),
+            (PoolName.DRAFT, "page_tp3_cp1_pp2_draft"),
+        ):
+            keys, _ = linker._object_keys_for_pages(
+                ["page"], SimpleNamespace(name=name)
+            )
+            self.assertEqual(keys, [key])
 
 
 class TestPackedDraftRanges(CustomTestCase):
