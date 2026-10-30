@@ -798,6 +798,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(group.num_layers, 4)
         self.assertFalse(group.rank_replicated)
         kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
+        self.assertTrue(kv.rank_replicated)
+        self.assertFalse(mamba.rank_replicated)
+        self.assertFalse(group.entry_map[PoolName.DRAFT].rank_replicated)
         self.assertEqual(kv.layer_mapping, {1: 0, 3: 1})
         self.assertEqual(mamba.layer_mapping, {0: 0, 2: 1})
         self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
