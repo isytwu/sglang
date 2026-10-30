@@ -1207,6 +1207,8 @@ The standalone server defaults to `unix:///run/umbp/standalone/node0.grpc.sock` 
 
 UMBP defaults to a 4 GiB DRAM capacity, hugepages disabled, and a 30-second startup wait. This recipe uses 1.5 TB with hugepages enabled and keeps the default startup wait. It also sets `UMBP_SSD_ENABLED=0` to disable the SSD tier (whose config default is enabled), and `MORI_UMBP_LOG_LEVEL=info` to expose the readiness log (the default log level is error).
 
+When the mori client supports `batch_touch`, the linker also tells UMBP every 30 seconds which prefixes the GPU keeps serving, so DRAM eviction does not treat them as cold. Set `"touch_interval_s"` in `--unified-cache-external-linker-config` to change the interval, or to `0` to turn this off.
+
 Then launch the prefill role with the socket in its environment. The Deployment panel and Playground include this address and use the default 30-second startup wait.
 
 ```bash Command

@@ -458,6 +458,51 @@ class TestUnifiedCacheLinkerPythonBackend(
         consumer.check_hicache_events()
         consumer.sanity_check()
 
+    def test_device_hits_touch_the_served_pages_once_per_interval(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        linker.touch_interval_s = 3600.0
+        touches = []
+        linker.touch = touches.append
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 9))
+        self._insert(cache, allocator, req_pool, tokens[:4])
+        self._insert(cache, allocator, req_pool, tokens)
+        (parent,), (child,) = linker.offload_calls
+
+        def match(ids):
+            key = RadixKey(array("q", ids))
+            req = self._make_req(req_pool)
+            return cache.match_prefix(MatchPrefixParams(key=key, req=req))
+
+        # From the sequence head to the device boundary, once per node and
+        # interval.
+        with patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.time"
+        ) as clock:
+            clock.time.return_value = 0.0
+            match(tokens)
+            match(tokens + [99, 100])
+            self.assertEqual(len(touches), 1)
+            (kv,) = touches[0]
+            self.assertEqual(kv.name, PoolName.KV)
+            self.assertEqual(kv.keys, parent.keys + child.keys)
+            match(tokens[:4])
+            self.assertEqual([t[0].keys for t in touches[1:]], [parent.keys])
+            clock.time.return_value = 3600.0
+            match(tokens)
+            self.assertEqual([t[0].keys for t in touches[2:]], [kv.keys])
+
+        # A failing store stops touching on this rank; the match is unaffected.
+        cache.linker.reset()
+        linker.touch = MagicMock(side_effect=RuntimeError("store down"))
+        self.assertEqual(match(tokens).device_prefix_len, len(tokens))
+        linker.touch.assert_called_once()
+        match(tokens[:4])
+        linker.touch.assert_called_once()
+
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(
             page_size=2,
@@ -1094,6 +1139,13 @@ def test_offload_carries_the_inserting_session():
     wrapper.offload_nodes([8])
 
     assert linker.offload_sessions == ["session-a", None]
+
+
+def test_touch_interval_must_be_positive():
+    linker = _FakeLinker()
+    linker.touch_interval_s = 0
+    with pytest.raises(ValueError, match="touch_interval_s"):
+        UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
 
 
 def test_offload_skips_node_already_stored_by_tree_core():

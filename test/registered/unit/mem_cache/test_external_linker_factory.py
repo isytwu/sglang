@@ -388,6 +388,61 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                 if config == {}:
                     self.assertNotIn("master_server_address", passed)
 
+    def test_mori_keeps_touch_interval_out_of_the_store_config(self):
+        module = importlib.import_module(
+            "sglang.srt.mem_cache.storage.umbp.umbp_direct_linker"
+        )
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((2, 8), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=1,
+            rows_are_pages=False,
+        )
+        group = DevicePoolGroup([pool], num_layers=1, page_size=1)
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(),
+            page_size=1,
+        )
+        for interval, error in (
+            (5, None),
+            (-1, ValueError),
+            (float("inf"), ValueError),
+            (True, ValueError),
+        ):
+            expected = (
+                (RuntimeError, "storage boundary")
+                if error is None
+                else (error, "touch_interval_s")
+            )
+            with (
+                self.subTest(interval=interval),
+                get_context().override_server_args(
+                    unified_cache_external_linker_backend="mori",
+                    unified_cache_external_linker_config={"touch_interval_s": interval},
+                ),
+                patch.object(
+                    module, "resolve_hybrid_device_pool_group", return_value=group
+                ),
+                patch.object(
+                    module.torch.distributed, "is_initialized", return_value=False
+                ),
+                patch.object(
+                    module,
+                    "HiCacheStorageConfig",
+                    side_effect=RuntimeError("storage boundary"),
+                ) as storage_config,
+                self.assertRaisesRegex(*expected),
+            ):
+                _create_startup_linker("args", params, components={"full"})
+            if error is None:
+                passed = storage_config.call_args.kwargs["extra_config"]
+                self.assertNotIn("touch_interval_s", passed)
+
 
 if __name__ == "__main__":
     unittest.main()

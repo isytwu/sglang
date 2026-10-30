@@ -1184,8 +1184,7 @@ class SWAComponent(TreeComponent):
         if not keys:
             return None
 
-        # `keys` already start at the first device-uncached page, so the trailing
-        # window is simply their tail.
+        # `keys` end at the boundary, so the trailing window is simply their tail.
         tail_keys = list(keys[max(0, len(keys) - window_pages) :])
         if not tail_keys:
             return None

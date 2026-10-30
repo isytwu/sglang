@@ -884,9 +884,10 @@ class TreeComponent(ABC):
         """Build this component's direct device/storage transfer.
 
         ``node`` carries the device pages to persist on OFFLOAD and is None
-        otherwise. ``keys`` are the per-page hashes of the device-uncached tail
-        (page 0 is the first uncached page) on LOOKUP / LOAD, and None on
-        OFFLOAD, where the keys come from ``node.hash_value``.
+        otherwise. On LOOKUP / LOAD ``keys`` are consecutive per-page hashes
+        ending at the boundary: the device-uncached tail, or for a touch the
+        device-hit prefix. They are None on OFFLOAD, where the keys come from
+        ``node.hash_value``.
         """
         return None
 
