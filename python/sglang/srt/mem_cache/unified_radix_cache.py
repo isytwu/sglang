@@ -350,6 +350,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.buffer_pipeline: Optional[BufferModePipeline] = None
         # Session of the insert whose actions are being applied (see ``insert``).
         self.insert_session_id: Optional[str] = None
+        # The insert's new leaf when the linker writes it without its Mamba state.
+        self.insert_skip_mamba_node: Optional[NodeId] = None
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -697,6 +699,12 @@ class UnifiedRadixCache(BasePrefixCache):
         try:
             step = self.tree_core.begin_insert(params)
             while True:
+                # The walk's backups are of nodes earlier inserts left unstored.
+                self.insert_skip_mamba_node = (
+                    step.result.last_device_node
+                    if params.skip_leaf_mamba_offload and step.result is not None
+                    else None
+                )
                 self._apply_cache_actions(step.actions)
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
@@ -704,6 +712,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
+            self.insert_skip_mamba_node = None
             # Drain still-pending actions so frees reach the allocator on abort.
             try:
                 self._apply_cache_actions(self.tree_core.end_insert())
@@ -1224,6 +1233,12 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            skip_leaf_mamba_offload=(
+                self.linker is not None
+                and self.linker.skips_leaf_mamba_offload(
+                    req, up_to=up_to, is_finished=is_finished
+                )
+            ),
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1449,7 +1464,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage.free_owner_rows(indices)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
-                self.linker.offload_nodes(action.node_ids)
+                self.linker.offload_nodes(
+                    action.node_ids, skip_mamba_node=self.insert_skip_mamba_node
+                )
             else:
                 self._execute_and_commit_kv_backup(action)
         else:

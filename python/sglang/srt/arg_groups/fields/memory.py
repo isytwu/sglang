@@ -285,6 +285,20 @@ class Memory(msgspec.Struct):
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
     ] = False
+    linker_mamba_offload: A[
+        str,
+        Arg(
+            help=(
+                "Mamba states the external linker writes to the store: 'all', or "
+                "'prompt_end' to write a prefill chunk's KV without its state "
+                "when a later chunk of the prompt is expected to write a deeper "
+                "one. A prefix shared only up to such a chunk then restores from "
+                "the store only as far as an earlier stored state. No effect on "
+                "models without Mamba state."
+            ),
+            choices=["all", "prompt_end"],
+        ),
+    ] = "all"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

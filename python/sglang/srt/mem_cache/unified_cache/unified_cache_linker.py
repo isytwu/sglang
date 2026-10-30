@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -289,6 +290,13 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        mamba = cache.components.get(ComponentType.MAMBA)
+        # Set under --linker-mamba-offload prompt_end: see skips_leaf_mamba_offload.
+        self._mamba_skip_grid = (
+            mamba.mamba_checkpoint_grid
+            if mamba is not None and get_memory().linker_mamba_offload == "prompt_end"
+            else None
+        )
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -504,8 +512,25 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 
-    def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
-        """Persist a write-through chain, skipping nodes already in the store."""
+    def skips_leaf_mamba_offload(
+        self, req: Req, *, up_to: int, is_finished: bool
+    ) -> bool:
+        """Whether a checkpoint's new leaf goes to the store without its Mamba
+        state: a prefill chunk with at least a checkpoint grid of the prompt
+        after it, expected to let a later extend donate a deeper state. A chunk
+        cut short by the prefill budget can defeat that, leaving the prompt with
+        no state in the store."""
+        return (
+            self._mamba_skip_grid is not None
+            and not is_finished
+            and len(req.origin_input_ids) - up_to >= self._mamba_skip_grid
+        )
+
+    def offload_nodes(
+        self, node_ids: Sequence[NodeId], *, skip_mamba_node: Optional[NodeId] = None
+    ) -> None:
+        """Persist a write-through chain, skipping nodes already in the store;
+        ``skip_mamba_node`` is written without its Mamba state."""
         for node_id in node_ids:
             transfers = self.cache.tree_core.build_external_linker_offload_transfers(
                 node_id
@@ -513,11 +538,18 @@ class UnifiedCacheLinkerWrapper:
             if transfers is not None:
                 if self._skip_swa:
                     transfers = [t for t in transfers if t.name != PoolName.SWA]
-                self._offload_node(node_id, transfers)
+                skip_mamba = node_id == skip_mamba_node
+                if skip_mamba:
+                    transfers = [t for t in transfers if t.name != PoolName.MAMBA]
+                self._offload_node(node_id, transfers, skip_mamba=skip_mamba)
 
-    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
+    def _offload_node(
+        self, node_id: NodeId, transfers: list[PoolTransfer], *, skip_mamba: bool
+    ) -> None:
         cache = self.cache
-        lock_params = cache.inc_lock_ref(node_id).to_dec_params()
+        # A state the write skips need not stay pinned until the write ends.
+        skipped = (ComponentType.MAMBA,) if skip_mamba else ()
+        lock_params = cache.inc_lock_ref(node_id, skipped).to_dec_params()
         try:
             queued = self.cache_linker.offload(
                 transfers, session_id=getattr(cache, "insert_session_id", None)

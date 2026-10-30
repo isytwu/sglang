@@ -558,5 +558,6 @@ POSITIONAL_FIELD_ORDER = (
     "engram_config",
     "moe_ascend_ops_config",
     "cp_kv_layout",
+    "linker_mamba_offload",
 )
 # fmt: on
