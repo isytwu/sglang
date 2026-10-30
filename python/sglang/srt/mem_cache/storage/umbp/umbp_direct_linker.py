@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    linker_storage_suffix,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
@@ -42,20 +43,6 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
-
-
-def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
-) -> str:
-    # A rank-replicated group (MLA / DSA) holds byte-identical pages on every
-    # attention TP rank, so a tp term stores tp_size copies of the same page.
-    # Only the key collapses -- every rank still writes, because a Local-mode
-    # tier is private to its rank and a standalone server is per node.
-    parts = []
-    if not rank_replicated:
-        parts.append(f"tp{tp_rank}")
-    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
-    return "_".join(parts)
 
 
 def _ordered_layers(entry) -> list[int]:
@@ -262,10 +249,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if _storage is None:
             from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
-            # per_rank_keyspace: every object key this class writes carries a
-            # tp{rank} suffix (set just below), so the store must not put the
-            # ranks into the shared-SSD leader/follower scheme meant for
-            # deduplicating replicated MLA KV.
+            # per_rank_keyspace: this class sets the rank suffix of every object
+            # key itself, so the store must not put the ranks into the
+            # shared-SSD leader/follower scheme meant for deduplicating
+            # replicated MLA KV.
             self.storage = UMBPStore(
                 storage_config, mem_pool_host=None, per_rank_keyspace=True
             )
@@ -311,7 +298,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.mem_pool_host = self.pool_group
             self.storage._kv_anchor_is_logical = True
             self.storage.registered_pools = self.pools
-            rank_suffix = _storage_suffix(
+            # Replicated keys are shared, but every rank still writes: a
+            # Local-mode tier is private to its rank and a standalone server is
+            # per node.
+            rank_suffix = linker_storage_suffix(
                 rank_replicated=rank_replicated,
                 tp_rank=tp_rank,
                 attn_cp_rank=params.attn_cp_rank,

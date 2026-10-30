@@ -14,46 +14,11 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _ordered_layers,
     _PoolRangePlan,
-    _storage_suffix,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-
-
-class TestStorageSuffix(CustomTestCase):
-    def test_replicated_group_drops_the_tp_term(self):
-        # MLA/DSA pages are byte-identical on every attention TP rank, so every
-        # rank has to name the same object or the store holds tp_size copies.
-        suffixes = {
-            _storage_suffix(
-                rank_replicated=True, tp_rank=rank, attn_cp_rank=0, pp_rank=0
-            )
-            for rank in range(8)
-        }
-        self.assertEqual(suffixes, {"cp0_pp0"})
-
-    def test_sharded_group_keeps_one_keyspace_per_rank(self):
-        suffixes = [
-            _storage_suffix(
-                rank_replicated=False, tp_rank=rank, attn_cp_rank=0, pp_rank=0
-            )
-            for rank in range(8)
-        ]
-        self.assertEqual(len(set(suffixes)), 8)
-        self.assertEqual(suffixes[3], "tp3_cp0_pp0")
-
-    def test_cp_and_pp_shard_even_when_replicated(self):
-        # CP shards the sequence and PP shards layers, so neither may collapse.
-        self.assertEqual(
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=2),
-            "cp1_pp2",
-        )
-        self.assertNotEqual(
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_rank=0),
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=0),
-        )
 
 
 class TestPackedDraftRanges(CustomTestCase):

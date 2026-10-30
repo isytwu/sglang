@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    linker_storage_suffix,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
@@ -33,16 +34,6 @@ from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
-
-
-def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
-) -> str:
-    parts = []
-    if not rank_replicated:
-        parts.append(f"tp{tp_rank}")
-    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
-    return "_".join(parts)
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -75,7 +66,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
-        self.offload_owner = not rank_replicated or tp_rank == 0
+        # Every TP and CP rank of a rank-replicated group names the same objects.
+        self.offload_owner = not rank_replicated or (
+            tp_rank == 0 and params.attn_cp_rank == 0
+        )
         extra_config = deepcopy(extra_config or {})
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
@@ -103,7 +97,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
-        storage_suffix = _storage_suffix(
+        storage_suffix = linker_storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
             attn_cp_rank=params.attn_cp_rank,
@@ -112,11 +106,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
         logger.info(
-            "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "Mooncake direct linker storage topology: rank_replicated=%s, "
+            "tp_rank=%d/%d, attn_cp_rank=%d/%d, offload_owner=%s, suffix=%s",
             rank_replicated,
             tp_rank,
             tp_size,
+            params.attn_cp_rank,
+            params.attn_cp_size,
             self.offload_owner,
             storage_suffix,
         )

@@ -15,6 +15,8 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _build_dsa_device_pool_group,
+    linker_storage_suffix,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -158,6 +160,24 @@ class TestDevicePoolGroup(CustomTestCase):
         self.assertEqual(resolved[0].keys, ["b", "d"])
         self.assertEqual(resolved[0].host_indices.tolist(), [120, 121, 124, 125])
         self.assertEqual(resolved[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)
+
+
+class TestLinkerStorageSuffix(CustomTestCase):
+    def test_only_a_replicated_group_drops_the_tp_and_cp_ranks(self):
+        suffixes = {
+            linker_storage_suffix(
+                rank_replicated=True, tp_rank=tp, attn_cp_rank=cp, pp_rank=2
+            )
+            for tp in range(4)
+            for cp in range(2)
+        }
+        self.assertEqual(suffixes, {"pp2"})
+        self.assertEqual(
+            linker_storage_suffix(
+                rank_replicated=False, tp_rank=3, attn_cp_rank=1, pp_rank=0
+            ),
+            "tp3_cp1_pp0",
+        )
 
 
 class TestHybridDevicePoolAssembler(CustomTestCase):
@@ -619,6 +639,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "does not support HiSparse"):
             _build_deepseek_v4_device_pool_group(kvcache, 2)
+
+    def test_dsa_rejects_layer_split(self):
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
+
+        kvcache = LayerSplitDSATokenToKVPool.__new__(LayerSplitDSATokenToKVPool)
+        with self.assertRaisesRegex(ValueError, "dsa-cache-layer-split"):
+            _build_dsa_device_pool_group(kvcache, 2)
 
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool

@@ -175,6 +175,7 @@ class DevicePoolGroup:
         self.sources = {entry.name: entry.indices_from_pool for entry in self.entries}
         self.num_layers = num_layers
         self.page_size = page_size
+        # Byte-identical on every attention TP and CP rank.
         self.rank_replicated = rank_replicated
         self.kv_buffer = None
 
@@ -220,6 +221,19 @@ class DevicePoolGroup:
                 )
             )
         return resolved
+
+
+def linker_storage_suffix(
+    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+) -> str:
+    """The rank part of a direct linker's object keys."""
+    # Prefill CP gathers the whole sequence into every CP rank's pool, so a
+    # rank-replicated group's keys name neither the TP nor the CP rank. Other
+    # groups keep both: under CP-TP group sharing, linear attention shards its
+    # heads over the whole TP group. PP stages hold different layers.
+    if rank_replicated:
+        return f"pp{pp_rank}"
+    return f"tp{tp_rank}_cp{attn_cp_rank}_pp{pp_rank}"
 
 
 def _deepseek_v4_state_views(state_pools: list[Any], global_layers: list[int]):
@@ -413,6 +427,15 @@ def _build_dsa_device_pool_group(
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
 ) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
+
+    # Each CP rank of a layer-split pool holds only its own layers, but a
+    # rank-replicated group's keys name no CP rank.
+    if isinstance(kvcache, LayerSplitDSATokenToKVPool):
+        raise ValueError(
+            "The direct external linker does not support "
+            "--enable-dsa-cache-layer-split."
+        )
     if kvcache.page_size != page_size:
         raise ValueError(
             "DSA KV page size must match the tree page size: "
