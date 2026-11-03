@@ -452,6 +452,12 @@ def _mha_device_pool_entry(
         raise ValueError(
             "The direct external linker does not support scaled KV caches yet."
         )
+    layout = getattr(pool, "kv_cache_layout", "nhd")
+    if layout not in ("nhd", "hnd", "vectorized_5d"):
+        raise ValueError(
+            f"The direct external linker does not support the {layout!r} "
+            "MHA KV cache layout."
+        )
     num_layers = len(pool.k_buffer)
     return DevicePoolEntry(
         name=name,
@@ -462,7 +468,9 @@ def _mha_device_pool_entry(
             layer: (index, num_layers + index) for layer, index in layer_mapping.items()
         },
         page_size=page_size,
-        rows_are_pages=False,
+        # nhd leads with token slots; hnd and vectorized_5d lead with pages,
+        # each holding the page's bytes contiguously.
+        rows_are_pages=layout != "nhd",
     )
 
 
@@ -506,6 +514,44 @@ def _mamba_device_pool_entry(state: Any, start_layer: int) -> DevicePoolEntry:
         page_size=1,
         rows_are_pages=True,
     )
+
+
+def _build_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    # TODO: support MLA sub-pools and packed draft KV.
+    pools = (kvcache.full_kv_pool, kvcache.swa_kv_pool)
+    if (
+        not all(isinstance(pool, MHATokenToKVPool) for pool in pools)
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + SWA models only with "
+            "MHA full and SWA pools, without packed draft KV."
+        )
+    if any(pool.page_size != page_size for pool in pools):
+        raise ValueError(
+            "Full and SWA KV page sizes must match the tree page size: "
+            f"{[pool.page_size for pool in pools]} != {page_size}."
+        )
+
+    full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
+    entries = [
+        _mha_device_pool_entry(
+            PoolName.KV, kvcache.full_kv_pool, full_mapping, page_size
+        ),
+        _mha_device_pool_entry(
+            PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
+        ),
+    ]
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    # Not rank_replicated: the KV heads are TP-sharded.
+    return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 
 def _build_mamba_swa_device_pool_group(

@@ -29,6 +29,43 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def _mha_pool(layers, k_shape, v_shape, *, page_size=2, layout="nhd"):
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+    pool.page_size = page_size
+    pool.kv_cache_layout = layout
+    pool.k_scale_buffer = pool.native_k_scale_buffer = None
+    pool.k_buffer = [torch.zeros(k_shape, dtype=torch.uint8) for _ in range(layers)]
+    pool.v_buffer = [torch.zeros(v_shape, dtype=torch.uint8) for _ in range(layers)]
+    return pool
+
+
+def _swa_kv_pool(full_pool, swa_pool, full_ids, swa_ids):
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    kvcache = SWAKVPool.__new__(SWAKVPool)
+    # Strategy selection only asks the router which sub-pools exist.
+    kvcache.__dict__["layer_router"] = SimpleNamespace(
+        sub_pool=lambda name: object() if name == IdSpaceKind.SLIDING_WINDOW else None,
+        wrapped_view=lambda: None,
+    )
+    kvcache.start_layer = 0
+    kvcache.full_kv_pool = full_pool
+    kvcache.swa_kv_pool = swa_pool
+    kvcache.layers_mapping = {
+        **{layer: (index, False) for index, layer in enumerate(full_ids)},
+        **{layer: (index, True) for index, layer in enumerate(swa_ids)},
+    }
+    return kvcache
+
+
+# Muse Spark's pattern: layer 1 is full, then one full after every three SWA.
+_MUSE_FULL_LAYERS = [1, 5]
+_MUSE_SWA_LAYERS = [0, 2, 3, 4, 6, 7]
+
+
 class TestDevicePoolEntry(CustomTestCase):
     def test_sparse_multi_component_layer_ranges(self):
         k0 = torch.zeros((8, 3), dtype=torch.uint8)
@@ -784,6 +821,111 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
+    def _swa_group(self, *, layout="nhd", page_size=2, pages=4, **overrides):
+        if layout == "nhd":
+            k_shape, v_shape = (pages * page_size, 3), (pages * page_size, 4)
+        else:
+            k_shape, v_shape = (pages, 1, page_size, 3), (pages, 1, page_size, 4)
+        full = overrides.pop("full_pool", None)
+        if full is None:
+            full = _mha_pool(
+                len(_MUSE_FULL_LAYERS),
+                k_shape,
+                v_shape,
+                page_size=page_size,
+                layout=layout,
+            )
+        swa = overrides.pop("swa_pool", None)
+        if swa is None:
+            swa = _mha_pool(
+                len(_MUSE_SWA_LAYERS),
+                k_shape,
+                v_shape,
+                page_size=page_size,
+                layout=layout,
+            )
+        kvcache = _swa_kv_pool(full, swa, _MUSE_FULL_LAYERS, _MUSE_SWA_LAYERS)
+        params = SimpleNamespace(
+            mtp_draft_device_pools=overrides.pop("mtp_draft_device_pools", ())
+        )
+        assert not overrides, overrides
+        return resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=params,
+            components={ComponentType.FULL, ComponentType.SWA},
+        )
+
+    def test_mha_swa_maps_full_and_swa_pools(self):
+        group = self._swa_group()
+
+        self.assertEqual(group.num_layers, 8)
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(
+            group.sources, {PoolName.KV: PoolName.KV, PoolName.SWA: PoolName.SWA}
+        )
+        kv, swa = group.entry_map[PoolName.KV], group.entry_map[PoolName.SWA]
+        self.assertEqual(kv.layer_mapping, {1: (0, 2), 5: (1, 3)})
+        self.assertEqual(
+            swa.layer_mapping,
+            {0: (0, 6), 2: (1, 7), 3: (2, 8), 4: (3, 9), 6: (4, 10), 7: (5, 11)},
+        )
+        # Token-slot rows: page 2 of the pool starts at slot 4.
+        locations = kv.prepare_locations(torch.tensor([4, 5]))
+        self.assertEqual(locations, [4])
+        pointers, sizes, offsets = kv.get_prepared_layer_range_meta(locations, 5)
+        k1, v1 = kv.components[0][1], kv.components[0][3]
+        self.assertEqual(pointers, [[k1[4].data_ptr(), v1[4].data_ptr()]])
+        # One packed object: k0 k1 v0 v1 at 6 bytes per K page, 8 per V page.
+        self.assertEqual(sizes, [[6, 8]])
+        self.assertEqual(offsets, [[6, 20]])
+        self.assertIsNone(kv.get_prepared_layer_range_meta(locations, 0))
+        # SWA layer 7 is the sixth SWA buffer: k5 after five K pages, v5 after
+        # all six K pages and five V pages.
+        _, sizes, offsets = swa.get_prepared_layer_range_meta(locations, 7)
+        self.assertEqual(sizes, [[6, 8]])
+        self.assertEqual(offsets, [[30, 76]])
+
+    def test_mha_swa_page_major_layouts_address_pages(self):
+        for layout in ("hnd", "vectorized_5d"):
+            with self.subTest(layout=layout):
+                group = self._swa_group(layout=layout)
+                swa = group.entry_map[PoolName.SWA]
+                locations = swa.prepare_locations(torch.tensor([4, 5]))
+                self.assertEqual(locations, [2])
+                pointers, sizes, offsets = swa.get_prepared_layer_range_meta(
+                    locations, 2
+                )
+                k1, v1 = swa.components[0][1], swa.components[0][7]
+                self.assertEqual(pointers, [[k1[2].data_ptr(), v1[2].data_ptr()]])
+                self.assertEqual(sizes, [[6, 8]])
+                self.assertEqual(offsets, [[6, 44]])
+
+    def test_mha_swa_rejects_unsupported_pools(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        mla = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        mla.page_size = 2
+        for overrides, error in (
+            ({"swa_pool": mla}, "MHA full and SWA pools"),
+            ({"mtp_draft_device_pools": (object(),)}, "without packed draft KV"),
+            (
+                {"full_pool": _mha_pool(2, (8, 3), (8, 4), page_size=4)},
+                "page sizes must match",
+            ),
+            (
+                {
+                    "swa_pool": _mha_pool(
+                        6, (8, 3), (8, 4), layout="page_major_layer_major"
+                    )
+                },
+                "'page_major_layer_major' MHA KV cache layout",
+            ),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(ValueError, error):
+                    self._swa_group(**overrides)
+
     def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -986,20 +1128,26 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             resolve()
 
     def test_unsupported_strategy_fails_with_context(self):
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        # Every built-in strategy has a linker pool group; one registered
+        # downstream without it has to fail by name.
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 
-        kvcache = SWAKVPool.__new__(SWAKVPool)
-        kvcache.full_kv_pool, kvcache.swa_kv_pool = object(), object()
-        kvcache.layers_mapping = {}
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support the direct external linker: _SwaStrategy",
+        class _ForkStrategy(hybrid_pool_assembler.StackStrategy):
+            def matches(self, kvcache, components):
+                return True
+
+        with (
+            patch.object(hybrid_pool_assembler, "_STRATEGIES", [_ForkStrategy()]),
+            self.assertRaisesRegex(
+                ValueError,
+                "does not support the direct external linker: _ForkStrategy",
+            ),
         ):
             resolve_hybrid_device_pool_group(
-                kvcache=kvcache,
+                kvcache=object(),
                 page_size=2,
                 params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.SWA},
+                components={ComponentType.FULL},
             )
 
 

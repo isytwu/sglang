@@ -1,5 +1,6 @@
 """Unit tests for the UMBP direct linker's rank-replicated key handling."""
 
+import ctypes
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -8,7 +9,12 @@ from unittest import mock
 import torch
 
 import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
@@ -16,6 +22,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     _PoolRangePlan,
     _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -171,6 +178,190 @@ class TestLoadReadyEvents(CustomTestCase):
             ],
         )
         linker.layer_done_counter.fail.assert_not_called()
+
+
+class _RangedStore:
+    """In-memory UMBP client. Like mori, a put has to tile its object exactly."""
+
+    def __init__(self):
+        self.objects: dict[str, bytearray] = {}
+
+    def batch_put_ranges_from_ptr(self, keys, object_sizes, ptrs, sizes, offsets):
+        results = []
+        for key, object_size, range_ptrs, range_sizes, range_offsets in zip(
+            keys, object_sizes, ptrs, sizes, offsets
+        ):
+            cursor = 0
+            for offset, length in sorted(zip(range_offsets, range_sizes)):
+                if offset != cursor:
+                    break
+                cursor += length
+            results.append(cursor == object_size)
+            if cursor != object_size:
+                continue
+            data = self.objects.setdefault(key, bytearray(object_size))
+            for ptr, length, offset in zip(range_ptrs, range_sizes, range_offsets):
+                view = (ctypes.c_char * length).from_buffer(data, offset)
+                ctypes.memmove(view, ptr, length)
+        return results
+
+    def batch_get_ranges_into_ptr(self, keys, ptrs, sizes, offsets):
+        results = []
+        for key, range_ptrs, range_sizes, range_offsets in zip(
+            keys, ptrs, sizes, offsets
+        ):
+            data = self.objects.get(key)
+            results.append(data is not None)
+            if data is None:
+                continue
+            for ptr, length, offset in zip(range_ptrs, range_sizes, range_offsets):
+                view = (ctypes.c_char * length).from_buffer(data, offset)
+                ctypes.memmove(ptr, view, length)
+        return results
+
+    def batch_exists(self, keys):
+        return [key in self.objects for key in keys]
+
+
+class TestFullSwaRoundTrip(CustomTestCase):
+    """Offload, look up and load a FULL + SWA (Muse Spark) page group.
+
+    Full-attention K/V cover every prefix page; the SWA pool only keeps the
+    trailing window, so a restore needs just those pages from it.
+    """
+
+    def _group(self, page_size, full_pages, swa_pages):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        def pool(layers, pages):
+            mha = MHATokenToKVPool.__new__(MHATokenToKVPool)
+            mha.page_size, mha.kv_cache_layout = page_size, "nhd"
+            mha.k_scale_buffer = mha.native_k_scale_buffer = None
+            mha.k_buffer = [
+                torch.randint(0, 256, (pages * page_size, 2, 3), dtype=torch.uint8)
+                for _ in range(layers)
+            ]
+            mha.v_buffer = [
+                torch.randint(0, 256, (pages * page_size, 2, 5), dtype=torch.uint8)
+                for _ in range(layers)
+            ]
+            return mha
+
+        kvcache = SWAKVPool.__new__(SWAKVPool)
+        kvcache.start_layer = 0
+        kvcache.full_kv_pool = pool(2, full_pages)
+        kvcache.swa_kv_pool = pool(6, swa_pages)
+        kvcache.layers_mapping = {
+            **{layer: (index, False) for index, layer in enumerate([1, 5])},
+            **{layer: (index, True) for index, layer in enumerate([0, 2, 3, 4, 6, 7])},
+        }
+        return linker_pool_assembler._build_swa_device_pool_group(
+            kvcache, SimpleNamespace(mtp_draft_device_pools=()), page_size
+        )
+
+    def _linker(self, group):
+        storage = UMBPStore.__new__(UMBPStore)
+        storage.client = _RangedStore()
+        storage.registered_pools = group.entry_map
+        storage.mla_suffix = storage.mha_suffix = "tp3_cp0_pp0"
+        storage.is_mla_backend = True
+        storage.config_prefix = None
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker.storage = storage
+        linker.pool_group = group
+        linker.pools = group.entry_map
+        linker.num_layers = group.num_layers
+        linker.pool_layers = {
+            name: _ordered_layers(entry) for name, entry in group.entry_map.items()
+        }
+        linker.layer_group = 2
+        linker.layer_done_counter = mock.Mock()
+        linker._stats = {"lookup": 0, "load": 0, "offload": 0, "offload_batches": 0}
+        linker._pending = {}
+        linker._async_offload_index_snapshot = False
+        return linker
+
+    def test_full_kv_and_swa_window_round_trip(self):
+        group = self._group(page_size=2, full_pages=8, swa_pages=4)
+        linker = self._linker(group)
+        ready = SimpleNamespace(synchronize=lambda: None)
+        keys = [f"page{i}" for i in range(3)]
+        # Full pages 1-3 hold the 3-page prefix; SWA pages 0 and 2 hold its
+        # 2-page window.
+        offload = [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=keys,
+                device_indices=torch.tensor([2, 3, 4, 5, 6, 7]),
+            ),
+            PoolTransfer(
+                name=PoolName.SWA,
+                keys=keys[1:],
+                device_indices=torch.tensor([0, 1, 4, 5]),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+        ]
+        expanded = group.resolve_transfers(offload, allow_partial=True)
+        self.assertTrue(linker._run_offload([(expanded, ready)]))
+        self.assertEqual(
+            sorted(linker.storage.client.objects),
+            sorted(
+                [f"{key}_tp3_cp0_pp0_{PoolName.KV}" for key in keys]
+                + [f"{key}_tp3_cp0_pp0_{PoolName.SWA}" for key in keys[1:]]
+            ),
+        )
+
+        def lookup(num_pages, window):
+            return linker.lookup(
+                "rid",
+                [
+                    PoolTransfer(name=PoolName.KV, keys=keys[:num_pages]),
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        keys=keys[max(0, num_pages - window) : num_pages],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    ),
+                ],
+            )
+
+        self.assertEqual(lookup(3, 2), [3])
+        # A 2-page prefix's window starts at page 0, whose SWA was never stored.
+        self.assertEqual(lookup(2, 2), [])
+
+        kv, swa = group.entry_map[PoolName.KV], group.entry_map[PoolName.SWA]
+        before_kv = [buffer[2:8].clone() for buffer in kv.components[0]]
+        before_swa = [buffer[[0, 1, 4, 5]].clone() for buffer in swa.components[0]]
+        load = [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=keys,
+                device_indices=torch.tensor([10, 11, 12, 13, 14, 15]),
+            ),
+            PoolTransfer(
+                name=PoolName.SWA,
+                keys=keys[1:],
+                device_indices=torch.tensor([2, 3, 6, 7]),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+        ]
+        self.assertTrue(linker.load("rid", load))
+        plans = linker._build_load_plans(list(linker._pending.values()))
+        linker._run_layer_wise_batch(0, plans, ready)
+        linker.layer_done_counter.fail.assert_not_called()
+        self.assertEqual(
+            sorted(
+                c.args[1] for c in linker.layer_done_counter.complete.call_args_list
+            ),
+            list(range(8)),
+        )
+
+        for got, want in zip([buffer[10:16] for buffer in kv.components[0]], before_kv):
+            self.assertTrue(torch.equal(got, want))
+        for got, want in zip(
+            [buffer[[2, 3, 6, 7]] for buffer in swa.components[0]], before_swa
+        ):
+            self.assertTrue(torch.equal(got, want))
 
 
 if __name__ == "__main__":
