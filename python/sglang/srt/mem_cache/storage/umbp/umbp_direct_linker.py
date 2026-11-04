@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -350,6 +351,18 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
+            # Wall time on the transfer threads. A load batch's first group is
+            # what the forward waits on before its first layer can run.
+            "load_batches": 0,
+            "load_calls": 0,
+            "load_bytes": 0,
+            "load_ready_wait_s": 0.0,
+            "load_first_group_s": 0.0,
+            "load_batch_s": 0.0,
+            "load_get_s": 0.0,
+            "offload_calls": 0,
+            "offload_bytes": 0,
+            "offload_put_s": 0.0,
         }
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
@@ -783,22 +796,31 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self, counter_index: int, plans: list[_PoolRangePlan], ready: TransferReady
     ) -> None:
         try:
+            stats = self._stats
+            began = time.perf_counter()
             ready.synchronize()
+            stats["load_ready_wait_s"] += time.perf_counter() - began
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
                 for logical_layer in self.pool_layers[plan.name]:
                     by_layer[logical_layer].append(plan)
 
-            for group in self._layer_groups():
+            for group_index, group in enumerate(self._layer_groups()):
                 for plan in self._plans_covering(by_layer, group):
                     meta = self._layer_group_ranges(plan, group)
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
+                    # Objects repeat their ranges with the period of the
+                    # objects per page.
+                    stats["load_bytes"] += sum(
+                        sum(entry) for entry in sizes[: plan.entries_per_page]
+                    ) * (len(plan.keys) // plan.entries_per_page)
                     step = self._entries_per_call(sizes)
                     for start in range(0, len(plan.keys), step):
                         end = start + step
                         chunk_keys = plan.keys[start:end]
+                        called = time.perf_counter()
                         results = list(
                             self.storage.client.batch_get_ranges_into_ptr(
                                 chunk_keys,
@@ -807,6 +829,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                                 offsets[start:end],
                             )
                         )
+                        stats["load_get_s"] += time.perf_counter() - called
+                        stats["load_calls"] += 1
                         if len(results) != len(chunk_keys) or not all(results):
                             where = (
                                 f"layer={group[0]}"
@@ -823,6 +847,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 # granularity for fewer times each object is named on the wire.
                 for logical_layer in group:
                     self.layer_done_counter.complete(counter_index, logical_layer)
+                if group_index == 0:
+                    stats["load_first_group_s"] += time.perf_counter() - began
+            stats["load_batch_s"] += time.perf_counter() - began
+            stats["load_batches"] += 1
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
@@ -932,9 +960,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # An object's ranges must tile it exactly, so a chunk boundary may
             # fall between objects but never inside one.
             step = self._entries_per_call(sizes)
+            self._stats["offload_bytes"] += sum(object_sizes)
             for start in range(0, len(plan.keys), step):
                 end = start + step
                 chunk_keys = plan.keys[start:end]
+                called = time.perf_counter()
                 results = list(
                     self.storage.client.batch_put_ranges_from_ptr(
                         chunk_keys,
@@ -944,6 +974,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         offsets[start:end],
                     )
                 )
+                self._stats["offload_put_s"] += time.perf_counter() - called
+                self._stats["offload_calls"] += 1
                 if len(results) != len(chunk_keys) or not all(results):
                     logger.warning(
                         "UMBP offload failed: pool=%s object_range=[%d,%d) "
@@ -1001,6 +1033,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # down every registered region. Keep the GPU tensors alive until
             # the synchronous RPC has completed successfully.
             self.storage.client.deregister_memory(self._registered[0][0])
-        logger.info("UMBP direct linker stats: %s", self._stats)
+        logger.info(
+            "UMBP direct linker stats: %s",
+            {k: round(v, 3) if isinstance(v, float) else v for k, v in self._stats.items()},
+        )
         self.storage.close()
         self._closed = True

@@ -2,6 +2,7 @@
 
 import ctypes
 import unittest
+from collections import Counter
 from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
@@ -160,7 +161,7 @@ class TestLoadReadyEvents(CustomTestCase):
         linker._build_load_plans = lambda _transfers: []
         linker.layer_done_counter = mock.MagicMock()
         linker.layer_done_counter.update_producer.return_value = 3
-        linker._stats = {"load": 0}
+        linker._stats = Counter()
         linker._load_queue = Queue()
         # No layer group to read, so only the waits run.
         linker.num_layers = 0
@@ -277,7 +278,7 @@ class TestFullSwaRoundTrip(CustomTestCase):
         }
         linker.layer_group = 2
         linker.layer_done_counter = mock.Mock()
-        linker._stats = {"lookup": 0, "load": 0, "offload": 0, "offload_batches": 0}
+        linker._stats = Counter()
         linker._pending = {}
         linker._async_offload_index_snapshot = False
         return linker
