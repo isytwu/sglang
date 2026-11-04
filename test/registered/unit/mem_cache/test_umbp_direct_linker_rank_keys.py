@@ -347,6 +347,16 @@ class TestFullSwaRoundTrip(CustomTestCase):
         ]
         self.assertTrue(linker.load("rid", load))
         plans = linker._build_load_plans(list(linker._pending.values()))
+        # What a staging medium reads per object is the extent of its ranges in
+        # one layer group; it has to be exactly the bytes that group needs.
+        for plan in plans:
+            for group in linker._layer_groups():
+                meta = linker._layer_group_ranges(plan, group)
+                if meta is None:
+                    continue
+                for sizes, offsets in zip(meta[1], meta[2]):
+                    span = max(o + s for o, s in zip(offsets, sizes)) - min(offsets)
+                    self.assertEqual(span, sum(sizes))
         linker._run_layer_wise_batch(0, plans, ready)
         linker.layer_done_counter.fail.assert_not_called()
         self.assertEqual(

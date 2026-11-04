@@ -458,14 +458,17 @@ def _mha_device_pool_entry(
             f"The direct external linker does not support the {layout!r} "
             "MHA KV cache layout."
         )
-    num_layers = len(pool.k_buffer)
+    # Each layer's K next to its V in the packed page object: a layer group is
+    # then one contiguous extent, so a staging medium (SSD) reads only that
+    # group instead of an extent spanning both halves of the object.
+    buffers = [buffer for pair in zip(pool.k_buffer, pool.v_buffer) for buffer in pair]
     return DevicePoolEntry(
         name=name,
         indices_from_pool=indices_from_pool or name,
         device_pool=pool,
-        components=[[*pool.k_buffer, *pool.v_buffer]],
+        components=[buffers],
         layer_mapping={
-            layer: (index, num_layers + index) for layer, index in layer_mapping.items()
+            layer: (2 * index, 2 * index + 1) for layer, index in layer_mapping.items()
         },
         page_size=page_size,
         # nhd leads with token slots; hnd and vectorized_5d lead with pages,

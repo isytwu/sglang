@@ -865,26 +865,31 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             group.sources, {PoolName.KV: PoolName.KV, PoolName.SWA: PoolName.SWA}
         )
         kv, swa = group.entry_map[PoolName.KV], group.entry_map[PoolName.SWA]
-        self.assertEqual(kv.layer_mapping, {1: (0, 2), 5: (1, 3)})
+        self.assertEqual(kv.layer_mapping, {1: (0, 1), 5: (2, 3)})
         self.assertEqual(
             swa.layer_mapping,
-            {0: (0, 6), 2: (1, 7), 3: (2, 8), 4: (3, 9), 6: (4, 10), 7: (5, 11)},
+            {0: (0, 1), 2: (2, 3), 3: (4, 5), 4: (6, 7), 6: (8, 9), 7: (10, 11)},
         )
         # Token-slot rows: page 2 of the pool starts at slot 4.
         locations = kv.prepare_locations(torch.tensor([4, 5]))
         self.assertEqual(locations, [4])
         pointers, sizes, offsets = kv.get_prepared_layer_range_meta(locations, 5)
-        k1, v1 = kv.components[0][1], kv.components[0][3]
+        k1, v1 = kv.components[0][2], kv.components[0][3]
         self.assertEqual(pointers, [[k1[4].data_ptr(), v1[4].data_ptr()]])
-        # One packed object: k0 k1 v0 v1 at 6 bytes per K page, 8 per V page.
+        # One packed object: k0 v0 k1 v1 at 6 bytes per K page, 8 per V page.
         self.assertEqual(sizes, [[6, 8]])
-        self.assertEqual(offsets, [[6, 20]])
+        self.assertEqual(offsets, [[14, 20]])
         self.assertIsNone(kv.get_prepared_layer_range_meta(locations, 0))
-        # SWA layer 7 is the sixth SWA buffer: k5 after five K pages, v5 after
-        # all six K pages and five V pages.
+        # SWA layer 7 is the sixth SWA layer: its K after five K/V pairs.
         _, sizes, offsets = swa.get_prepared_layer_range_meta(locations, 7)
         self.assertEqual(sizes, [[6, 8]])
-        self.assertEqual(offsets, [[30, 76]])
+        self.assertEqual(offsets, [[70, 76]])
+        # Consecutive layers abut, so a layer group is one contiguous extent.
+        end = 0
+        for layer in _MUSE_SWA_LAYERS:
+            _, sizes, offsets = swa.get_prepared_layer_range_meta(locations, layer)
+            self.assertEqual(offsets[0], [end, end + sizes[0][0]])
+            end += sum(sizes[0])
 
     def test_mha_swa_page_major_layouts_address_pages(self):
         for layout in ("hnd", "vectorized_5d"):
@@ -896,10 +901,10 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 pointers, sizes, offsets = swa.get_prepared_layer_range_meta(
                     locations, 2
                 )
-                k1, v1 = swa.components[0][1], swa.components[0][7]
+                k1, v1 = swa.components[0][2], swa.components[0][3]
                 self.assertEqual(pointers, [[k1[2].data_ptr(), v1[2].data_ptr()]])
                 self.assertEqual(sizes, [[6, 8]])
-                self.assertEqual(offsets, [[6, 44]])
+                self.assertEqual(offsets, [[14, 20]])
 
     def test_mha_swa_rejects_unsupported_pools(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
