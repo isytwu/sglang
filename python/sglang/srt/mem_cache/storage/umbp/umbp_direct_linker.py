@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -147,6 +148,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
+        # Get calls in flight per layer group. One call's argument conversion,
+        # wire time, lookup and copy run back to back; several overlap them.
+        load_parallel = max(1, int(os.getenv("UMBP_LOAD_PARALLEL", "1")))
+        self._load_pool = (
+            ThreadPoolExecutor(load_parallel, thread_name_prefix="umbp-load")
+            if load_parallel > 1
+            else None
+        )
         # Coalesce queued offload tasks up to this many pages; offload_nodes
         # queues one task per node, so they arrive a page or two at a time.
         self._offload_coalesce_pages = max(
@@ -817,31 +826,25 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         sum(entry) for entry in sizes[: plan.entries_per_page]
                     ) * (len(plan.keys) // plan.entries_per_page)
                     step = self._entries_per_call(sizes)
-                    for start in range(0, len(plan.keys), step):
-                        end = start + step
-                        chunk_keys = plan.keys[start:end]
-                        called = time.perf_counter()
-                        results = list(
-                            self.storage.client.batch_get_ranges_into_ptr(
-                                chunk_keys,
-                                ptrs[start:end],
-                                sizes[start:end],
-                                offsets[start:end],
+                    starts = range(0, len(plan.keys), step)
+                    called = time.perf_counter()
+                    if self._load_pool is None or len(starts) == 1:
+                        for start in starts:
+                            self._get_chunk(plan, group, meta, start, start + step)
+                    else:
+                        futures = [
+                            self._load_pool.submit(
+                                self._get_chunk, plan, group, meta, start, start + step
                             )
-                        )
-                        stats["load_get_s"] += time.perf_counter() - called
-                        stats["load_calls"] += 1
-                        if len(results) != len(chunk_keys) or not all(results):
-                            where = (
-                                f"layer={group[0]}"
-                                if len(group) == 1
-                                else f"layers={group[0]}..{group[-1]}"
-                            )
-                            raise RuntimeError(
-                                f"UMBP get failed for pool={plan.name}, {where}: "
-                                f"success={sum(bool(value) for value in results)}/"
-                                f"{len(chunk_keys)}."
-                            )
+                            for start in starts
+                        ]
+                        # Every call has to land before a failure is raised:
+                        # one still running would keep writing the pages.
+                        wait(futures)
+                        for future in futures:
+                            future.result()
+                    stats["load_get_s"] += time.perf_counter() - called
+                    stats["load_calls"] += len(starts)
                 # Only now is every layer in the group readable, so they are
                 # released together. A group wider than 1 trades overlap
                 # granularity for fewer times each object is named on the wire.
@@ -854,6 +857,25 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
+
+    def _get_chunk(
+        self, plan: _PoolRangePlan, group: list[int], meta, start: int, end: int
+    ) -> None:
+        ptrs, sizes, offsets = meta
+        chunk_keys = plan.keys[start:end]
+        results = list(
+            self.storage.client.batch_get_ranges_into_ptr(
+                chunk_keys, ptrs[start:end], sizes[start:end], offsets[start:end]
+            )
+        )
+        if len(results) != len(chunk_keys) or not all(results):
+            where = (
+                f"layer={group[0]}" if len(group) == 1 else f"layers={group[0]}..{group[-1]}"
+            )
+            raise RuntimeError(
+                f"UMBP get failed for pool={plan.name}, {where}: "
+                f"success={sum(bool(value) for value in results)}/{len(chunk_keys)}."
+            )
 
     def _layer_groups(self) -> list[list[int]]:
         return [
@@ -1028,6 +1050,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if thread.is_alive():
                 queue.put(None)
                 thread.join()
+        if self._load_pool is not None:
+            self._load_pool.shutdown(wait=True)
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until

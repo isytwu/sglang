@@ -3,12 +3,14 @@
 import ctypes
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
 import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -281,11 +283,24 @@ class TestFullSwaRoundTrip(CustomTestCase):
         linker._stats = Counter()
         linker._pending = {}
         linker._async_offload_index_snapshot = False
+        linker._load_pool = None
         return linker
 
     def test_full_kv_and_swa_window_round_trip(self):
+        self._round_trip(load_pool=None)
+
+    def test_parallel_get_calls_round_trip(self):
+        # One object per call, so every layer group's calls run side by side.
+        with ThreadPoolExecutor(3) as pool, mock.patch.object(
+            umbp_direct_linker, "RANGES_PER_CALL", 2
+        ):
+            linker = self._round_trip(load_pool=pool)
+        self.assertGreater(linker._stats["load_calls"], len(linker._layer_groups()) * 2)
+
+    def _round_trip(self, load_pool):
         group = self._group(page_size=2, full_pages=8, swa_pages=4)
         linker = self._linker(group)
+        linker._load_pool = load_pool
         ready = SimpleNamespace(synchronize=lambda: None)
         keys = [f"page{i}" for i in range(3)]
         # Full pages 1-3 hold the 3-page prefix; SWA pages 0 and 2 hold its
@@ -373,6 +388,7 @@ class TestFullSwaRoundTrip(CustomTestCase):
             [buffer[[2, 3, 6, 7]] for buffer in swa.components[0]], before_swa
         ):
             self.assertTrue(torch.equal(got, want))
+        return linker
 
 
 if __name__ == "__main__":
