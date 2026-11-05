@@ -38,6 +38,8 @@ def _mha_pool(layers, k_shape, v_shape, *, page_size=2, layout="nhd"):
     pool.k_scale_buffer = pool.native_k_scale_buffer = None
     pool.k_buffer = [torch.zeros(k_shape, dtype=torch.uint8) for _ in range(layers)]
     pool.v_buffer = [torch.zeros(v_shape, dtype=torch.uint8) for _ in range(layers)]
+    pool.layer_num = layers
+    pool.size = k_shape[0] * (1 if layout == "nhd" else page_size)
     return pool
 
 
@@ -846,7 +848,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
         kvcache = _swa_kv_pool(full, swa, _MUSE_FULL_LAYERS, _MUSE_SWA_LAYERS)
         params = SimpleNamespace(
-            mtp_draft_device_pools=overrides.pop("mtp_draft_device_pools", ())
+            mtp_draft_device_pools=overrides.pop("mtp_draft_device_pools", ()),
+            sidecar_draft_device_pools=overrides.pop("sidecar_draft_device_pools", ()),
         )
         assert not overrides, overrides
         return resolve_hybrid_device_pool_group(
@@ -930,6 +933,63 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             with self.subTest(error=error):
                 with self.assertRaisesRegex(ValueError, error):
                     self._swa_group(**overrides)
+
+    @staticmethod
+    def _draft_pool(layers=2, *, on_swa_ids=True, page_size=2, rows=8):
+        pool = _mha_pool(layers, (rows, 5), (rows, 5), page_size=page_size)
+        pool.follows_target_swa_ids = on_swa_ids
+        return pool
+
+    def test_mha_swa_stores_draft_kv_on_swa_ids(self):
+        draft = self._draft_pool()
+        group = self._swa_group(sidecar_draft_device_pools=(draft,))
+
+        # Draft layers ride with target layers 0 and 1: the range is unchanged.
+        self.assertEqual(group.num_layers, 8)
+        self.assertEqual(group.sources[PoolName.DRAFT_SWA], PoolName.SWA)
+        entry = group.entry_map[PoolName.DRAFT_SWA]
+        self.assertIs(entry.device_pool, draft)
+        self.assertEqual(entry.layer_mapping, {0: (0, 1), 1: (2, 3)})
+        locations = entry.prepare_locations(torch.tensor([4, 5]))
+        pointers, sizes, offsets = entry.get_prepared_layer_range_meta(locations, 1)
+        self.assertEqual(
+            pointers,
+            [[draft.k_buffer[1][4].data_ptr(), draft.v_buffer[1][4].data_ptr()]],
+        )
+        self.assertEqual(sizes, [[10, 10]])
+        self.assertEqual(offsets, [[20, 30]])
+
+        # The draft rides on the SWA transfer: same keys, ids and hit policy.
+        kv = PoolTransfer(
+            name=PoolName.KV, keys=["a", "b"], device_indices=torch.arange(4)
+        )
+        swa = PoolTransfer(
+            name=PoolName.SWA,
+            keys=["b"],
+            device_indices=torch.tensor([6, 7]),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        resolved = {item.name: item for item in group.resolve_transfers([kv, swa])}
+        self.assertEqual(set(resolved), {PoolName.KV, PoolName.SWA, PoolName.DRAFT_SWA})
+        draft_transfer = resolved[PoolName.DRAFT_SWA]
+        self.assertEqual(draft_transfer.keys, ["b"])
+        self.assertEqual(draft_transfer.host_indices.tolist(), [6, 7])
+        self.assertEqual(draft_transfer.hit_policy, PoolHitPolicy.TRAILING_PAGES)
+
+    def test_mha_swa_stores_draft_kv_on_full_ids_with_the_kv(self):
+        draft = self._draft_pool(on_swa_ids=False)
+        group = self._swa_group(sidecar_draft_device_pools=(draft,))
+        self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
+        self.assertNotIn(PoolName.DRAFT_SWA, group.entry_map)
+
+    def test_mha_swa_rejects_unsupported_draft_kv(self):
+        for draft, error in (
+            (self._draft_pool(page_size=4), "Draft KV page size must match"),
+            (self._draft_pool(rows=6), "target SWA pool at most its size"),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(ValueError, error):
+                    self._swa_group(sidecar_draft_device_pools=(draft,))
 
     def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec

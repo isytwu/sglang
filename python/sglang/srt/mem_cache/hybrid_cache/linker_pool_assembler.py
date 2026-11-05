@@ -551,6 +551,7 @@ def _build_swa_device_pool_group(
         _mha_device_pool_entry(
             PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
         ),
+        *_sidecar_draft_entries(params, page_size, swa_pool=kvcache.swa_kv_pool),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the KV heads are TP-sharded.
@@ -626,20 +627,30 @@ def _build_mamba_device_pool_group(
     return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 
-def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]:
+def _sidecar_draft_entries(
+    params: Any, page_size: int, swa_pool: Any = None
+) -> list[DevicePoolEntry]:
     entries = []
     for draft_pool in params.sidecar_draft_device_pools:
         if draft_pool.page_size != page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
+        # A draft pool on the target's SWA ids (DFlash) holds only the SWA
+        # window, so it rides the SWA transfers: their keys, ids and hit policy.
+        on_swa_ids = getattr(draft_pool, "follows_target_swa_ids", False)
+        if on_swa_ids and (swa_pool is None or draft_pool.size < swa_pool.size):
+            raise ValueError(
+                "A draft KV pool on the target's SWA ids needs a target SWA "
+                "pool at most its size."
+            )
         # Draft layer i rides transfer layer i; the draft reads it only after
         # the batch's loads finish.
         entries.append(
             _mha_device_pool_entry(
-                PoolName.DRAFT,
+                PoolName.DRAFT_SWA if on_swa_ids else PoolName.DRAFT,
                 draft_pool,
                 {layer: layer for layer in range(draft_pool.layer_num)},
                 page_size,
-                indices_from_pool=PoolName.KV,
+                indices_from_pool=PoolName.SWA if on_swa_ids else PoolName.KV,
             )
         )
     return entries
@@ -717,8 +728,8 @@ def resolve_hybrid_device_pool_group(
         params=params,
         page_size=page_size,
     )
-    if getattr(params, "sidecar_draft_device_pools", ()) and (
-        PoolName.DRAFT not in group.entry_map
+    if getattr(params, "sidecar_draft_device_pools", ()) and not (
+        {PoolName.DRAFT, PoolName.DRAFT_SWA} & group.entry_map.keys()
     ):
         raise ValueError(
             "The direct external linker does not support this model's draft KV."

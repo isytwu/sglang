@@ -233,7 +233,7 @@ class TestFullSwaRoundTrip(CustomTestCase):
     trailing window, so a restore needs just those pages from it.
     """
 
-    def _group(self, page_size, full_pages, swa_pages):
+    def _group(self, page_size, full_pages, swa_pages, draft_layers=0):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
@@ -249,6 +249,7 @@ class TestFullSwaRoundTrip(CustomTestCase):
                 torch.randint(0, 256, (pages * page_size, 2, 5), dtype=torch.uint8)
                 for _ in range(layers)
             ]
+            mha.size, mha.layer_num = pages * page_size, layers
             return mha
 
         kvcache = SWAKVPool.__new__(SWAKVPool)
@@ -259,8 +260,18 @@ class TestFullSwaRoundTrip(CustomTestCase):
             **{layer: (index, False) for index, layer in enumerate([1, 5])},
             **{layer: (index, True) for index, layer in enumerate([0, 2, 3, 4, 6, 7])},
         }
+        drafts = ()
+        if draft_layers:
+            # DFlash: the draft KV rows are the target's SWA ids.
+            draft = pool(draft_layers, swa_pages)
+            draft.follows_target_swa_ids = True
+            drafts = (draft,)
         return linker_pool_assembler._build_swa_device_pool_group(
-            kvcache, SimpleNamespace(mtp_draft_device_pools=()), page_size
+            kvcache,
+            SimpleNamespace(
+                mtp_draft_device_pools=(), sidecar_draft_device_pools=drafts
+            ),
+            page_size,
         )
 
     def _linker(self, group):
@@ -291,14 +302,39 @@ class TestFullSwaRoundTrip(CustomTestCase):
 
     def test_parallel_get_calls_round_trip(self):
         # One object per call, so every layer group's calls run side by side.
-        with ThreadPoolExecutor(3) as pool, mock.patch.object(
-            umbp_direct_linker, "RANGES_PER_CALL", 2
+        with (
+            ThreadPoolExecutor(3) as pool,
+            mock.patch.object(umbp_direct_linker, "RANGES_PER_CALL", 2),
         ):
             linker = self._round_trip(load_pool=pool)
         self.assertGreater(linker._stats["load_calls"], len(linker._layer_groups()) * 2)
 
-    def _round_trip(self, load_pool):
-        group = self._group(page_size=2, full_pages=8, swa_pages=4)
+    def test_draft_kv_rides_on_the_swa_window(self):
+        linker = self._round_trip(load_pool=None, draft_layers=2)
+        # A missing draft page gates the hit like a missing SWA page would:
+        # restoring the target without its draft KV is not a hit.
+        del linker.storage.client.objects[f"page2_tp3_cp0_pp0_{PoolName.DRAFT_SWA}"]
+        self.assertEqual(self._lookup(linker, 3, 2), [])
+
+    @staticmethod
+    def _lookup(linker, num_pages, window):
+        keys = [f"page{i}" for i in range(3)]
+        return linker.lookup(
+            "rid",
+            [
+                PoolTransfer(name=PoolName.KV, keys=keys[:num_pages]),
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=keys[max(0, num_pages - window) : num_pages],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ],
+        )
+
+    def _round_trip(self, load_pool, draft_layers=0):
+        group = self._group(
+            page_size=2, full_pages=8, swa_pages=4, draft_layers=draft_layers
+        )
         linker = self._linker(group)
         linker._load_pool = load_pool
         ready = SimpleNamespace(synchronize=lambda: None)
@@ -320,34 +356,30 @@ class TestFullSwaRoundTrip(CustomTestCase):
         ]
         expanded = group.resolve_transfers(offload, allow_partial=True)
         self.assertTrue(linker._run_offload([(expanded, ready)]))
+        window_pools = [PoolName.SWA] + ([PoolName.DRAFT_SWA] if draft_layers else [])
         self.assertEqual(
             sorted(linker.storage.client.objects),
             sorted(
                 [f"{key}_tp3_cp0_pp0_{PoolName.KV}" for key in keys]
-                + [f"{key}_tp3_cp0_pp0_{PoolName.SWA}" for key in keys[1:]]
+                + [
+                    f"{key}_tp3_cp0_pp0_{name}"
+                    for key in keys[1:]
+                    for name in window_pools
+                ]
             ),
         )
 
-        def lookup(num_pages, window):
-            return linker.lookup(
-                "rid",
-                [
-                    PoolTransfer(name=PoolName.KV, keys=keys[:num_pages]),
-                    PoolTransfer(
-                        name=PoolName.SWA,
-                        keys=keys[max(0, num_pages - window) : num_pages],
-                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
-                    ),
-                ],
-            )
-
-        self.assertEqual(lookup(3, 2), [3])
+        self.assertEqual(self._lookup(linker, 3, 2), [3])
         # A 2-page prefix's window starts at page 0, whose SWA was never stored.
-        self.assertEqual(lookup(2, 2), [])
+        self.assertEqual(self._lookup(linker, 2, 2), [])
 
-        kv, swa = group.entry_map[PoolName.KV], group.entry_map[PoolName.SWA]
+        kv = group.entry_map[PoolName.KV]
+        windowed = [group.entry_map[name] for name in window_pools]
         before_kv = [buffer[2:8].clone() for buffer in kv.components[0]]
-        before_swa = [buffer[[0, 1, 4, 5]].clone() for buffer in swa.components[0]]
+        before_windowed = [
+            [buffer[[0, 1, 4, 5]].clone() for buffer in entry.components[0]]
+            for entry in windowed
+        ]
         load = [
             PoolTransfer(
                 name=PoolName.KV,
@@ -384,10 +416,11 @@ class TestFullSwaRoundTrip(CustomTestCase):
 
         for got, want in zip([buffer[10:16] for buffer in kv.components[0]], before_kv):
             self.assertTrue(torch.equal(got, want))
-        for got, want in zip(
-            [buffer[[2, 3, 6, 7]] for buffer in swa.components[0]], before_swa
-        ):
-            self.assertTrue(torch.equal(got, want))
+        for entry, before in zip(windowed, before_windowed):
+            for got, want in zip(
+                [buffer[[2, 3, 6, 7]] for buffer in entry.components[0]], before
+            ):
+                self.assertTrue(torch.equal(got, want))
         return linker
 
 
