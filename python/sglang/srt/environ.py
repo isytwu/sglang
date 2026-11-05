@@ -673,6 +673,11 @@ class Envs:
     SGLANG_ENABLE_WAITING_PREFIX_REFRESH = EnvBool(True)
     # PD prefill: bootstrap-queued requests each refresh also touches; 0 skips them.
     SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX = EnvInt(512)
+    # shortest-prefill-first also charges this many tokens per token of a
+    # request's context: its decode steps cost in proportion to the context they
+    # attend over, which the uncached prefill alone does not show. 0 sorts by the
+    # uncached prefill only.
+    SGLANG_SPF_CONTEXT_WEIGHT = EnvFloat(0.0)
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)

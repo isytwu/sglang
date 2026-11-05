@@ -409,10 +409,12 @@ class SchedulePolicy:
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
+        context_weight = envs.SGLANG_SPF_CONTEXT_WEIGHT.get()
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                SchedulePolicy._shortest_prefill_work(r),
+                SchedulePolicy._shortest_prefill_work(r)
+                + context_weight * (len(r.origin_input_ids) + len(r.output_ids)),
                 r.time_stats.wait_queue_entry_time,
             )
         )

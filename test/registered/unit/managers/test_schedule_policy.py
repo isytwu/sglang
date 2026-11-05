@@ -2,6 +2,7 @@ import unittest
 from array import array
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -168,6 +169,18 @@ class TestShortestPrefillFirst(CustomTestCase):
         ):
             self.policy.calc_priority(queue)
         self.assertEqual(queue, [other, duplicate])
+
+    def test_context_weight_charges_the_whole_context(self):
+        # A long context restored almost whole still decodes over all of it, so
+        # with a context weight a shorter context goes first despite a slightly
+        # longer uncached prefill.
+        restored = self.make_req("restored", 3000, cached=97700)
+        short = self.make_req("short", 3400, cached=58600)
+        for weight, first in ((0.0, "restored"), (0.1, "short")):
+            queue = [restored, short]
+            with envs.SGLANG_SPF_CONTEXT_WEIGHT.override(weight):
+                self.policy._sort_by_shortest_prefill(queue, set())
+            self.assertEqual(queue[0].rid, first)
 
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
