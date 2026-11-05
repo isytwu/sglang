@@ -253,6 +253,24 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _SortLookup(NamedTuple):
+    """A request's last external lookup, for the waiting-queue sort to reuse."""
+
+    device_hit_len: int
+    num_pages: int
+    hit_pages: int
+    tail_hashes: list[str]
+    swa_host_hit_length: int
+    mamba_host_hit_length: int
+    reuses: int
+
+
+# A waiting-queue sort answers from a request's last lookup at most this many
+# times in a row before probing the store again, so a hit that grows while the
+# request waits is seen within a few rounds. Admission always probes.
+_SORT_LOOKUP_REUSES = 4
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -283,6 +301,10 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # rid -> its last lookup while it waits. Every rank sorts the same queue
+        # with the same device hits, so all reuse (and skip the reduction in
+        # _sync_restorable_prefix) together.
+        self.sort_lookups: dict[str, _SortLookup] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -306,49 +328,49 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
-    def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+    def match(
+        self,
+        key: RadixKey,
+        req: Req,
+        result: MatchResult,
+        *,
+        reuse_lookup: bool = False,
+    ) -> MatchResult:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if not reuse_lookup:
+            # A match outside the sort (admission) ends the request's wait.
+            self.sort_lookups.pop(req.rid, None)
         if device_hit_len >= len(key):
             return result
 
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
-        if not tail_hashes:
-            return result
-
-        lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
-            if transfer is None:
+        num_pages = (len(key) - device_hit_len) // page
+        last = self.sort_lookups.get(req.rid) if reuse_lookup else None
+        if (
+            last is not None
+            and last.device_hit_len == device_hit_len
+            and last.num_pages == num_pages
+            and last.reuses < _SORT_LOOKUP_REUSES
+        ):
+            self.sort_lookups[req.rid] = last._replace(reuses=last.reuses + 1)
+            found = last
+        else:
+            found = self._lookup(key, req, result, device_hit_len, num_pages)
+            if found is None:
                 return result
-            lookup_transfers.append(transfer)
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
-
-        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+            if reuse_lookup:
+                self.sort_lookups[req.rid] = found
+        hit_pages = found.hit_pages
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
-
-        swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
-        # Mamba keeps a single state slot per node, so a hit is worth one slot.
-        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+        swa_host_hit_length = found.swa_host_hit_length
+        mamba_host_hit_length = found.mamba_host_hit_length
 
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
-            tail_hashes=list(tail_hashes[:hit_pages]),
+            tail_hashes=list(found.tail_hashes),
             device_hit_len=device_hit_len,
         )
         return result._replace(
@@ -358,6 +380,52 @@ class UnifiedCacheLinkerWrapper:
             mamba_host_hit_length=max(
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
+        )
+
+    def _lookup(
+        self,
+        key: RadixKey,
+        req: Req,
+        result: MatchResult,
+        device_hit_len: int,
+        num_pages: int,
+    ) -> Optional[_SortLookup]:
+        """Probe the store for the device-uncached tail; None if it cannot be."""
+        tail_hashes = self._tail_hashes(key, result, device_hit_len)
+        if not tail_hashes:
+            return None
+
+        lookup_transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, tail_hashes
+            )
+            if transfer is None:
+                return None
+            lookup_transfers.append(transfer)
+        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+
+        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        hit_pages = self._sync_restorable_prefix(
+            self.cache_linker.lookup(req.rid, lookup_transfers),
+            num_pages=len(tail_hashes),
+            device_hit_pages=0,
+        )
+        page = self.cache.page_size
+        swa_transfer = by_pool.get(PoolName.SWA)
+        return _SortLookup(
+            device_hit_len=device_hit_len,
+            num_pages=num_pages,
+            hit_pages=hit_pages,
+            tail_hashes=tail_hashes[:hit_pages],
+            swa_host_hit_length=(
+                min(len(swa_transfer.keys), hit_pages) * page
+                if swa_transfer is not None
+                else 0
+            ),
+            # Mamba keeps a single state slot per node, so a hit is worth one slot.
+            mamba_host_hit_length=1 if PoolName.MAMBA in by_pool else 0,
+            reuses=0,
         )
 
     def _sync_restorable_prefix(
@@ -412,6 +480,7 @@ class UnifiedCacheLinkerWrapper:
         the load.
         """
         cache = self.cache
+        self.sort_lookups.pop(req.rid, None)
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
@@ -652,6 +721,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self.sort_lookups.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -667,6 +737,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.sort_lookups.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

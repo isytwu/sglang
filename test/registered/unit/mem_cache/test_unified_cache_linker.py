@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    _SORT_LOOKUP_REUSES,
     ExternalCacheHitMarker,
     LayerWiseLoadCounter,
     TransferReady,
@@ -457,6 +458,43 @@ class TestUnifiedCacheLinkerPythonBackend(
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         consumer.sanity_check()
+
+    def test_waiting_queue_sort_reuses_the_last_lookup(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 9))
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+        req = self._make_req(consumer_req_pool)
+        key = RadixKey(array("q", tokens))
+
+        def sort_match():
+            return consumer.match_prefix(
+                MatchPrefixParams(key=key, req=req, reuse_external_lookup=True)
+            )
+
+        # The sort probes once, then answers from that lookup a few times.
+        for _ in range(1 + _SORT_LOOKUP_REUSES):
+            self.assertEqual(sort_match().host_hit_length, len(tokens))
+        self.assertEqual(len(consumer_linker.lookup_calls), 1)
+        self.assertEqual(sort_match().host_hit_length, len(tokens))
+        self.assertEqual(len(consumer_linker.lookup_calls), 2)
+        # Admission always probes, and ends the request's reuse.
+        match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, len(tokens))
+        self.assertEqual(len(consumer_linker.lookup_calls), 3)
+        self.assertNotIn(req.rid, consumer.linker.sort_lookups)
+        sort_match()
+        self.assertEqual(len(consumer_linker.lookup_calls), 4)
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(

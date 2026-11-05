@@ -74,6 +74,10 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # The caller only ranks requests (the waiting-queue sort), so an external
+    # cache linker may answer from its last lookup for the same request.
+    reuse_external_lookup: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:

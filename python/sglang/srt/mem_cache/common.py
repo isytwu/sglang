@@ -257,6 +257,7 @@ def match_kv_cache(
     *,
     cow_mamba: bool = False,
     max_prefix_len: Optional[int] = None,
+    reuse_external_lookup: bool = False,
 ) -> MatchResult:
     """Match token_ids against tree_cache and adopt the hit as req's prefix."""
     if token_ids is None:
@@ -267,6 +268,7 @@ def match_kv_cache(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
             req=req,
+            reuse_external_lookup=reuse_external_lookup,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
