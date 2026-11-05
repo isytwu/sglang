@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -40,6 +41,8 @@ class DevicePoolEntry:
         self.layer_mapping = layer_mapping
         self.page_size = page_size
         self.packed = packed
+        # Maps tree slots to this pool's rows; a slot it cannot place maps to
+        # -1, which the row check rejects.
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
@@ -167,15 +170,21 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
+        dcp_shard: tuple[int, int] | None = None,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
         if len(self.entries) != len(self.entry_map):
             raise ValueError("DevicePoolGroup contains duplicate pool names.")
+        if rank_replicated and dcp_shard is not None:
+            raise ValueError("A DCP-sharded group's ranks hold different pages.")
         self.sources = {entry.name: entry.indices_from_pool for entry in self.entries}
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
+        # (DCP rank, DCP size) of a group whose KV DCP shards, so that what a
+        # rank stores depends on both.
+        self.dcp_shard = dcp_shard
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -508,6 +517,31 @@ def _mamba_device_pool_entry(state: Any, start_layer: int) -> DevicePoolEntry:
     )
 
 
+def _dcp_row_mapper(
+    page_size: int, dcp_size: int, dcp_rank: int
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Map DCP-widened slots to this rank's rows, ``page_size`` per tree page.
+
+    Slots that do not form whole aligned widened pages map to -1. A misaligned
+    widened page can still yield rows that look aligned on this rank, so the
+    entry's own alignment check cannot be relied on.
+    """
+    span = page_size * dcp_size
+
+    def to_rows(indices: torch.Tensor) -> torch.Tensor:
+        if indices.numel() % span:
+            return torch.full_like(indices, -1)
+        pages = indices.reshape(-1, span)
+        expected = pages[:, :1] // span * span + torch.arange(
+            span, device=indices.device
+        )
+        bad = (pages != expected).any(dim=1, keepdim=True)
+        rows = maybe_dcp_kernel_indices(indices, dcp_size, dcp_rank)
+        return torch.where(bad, -1, rows.reshape(-1, page_size)).flatten()
+
+    return to_rows
+
+
 def _build_mamba_swa_device_pool_group(
     kvcache: Any, params: Any, page_size: int
 ) -> DevicePoolGroup:
@@ -542,18 +576,30 @@ def _build_mamba_device_pool_group(
         MLATokenToKVPool,
     )
 
-    # TODO(alphabetc1): support other full-attention pools, DCP and packed draft KV.
+    # TODO(alphabetc1): support other full-attention pools and packed draft KV.
     full_kv_pool = kvcache.full_kv_pool
     if (
         type(kvcache) is not HybridLinearKVPool
         or type(full_kv_pool) is not MLATokenToKVPool
-        or get_parallel().attn_dcp_size > 1
         or params.mtp_draft_device_pools
     ):
         raise ValueError(
             "The direct external linker supports FULL + MAMBA models only with a "
-            "plain MLA pool, without DCP or packed draft KV."
+            "plain MLA pool, without packed draft KV."
         )
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    if full_kv_pool.page_size * dcp_size != page_size:
+        raise ValueError(
+            "MLA KV page size x DCP size must match the tree page size: "
+            f"{full_kv_pool.page_size} x {dcp_size} != {page_size}."
+        )
+    dcp_shard = (parallel.attn_dcp_rank, dcp_size) if dcp_size > 1 else None
+    kv_index_mapper = (
+        _dcp_row_mapper(full_kv_pool.page_size, dcp_size, parallel.attn_dcp_rank)
+        if dcp_shard
+        else None
+    )
 
     entries = [
         DevicePoolEntry(
@@ -564,8 +610,9 @@ def _build_mamba_device_pool_group(
             layer_mapping=_stage_local_layer_mapping(
                 kvcache.full_attention_layer_id_mapping, kvcache.start_layer
             ),
-            page_size=page_size,
+            page_size=full_kv_pool.page_size,
             rows_are_pages=False,
+            index_mapper=kv_index_mapper,
         ),
         _mamba_device_pool_entry(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
@@ -574,7 +621,7 @@ def _build_mamba_device_pool_group(
     entries.extend(_sidecar_draft_entries(params, page_size))
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the Mamba state is TP-sharded.
-    return DevicePoolGroup(entries, num_layers + 1, page_size)
+    return DevicePoolGroup(entries, num_layers + 1, page_size, dcp_shard=dcp_shard)
 
 
 def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]:

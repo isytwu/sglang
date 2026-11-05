@@ -55,6 +55,23 @@ class TestStorageSuffix(CustomTestCase):
             _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=0),
         )
 
+    def test_dcp_shards_of_one_tree_page_name_their_own_objects(self):
+        # Pages of 1 at DCP4, 2 at DCP2 and 4 without DCP share a tree page,
+        # so a page hashes alike, but a rank holds different tokens of it.
+        suffixes = [
+            _storage_suffix(
+                rank_replicated=False,
+                tp_rank=rank,
+                attn_cp_rank=0,
+                pp_rank=0,
+                dcp_shard=(rank % dcp_size, dcp_size) if dcp_size > 1 else None,
+            )
+            for dcp_size in (1, 2, 4)
+            for rank in range(4)
+        ]
+        self.assertEqual(len(set(suffixes)), len(suffixes))
+        self.assertEqual(suffixes[-1], "tp3_dcp3of4_cp0_pp0")
+
 
 class TestPackedDraftRanges(CustomTestCase):
     def test_target_and_draft_share_a_transfer_layer(self):

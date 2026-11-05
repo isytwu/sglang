@@ -36,11 +36,21 @@ device_module = get_device_module()
 
 
 def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    dcp_shard: tuple[int, int] | None = None,
 ) -> str:
     parts = []
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
+    if dcp_shard is not None:
+        # A DCP rank holds every dcp_size-th token of a page, so what an object
+        # holds depends on both its rank and the DCP size.
+        dcp_rank, dcp_size = dcp_shard
+        parts.append(f"dcp{dcp_rank}of{dcp_size}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
 
@@ -108,6 +118,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank=tp_rank,
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
+            dcp_shard=self.pool_group.dcp_shard,
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
