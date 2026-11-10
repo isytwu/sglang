@@ -736,7 +736,18 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
-        return self.linker.skip_offload_prefix(len(skip_key))
+        end_limit = 0
+        if self.linker.skip_output_offload and req.finished():
+            # A later turn continues from this prompt, never from its output.
+            end_limit = len(
+                RadixKey(
+                    req.origin_input_ids,
+                    req.extra_key,
+                    is_bigram=self.tree_core.is_eagle,
+                    cache_salt=req.cache_salt,
+                ).page_aligned(self.page_size)
+            )
+        return self.linker.offload_window(len(skip_key), end_limit)
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -1600,6 +1611,8 @@ class UnifiedRadixCache(BasePrefixCache):
         try:
             with self._linker_offload_skip_prefix(req, token_ids):
                 result = self.insert(insert_params)
+                if self.linker is not None and not result.rotation_tail_declined:
+                    self.linker.offload_new_state(result.last_device_node)
         finally:
             if reuse_existing_mamba:
                 insert_params.allow_missing_mamba = False
@@ -4109,6 +4122,7 @@ class UnifiedRadixCache(BasePrefixCache):
         them."""
         if self.linker is None:
             return []
+        self.linker.touch_running(reqs)
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
         if failed:
