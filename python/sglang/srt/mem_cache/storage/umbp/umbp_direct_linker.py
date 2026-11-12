@@ -389,10 +389,20 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "touched": 0,
             "touch_failures": 0,
             "touch_dropped": 0,
+            # removed / remove_keys is how many objects asked to go were stored.
+            "remove_keys": 0,
+            "removed": 0,
+            "remove_failures": 0,
+            "remove_dropped": 0,
         }
         self._touch_queue: Queue[list[PoolTransfer] | None] = Queue(
             maxsize=_TOUCH_QUEUE_LIMIT
         )
+        self._remove_queue: Queue[list[PoolTransfer] | None] = Queue(
+            maxsize=_TOUCH_QUEUE_LIMIT
+        )
+        # A mori without BatchRemove keeps every object until it evicts it.
+        self.can_remove = hasattr(self.storage.client, "batch_remove")
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -408,11 +418,18 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             daemon=True,
             name=f"umbp-touch-tp{tp_rank}",
         )
+        self._remove_thread = threading.Thread(
+            target=self._remove_thread_func,
+            daemon=True,
+            name=f"umbp-remove-tp{tp_rank}",
+        )
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
         if self.touch_interval_s is not None:
             self._touch_thread.start()
+        if self.can_remove:
+            self._remove_thread.start()
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -1097,6 +1114,46 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._stats["touch_keys"] += len(keys)
 
+    def remove(self, transfers: list[PoolTransfer]) -> None:
+        """Drop stored objects the caller will never read again."""
+        try:
+            self._remove_queue.put_nowait(transfers)
+        except Full:
+            self._stats["remove_dropped"] += 1
+
+    def _remove_thread_func(self) -> None:
+        while True:
+            batch = [self._remove_queue.get()]
+            while True:
+                try:
+                    batch.append(self._remove_queue.get_nowait())
+                except Empty:
+                    break
+            try:
+                keys = []
+                for transfers in batch:
+                    if transfers is None:
+                        continue
+                    for transfer in self.pool_group.resolve_transfers(
+                        transfers, allow_partial=True, allow_missing_kv=True
+                    ):
+                        object_keys, _ = self._object_keys_for_pages(
+                            list(transfer.keys), transfer
+                        )
+                        keys.extend(object_keys)
+                if keys:
+                    self._stats["removed"] += self.storage.client.batch_remove(keys)
+                    self._stats["remove_keys"] += len(keys)
+            except Exception:
+                self._stats["remove_failures"] += 1
+                failures = self._stats["remove_failures"]
+                if failures == 1 or failures % 1000 == 0:
+                    logger.warning(
+                        "UMBP remove failed (%d so far)", failures, exc_info=True
+                    )
+            if None in batch:
+                return
+
     def reset(self) -> None:
         self._pending.clear()
         self._load_queue.join()
@@ -1120,6 +1177,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 break
         for thread, queue in (
             (self._touch_thread, self._touch_queue),
+            (self._remove_thread, self._remove_queue),
             (self._offload_thread, self._offload_queue),
             (self._load_thread, self._load_queue),
         ):

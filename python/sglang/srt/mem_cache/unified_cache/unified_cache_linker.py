@@ -367,6 +367,24 @@ class UnifiedCacheLinkerWrapper:
         # point, a recompute of an evicted state) would never get there.
         self._offload_states = ComponentType.MAMBA in cache.components
         self._state_offloaded: dict[NodeId, int] = {}
+        # A turn restores from the state its previous turn left at the deepest
+        # point of the path, or from the one before when its prompt rewrote the
+        # previous turn's tail; older states on a path only take store capacity
+        # from prefixes still to be read. Once a state lands, the second state
+        # above it on its path goes, unless more than one branch below that
+        # state offloaded a state of its own (subagents forked there).
+        # Node -> the store keys of its offloaded state; that state -> the
+        # children its offloading branches leave it by; pending state offload
+        # -> the state it replaces once it lands.
+        self._drop_replaced_states = (
+            self._offload_states
+            and os.environ.get("SGLANG_LINKER_DROP_REPLACED_STATE") == "1"
+            and getattr(cache_linker, "can_remove", False)
+        )
+        self._state_keys: dict[NodeId, list[str]] = {}
+        self._state_keys_limit = 200_000
+        self._state_branches: dict[NodeId, set[NodeId]] = {}
+        self._replaces: dict[NodeId, tuple[NodeId, list[str]]] = {}
         # Radix-key end past which an insert offloads nothing; 0 is no limit.
         # Set for finished requests when their output is never reused.
         self.offload_end_limit = 0
@@ -378,6 +396,7 @@ class UnifiedCacheLinkerWrapper:
             "state_only_failed": 0,
             "output_trimmed": 0,
             "output_skipped": 0,
+            "state_dropped": 0,
         }
         # Lookups restoring under half of a long tail are logged once per
         # request and shape, with the store's per-pool verdict.
@@ -957,6 +976,7 @@ class UnifiedCacheLinkerWrapper:
                 state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
                 if state is not None:
                     self._state_offloaded[node_id] = _slot_of(state.device_indices)
+                    self._note_state_offload(node_id, state.keys, droppable=True)
 
     def offload_new_state(self, node_id: NodeId) -> None:
         """Offload the Mamba state an insert left on ``node_id`` when the
@@ -998,10 +1018,62 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             return
         self._state_offloaded[node_id] = slot
+        self._note_state_offload(node_id, transfer.keys, droppable=False)
         self.offload_stats["state_only"] += 1
         self.pending_offloads.append(
             _PendingOffload(node_id, lock_params, [], state_only=True)
         )
+
+    def _note_state_offload(
+        self, node_id: NodeId, keys: Optional[list[str]], droppable: bool
+    ) -> None:
+        """Note the branch ``node_id`` leaves each droppable state above it by,
+        and the second of those states, which its state replaces once it lands.
+
+        Only a write-through state is droppable: the end of an inserted prompt
+        or prefill chunk, which the next turn of the same path goes past. A
+        state added to a stored node can be a branch point other paths still
+        restore from, so it replaces but is never dropped."""
+        if not self._drop_replaced_states or not keys:
+            return
+        (path,) = self.cache.tree_core.collect_path_info([node_id])
+        above = []
+        for index in range(len(path) - 2, -1, -1):
+            ancestor = path[index].node_id
+            if ancestor in self._state_keys:
+                self._state_branches.setdefault(ancestor, set()).add(
+                    path[index + 1].node_id
+                )
+                above.append(ancestor)
+        if len(above) > 1:
+            self._replaces[node_id] = (above[1], self._state_keys[above[1]])
+        if not droppable:
+            return
+        if len(self._state_keys) >= self._state_keys_limit:
+            oldest = next(iter(self._state_keys))
+            del self._state_keys[oldest]
+            self._state_branches.pop(oldest, None)
+        self._state_keys[node_id] = list(keys)
+
+    def _drop_state(self, node_id: NodeId, keys: list[str]) -> None:
+        # Not when the node offloaded its state again since, nor at a fork.
+        if self._state_keys.get(node_id) is not keys:
+            return
+        if len(self._state_branches.get(node_id, ())) > 1:
+            return
+        del self._state_keys[node_id]
+        self._state_branches.pop(node_id, None)
+        self._state_offloaded.pop(node_id, None)
+        self.cache_linker.remove(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=keys,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+        )
+        self.offload_stats["state_dropped"] += 1
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
@@ -1136,11 +1208,16 @@ class UnifiedCacheLinkerWrapper:
                 self.cache.tree_core.finish_external_linker_offload(
                     pending.publish_node_ids, pending.lock_node_id, success
                 )
+            replaced = self._replaces.pop(pending.lock_node_id, None)
             if not success:
                 # The state never landed; a later insert of the node retries it.
                 self._state_offloaded.pop(pending.lock_node_id, None)
+                self._state_keys.pop(pending.lock_node_id, None)
+                self._state_branches.pop(pending.lock_node_id, None)
                 if pending.state_only:
                     self.offload_stats["state_only_failed"] += 1
+            elif replaced is not None:
+                self._drop_state(*replaced)
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
@@ -1186,6 +1263,9 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self._touched.clear()
         self._state_offloaded.clear()
+        self._state_keys.clear()
+        self._state_branches.clear()
+        self._replaces.clear()
         self._logged_short.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
