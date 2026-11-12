@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
-from queue import Empty, Queue
-from typing import Any, Callable
+from queue import Empty, Full, Queue
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -42,6 +42,11 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+# Pending removals beyond this are dropped: the store has stopped answering.
+_REMOVE_QUEUE_LIMIT = 1024
+# Landed states remembered for keep_states_per_path; the oldest are forgotten
+# (and left to the store's own eviction) past this.
+_KEPT_STATES_LIMIT = 200_000
 
 
 def _storage_suffix(
@@ -196,6 +201,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
         extra_config = dict(extra_config or {})
+        # Mamba states one radix path keeps here once deeper ones land; 0 keeps
+        # every state until the store evicts it. A state is as large as dozens
+        # of KV pages, and a later turn restores from its path's deepest ones.
+        keep_states = extra_config.pop("keep_states_per_path", 0)
+        if isinstance(keep_states, bool) or not isinstance(keep_states, int):
+            raise ValueError(
+                "UMBP linker config 'keep_states_per_path' must be an integer, "
+                f"got {keep_states!r}."
+            )
+        if keep_states < 0:
+            raise ValueError(
+                f"UMBP linker config 'keep_states_per_path' must be >= 0, got {keep_states}."
+            )
+        self._keep_states = keep_states
+        self.tracks_state_paths = False
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -297,6 +317,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     "(both scratch arenas must be non-zero), and note that a "
                     "read-only SharedSSDFollower is whole-object by design."
                 )
+            if keep_states:
+                if callable(getattr(client, "batch_remove", None)):
+                    self.tracks_state_paths = True
+                else:
+                    logger.warning(
+                        "UMBP keep_states_per_path is ignored: this mori client has "
+                        "no batch_remove."
+                    )
             get_backend_mode = getattr(client, "get_backend_mode", None)
             self.backend_mode = (
                 get_backend_mode() if callable(get_backend_mode) else None
@@ -326,11 +354,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # it could not have shown an embedded run for what it was.
             logger.info(
                 "UMBPDirectLinker topology=%s+%s ranged_io=yes "
-                "rank_replicated=%s suffix=%s",
+                "rank_replicated=%s suffix=%s keep_states_per_path=%s",
                 mode.name,
                 self.backend_mode.name if self.backend_mode is not None else None,
                 rank_replicated,
                 rank_suffix,
+                self._keep_states if self.tracks_state_paths else 0,
             )
         except BaseException:
             self.storage.close()
@@ -350,7 +379,29 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
+            # removed / remove_keys is how many objects asked to go were stored.
+            "state_dropped": 0,
+            "remove_keys": 0,
+            "removed": 0,
+            "remove_failures": 0,
+            "remove_dropped": 0,
         }
+        # keep_states_per_path: per queued offload, the state key it carries,
+        # popped with its result; per queued state, the node-boundary keys
+        # above it; the droppable states that landed, and per such state the
+        # children its landed descendants leave it by (two or more: a fork).
+        self._offload_state_keys: deque[Optional[str]] = deque()
+        self._state_paths: dict[str, tuple[list[str], bool]] = {}
+        self._kept_states: dict[str, None] = {}
+        self._state_branches: dict[str, set[str]] = {}
+        self._remove_queue: Queue[list[PoolTransfer] | None] = Queue(
+            maxsize=_REMOVE_QUEUE_LIMIT
+        )
+        self._remove_thread = threading.Thread(
+            target=self._remove_thread_func,
+            daemon=True,
+            name=f"umbp-remove-tp{tp_rank}",
+        )
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -364,6 +415,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
+        if self.tracks_state_paths:
+            self._remove_thread.start()
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -845,6 +898,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._freeze_gc_once()
         ready = self.record_transfer_ready()
         self._offload_queue.put((expanded, ready))
+        if self.tracks_state_paths:
+            state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+            self._offload_state_keys.append(
+                state.keys[-1] if state is not None and state.keys else None
+            )
         return True
 
     def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
@@ -975,7 +1033,103 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return self._offload_results.qsize()
 
     def pop_completed_offload(self) -> bool:
-        return self._offload_results.get_nowait()
+        success = self._offload_results.get_nowait()
+        if self.tracks_state_paths:
+            key = self._offload_state_keys.popleft()
+            if key is not None:
+                self._state_landed(key, success)
+        return success
+
+    # ---- keep_states_per_path ----
+
+    def note_state_path(
+        self, state_key: str, path_keys: list[str], replaceable: bool
+    ) -> None:
+        """The node-boundary keys above the Mamba state ``state_key`` just
+        queued, root first. Only a ``replaceable`` state (the end of an
+        inserted prompt or prefill chunk) is ever dropped."""
+        self._state_paths[state_key] = (path_keys, replaceable)
+
+    def _state_landed(self, key: str, success: bool) -> None:
+        """Once a state lands, drop the keep_states_per_path-th droppable state
+        above it on its path, unless branches below that state landed states
+        through more than one child.
+
+        Decided from the same queue and completion order on every rank, so the
+        ranks drop the same states; a lookup still reads the store, so a dropped
+        state only moves a later restore to a shallower one."""
+        noted = self._state_paths.pop(key, None)
+        if noted is None or not success:
+            return
+        path_keys, replaceable = noted
+        above = []
+        for index in range(len(path_keys) - 1, -1, -1):
+            ancestor = path_keys[index]
+            if ancestor in self._kept_states:
+                child = path_keys[index + 1] if index + 1 < len(path_keys) else key
+                self._state_branches.setdefault(ancestor, set()).add(child)
+                above.append(ancestor)
+        if len(above) >= self._keep_states:
+            victim = above[self._keep_states - 1]
+            if len(self._state_branches.get(victim, ())) <= 1:
+                del self._kept_states[victim]
+                self._state_branches.pop(victim, None)
+                self._stats["state_dropped"] += 1
+                self.remove(
+                    [
+                        PoolTransfer(
+                            name=PoolName.MAMBA,
+                            keys=[victim],
+                            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                        )
+                    ]
+                )
+        if replaceable:
+            if len(self._kept_states) >= _KEPT_STATES_LIMIT:
+                oldest = next(iter(self._kept_states))
+                del self._kept_states[oldest]
+                self._state_branches.pop(oldest, None)
+            self._kept_states[key] = None
+
+    def remove(self, transfers: list[PoolTransfer]) -> None:
+        """Drop stored objects no later read needs."""
+        try:
+            self._remove_queue.put_nowait(transfers)
+        except Full:
+            self._stats["remove_dropped"] += 1
+
+    def _remove_thread_func(self) -> None:
+        while True:
+            batch = [self._remove_queue.get()]
+            while True:
+                try:
+                    batch.append(self._remove_queue.get_nowait())
+                except Empty:
+                    break
+            try:
+                keys = []
+                for transfers in batch:
+                    if transfers is None:
+                        continue
+                    for transfer in self.pool_group.resolve_transfers(
+                        transfers, allow_partial=True, allow_missing_kv=True
+                    ):
+                        object_keys, _ = self._object_keys_for_pages(
+                            list(transfer.keys), transfer
+                        )
+                        keys.extend(object_keys)
+                if keys:
+                    self._stats["removed"] += self.storage.client.batch_remove(keys)
+                    self._stats["remove_keys"] += len(keys)
+            except Exception:
+                self._stats["remove_failures"] += 1
+                failures = self._stats["remove_failures"]
+                if failures == 1 or failures % 1000 == 0:
+                    logger.warning(
+                        "UMBP remove failed (%d so far)", failures, exc_info=True
+                    )
+            if None in batch:
+                return
 
     def reset(self) -> None:
         self._pending.clear()
@@ -986,6 +1140,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._offload_results.get_nowait()
             except Empty:
                 break
+        self._offload_state_keys.clear()
+        self._state_paths.clear()
+        self._kept_states.clear()
+        self._state_branches.clear()
         self.layer_done_counter.reset()
 
     def close(self) -> None:
@@ -993,6 +1151,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return
         self.reset()
         for thread, queue in (
+            (self._remove_thread, self._remove_queue),
             (self._offload_thread, self._offload_queue),
             (self._load_thread, self._load_queue),
         ):

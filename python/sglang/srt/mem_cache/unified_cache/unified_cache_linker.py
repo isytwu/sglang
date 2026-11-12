@@ -559,6 +559,7 @@ class UnifiedCacheLinkerWrapper:
                 state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
                 if state is not None:
                     self._state_offloaded[node_id] = _slot_of(state.device_indices)
+                    self._note_state_path(node_id, state.keys[-1], replaceable=True)
 
     def offload_new_state(self, node_id: NodeId) -> None:
         """Offload the Mamba state an insert left on ``node_id`` when the
@@ -600,9 +601,30 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             return
         self._state_offloaded[node_id] = slot
+        self._note_state_path(node_id, hashes[-1], replaceable=False)
         self.pending_offloads.append(
             _PendingOffload(node_id, lock_params, [], state_only=True)
         )
+
+    def _note_state_path(self, node_id: NodeId, key: str, replaceable: bool) -> None:
+        """Hand a store that keeps few states per path the node-boundary keys
+        above the Mamba state ``key`` just queued for ``node_id``, root first.
+
+        A state is ``replaceable`` when it ends an inserted prompt or prefill
+        chunk, which the next turn of the path goes past; a state added to a
+        stored node can be a branch point other paths still restore from."""
+        if not getattr(self.cache_linker, "tracks_state_paths", False):
+            return
+        tree_core = self.cache.tree_core
+        (path,) = tree_core.collect_path_info([node_id])
+        prefix = tree_core.get_prefix_hash_values(node_id)
+        page = self.cache.page_size
+        bounds = [
+            prefix[info.path_end // page - 1]
+            for info in path[:-1]
+            if info.path_end >= page
+        ]
+        self.cache_linker.note_state_path(key, bounds, replaceable)
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
