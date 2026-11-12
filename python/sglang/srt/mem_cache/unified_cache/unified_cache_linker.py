@@ -23,6 +23,8 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -37,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -154,6 +157,8 @@ class UnifiedCacheLinker(ABC):
     Store ``forward_stream`` and use ``record_transfer_ready()`` to gate loads
     and offloads. ``layer_done_counter`` provides ``set_consumer(index)`` and
     ``wait_until(layer)``. Report completion only after device copies finish.
+    A store whose eviction should hear about device hits sets
+    ``touch_interval_s`` and implements ``touch()``.
     """
 
     layer_done_counter: object
@@ -162,6 +167,9 @@ class UnifiedCacheLinker(ABC):
     forward_stream: Optional[torch.cuda.Stream] = None
     # Log each request's load time and bytes.
     log_load_timing: bool = False
+    # Seconds between touches of one device node, set in __init__ and read once
+    # when the cache attaches the linker; None never calls touch().
+    touch_interval_s: Optional[float] = None
 
     def record_transfer_ready(self) -> TransferReady:
         """Record what a transfer waits on before it touches device pages.
@@ -178,8 +186,21 @@ class UnifiedCacheLinker(ABC):
             events.append(forward_done)
         return TransferReady(events)
 
+    def touch(self, transfers: list[PoolTransfer]) -> None:
+        """Best-effort hint that these pages were just served from the device
+        cache, for a store whose eviction cannot see device hits.
+
+        LOOKUP-phase transfers, one per linked component, whose keys run from
+        the sequence head to the device boundary; each transfer's own keys
+        name the pages it holds (TRAILING_PAGES: the window ending at the
+        boundary). Called inside the rank-lockstep match, so it must not
+        block, raise, or communicate across ranks.
+        """
+
     @abstractmethod
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(
+        self, rid: str, transfers: list[PoolTransfer], resident_pages: int = 0
+    ) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
 
         A length is included only when *all* pools satisfy their hit policy at
@@ -188,6 +209,9 @@ class UnifiedCacheLinker(ABC):
         state) only exists at offloaded node boundaries, so the set is sparse
         and generally non-contiguous -- returning just the local maximum would
         let the tree pick a length that is invalid on another rank.
+
+        The first ``resident_pages`` pages are on the device already, so the
+        contiguous prefix pools count them as present without a stored copy.
 
         Local to this rank; the tree intersects the sets across ranks.
         """
@@ -244,17 +268,28 @@ class ExternalCacheHitMarker(NamedTuple):
     """What ``match`` found in the external store, consumed by ``load_back``.
 
     ``tail_hashes`` are the per-page storage hashes of the restorable tail,
-    starting at ``device_hit_len``.
+    starting at ``device_hit_len``. ``resident_len`` ends the device-resident
+    Full KV the load reuses instead of loading (a node end within the hit), or
+    is 0; ``resident_key`` is the radix key up to it.
     """
 
     tail_hashes: list[str]
     device_hit_len: int
+    resident_len: int = 0
+    resident_key: Optional[RadixKey] = None
+
+
+def _slot_of(indices: torch.Tensor) -> int:
+    return int(indices.reshape(-1)[0].item())
 
 
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
     publish_node_ids: list[NodeId]
+    # A Mamba state added to a node already stored or pending: the tree tracks
+    # no external state for it, so its ack only releases the lock.
+    state_only: bool = False
 
 
 class UnifiedCacheLinkerWrapper:
@@ -297,6 +332,56 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        self._touch_interval_s = cache_linker.touch_interval_s
+        if self._touch_interval_s is not None and not self._touch_interval_s > 0:
+            raise ValueError(
+                f"touch_interval_s must be None or > 0, got {self._touch_interval_s}."
+            )
+        # Device nodes touched in the current interval bucket; NodeIds are
+        # never reused.
+        self._touch_bucket = -1
+        self._touched: set[NodeId] = set()
+        # A Mamba hybrid drops a node's device state but keeps its Full KV, so
+        # the device match stops short of KV that is still resident. Reuse it
+        # and load only the state and the pages past it; the store need not
+        # keep the resident pages, which it may have evicted unread. Full must
+        # be the only paged component, and resident lengths must be in
+        # radix-key units.
+        self._reuse_resident_kv = (
+            ComponentType.MAMBA in cache.components
+            and ComponentType.SWA not in cache.components
+            and not cache.tree_core.is_eagle
+        )
+        self.resident_reuse_stats = {
+            "loads": 0,
+            "state_only": 0,
+            "partial": 0,
+            "stale": 0,
+            "reused_tokens": 0,
+            "loaded_tokens": 0,
+        }
+        # Node -> the device Mamba slot whose state went to the store. The
+        # write-through chain offloads new leaves only, so a state attached to
+        # a node already stored (a checkpoint inside a resident path, a branch
+        # point, a recompute of an evicted state) would never get there.
+        self._offload_states = ComponentType.MAMBA in cache.components
+        self._state_offloaded: dict[NodeId, int] = {}
+        # Radix-key end past which an insert offloads nothing; 0 is no limit.
+        # Set for finished requests when their output is never reused.
+        self.offload_end_limit = 0
+        self.skip_output_offload = (
+            os.environ.get("SGLANG_LINKER_SKIP_OUTPUT_OFFLOAD") == "1"
+        )
+        self.offload_stats = {
+            "state_only": 0,
+            "state_only_failed": 0,
+            "output_trimmed": 0,
+            "output_skipped": 0,
+        }
+        # Lookups restoring under half of a long tail are logged once per
+        # request and shape, with the store's per-pool verdict.
+        self.lookup_stats = {"lookups": 0, "tail_tokens": 0, "hit_tokens": 0, "short": 0}
+        self._logged_short: dict[str, tuple[int, int]] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -326,6 +411,8 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if device_hit_len >= page and self._touch_interval_s is not None:
+            self._touch(result.last_device_node, device_hit_len // page)
         if device_hit_len >= len(key):
             return result
 
@@ -336,10 +423,16 @@ class UnifiedCacheLinkerWrapper:
         lookup_transfers = self._lookup_transfers(tail_hashes)
         if not lookup_transfers:
             return result
+        resident_ends = self._resident_ends(
+            key, device_hit_len, device_hit_len + len(tail_hashes) * page
+        )
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            self._lookup(req.rid, lookup_transfers, device_hit_len, resident_ends),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
+        )
+        self._record_lookup(
+            req, len(key), device_hit_len, len(tail_hashes), resident_ends, hit_pages
         )
         if hit_pages == 0:
             return result
@@ -355,9 +448,14 @@ class UnifiedCacheLinkerWrapper:
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
 
+        resident_len = (
+            min(device_hit_len + hit_tokens, resident_ends[-1]) if resident_ends else 0
+        )
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
+            resident_len=resident_len,
+            resident_key=key[:resident_len] if resident_len else None,
         )
         return result._replace(
             last_host_node=result.best_match_node,
@@ -367,6 +465,96 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _touch(self, node_id: NodeId, pages: Optional[int]) -> None:
+        """Touch the pages up to ``node_id``, once per node and interval;
+        ``pages``, when given, is the path length the node must have.
+
+        Decided from the node and the wall-clock interval, so the ranks of a
+        group touch the same pages; a match that straddles an interval edge
+        can move one rank's touch to its next match.
+        """
+        try:
+            bucket = int(time.time() // self._touch_interval_s)
+            if bucket != self._touch_bucket:
+                self._touch_bucket = bucket
+                self._touched.clear()
+            elif node_id in self._touched:
+                return
+            self._touched.add(node_id)
+            tree_core = self.cache.tree_core
+            hashes = tree_core.get_prefix_hash_values(
+                node_id
+            ) + tree_core.get_hash_values(node_id)
+            if not hashes or (pages is not None and len(hashes) != pages):
+                return
+            transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes
+                )
+                if transfer is None:
+                    return
+                transfers.append(transfer)
+            self.cache_linker.touch(transfers)
+        except Exception:
+            # A hint must never break the rank-lockstep match it runs in.
+            logger.exception("External cache touch failed; touches stop on this rank.")
+            self._touch_interval_s = None
+
+    def touch_running(self, reqs: Sequence[Req]) -> None:
+        """Touch the cached prefix of each request in a batch. A decoding
+        request's prompt-end state may leave the device long before its next
+        turn, and the store's copy ages from when it was written."""
+        if self._touch_interval_s is None:
+            return
+        cache = self.cache
+        for req in reqs:
+            node = req.last_node
+            if not isinstance(node, int) or node == cache.root_node_handle(
+                req.extra_key
+            ):
+                continue
+            self._touch(node, None)
+            if self._touch_interval_s is None:
+                return
+
+    def _record_lookup(
+        self,
+        req: Req,
+        key_len: int,
+        device_hit_len: int,
+        tail_pages: int,
+        resident_ends: list[int],
+        hit_pages: int,
+    ) -> None:
+        page = self.cache.page_size
+        stats = self.lookup_stats
+        stats["lookups"] += 1
+        stats["tail_tokens"] += tail_pages * page
+        stats["hit_tokens"] += hit_pages * page
+        if tail_pages * page >= 32768 and hit_pages * 2 < tail_pages:
+            stats["short"] += 1
+            shape = (device_hit_len, hit_pages)
+            if self._logged_short.get(req.rid) != shape:
+                self._logged_short[req.rid] = shape
+                logger.info(
+                    "External linker short lookup: rid=%s key=%d device_hit=%d "
+                    "resident_end=%d tail_pages=%d hit_pages=%d pools=%s",
+                    req.rid,
+                    key_len,
+                    device_hit_len,
+                    resident_ends[-1] if resident_ends else 0,
+                    tail_pages,
+                    hit_pages,
+                    getattr(self.cache_linker, "last_lookup_detail", None),
+                )
+        if stats["lookups"] % 1024 == 0:
+            logger.info(
+                "External linker lookup stats: %s offload: %s",
+                stats,
+                self.offload_stats,
+            )
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -387,6 +575,42 @@ class UnifiedCacheLinkerWrapper:
         if common.numel() == 0:
             return 0
         return int(common[-1].item())
+
+    def _resident_ends(self, key: RadixKey, start: int, end: int) -> list[int]:
+        """Node ends past ``start`` on the device-resident Full path of
+        ``key[:end]``, ascending. Reused KV must stop at a node end, so the
+        device path to that node is exactly the reused prefix."""
+        if not self._reuse_resident_kv:
+            return []
+        tree_core = self.cache.tree_core
+        matched, node, _ = tree_core.match_full_device_prefix(key[:end])
+        if matched <= start:
+            return []
+        (path,) = tree_core.collect_path_info([node])
+        return [info.path_end for info in path if start < info.path_end <= matched]
+
+    def _lookup(
+        self,
+        rid: str,
+        transfers: list[PoolTransfer],
+        device_hit_len: int,
+        resident_ends: list[int],
+    ) -> list[int]:
+        """Restorable tail lengths in pages. Resident KV needs no stored copy,
+        only a state where the hit ends, and a hit ends inside it only at a
+        node end."""
+        if not resident_ends:
+            return self.cache_linker.lookup(rid, transfers)
+        page = self.cache.page_size
+        resident_pages = (resident_ends[-1] - device_hit_len) // page
+        node_ends = {(end - device_hit_len) // page for end in resident_ends}
+        return [
+            pages
+            for pages in self.cache_linker.lookup(
+                rid, transfers, resident_pages=resident_pages
+            )
+            if pages > resident_pages or pages in node_ends
+        ]
 
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
@@ -415,9 +639,10 @@ class UnifiedCacheLinkerWrapper:
         """Queue the external hit into device slots owned by ``req``.
 
         The loaded tail extends the request's prefix but stays out of the
-        tree (``req.last_node`` is unchanged): the request inserts it like
-        computed KV after its forward, once :meth:`finish_loads` has confirmed
-        the load.
+        tree: the request inserts it like computed KV after its forward, once
+        :meth:`finish_loads` has confirmed the load. Device-resident Full KV in
+        the hit is reused rather than reloaded; ``req.last_node`` then moves to
+        the node that ends it, and the tree keeps owning that prefix.
         """
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
@@ -428,47 +653,64 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
-        # Build per-component linker transfers.
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
+        resident = self._lock_resident_kv(hit)
+        if resident is None:
+            return 0, req.last_node
+        resident_len, resident_node, resident_lock = resident
+        resident_pages = (resident_len - device_hit_len) // cache.page_size
+        try:
+            # Build per-component linker transfers; Full skips the resident pages.
+            component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
+            for component in self._components:
+                keys = tail_hashes
+                if component.component_type == ComponentType.FULL:
+                    keys = tail_hashes[resident_pages:]
+                    if not keys:
+                        # Every page is resident: the load moves the state alone.
+                        continue
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, keys
+                )
+                if transfer is None:
+                    self._update_load(
+                        ExternalLinkerLoadPhase.ABORT,
+                        req,
+                        component_transfers,
+                        prefix_len,
+                    )
+                    return 0, req.last_node
+                component_transfers.append((component, transfer))
+
+            full_transfer = next(
+                (t for _, t in component_transfers if t.name == PoolName.KV), None
             )
-            if transfer is None:
+            # Queue before PREPARE touches the request, so a refused load only has
+            # the allocations to undo before falling back to recompute. The result
+            # depends on the transfers alone, so every rank takes the same branch.
+            try:
+                queued = self.cache_linker.load(
+                    req.rid, [transfer for _, transfer in component_transfers]
+                )
+            except BaseException:
                 self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                )
+                raise
+            if not queued:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
                 )
                 return 0, req.last_node
-            component_transfers.append((component, transfer))
-
-        full_transfer = component_transfers[0][1]
-        assert full_transfer.name == PoolName.KV
-        # Queue before PREPARE touches the request, so a refused load only has
-        # the allocations to undo before falling back to recompute. The result
-        # depends on the transfers alone, so every rank takes the same branch.
-        try:
-            queued = self.cache_linker.load(
-                req.rid, [transfer for _, transfer in component_transfers]
-            )
-        except BaseException:
             self._update_load(
-                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                component_transfers,
+                prefix_len,
             )
-            raise
-        if not queued:
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
-            )
-            return 0, req.last_node
-        self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
+        finally:
+            if resident_lock is not None:
+                # The request locks req.last_node before anything else allocates.
+                cache.dec_lock_ref(resident_node, resident_lock)
 
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
@@ -486,9 +728,50 @@ class UnifiedCacheLinkerWrapper:
             and req.swa_branching_seqlen <= prefix_len
         ):
             req.swa_branching_seqlen = None
-        self.private_load_indices[req.rid] = full_transfer.device_indices
+        loaded_tokens = 0
+        if full_transfer is not None:
+            self.private_load_indices[req.rid] = full_transfer.device_indices
+            loaded_tokens = len(full_transfer.device_indices)
         self.inflight_load_rids.append(req.rid)
-        return len(full_transfer.device_indices), req.last_node
+        reused_tokens = resident_len - device_hit_len
+        self._record_load(reused_tokens, loaded_tokens)
+        if resident_node is None:
+            return loaded_tokens, req.last_node
+        # The tree owns the reused KV, so a failed load frees only the tail.
+        req.kv.protect_prefix(resident_len)
+        if self._touch_interval_s is not None:
+            # The store never reads the reused KV, so its copy would age out.
+            self._touch(resident_node, resident_len // cache.page_size)
+        # The scheduler ranked and sized this request by the full hit; from here
+        # on the hit only feeds the tier split, which counts reused KV as device.
+        req.host_hit_length -= reused_tokens
+        return reused_tokens + loaded_tokens, resident_node
+
+    def _lock_resident_kv(
+        self, hit: ExternalCacheHitMarker
+    ) -> Optional[tuple[int, Optional[NodeId], Optional[DecLockRefParams]]]:
+        """Re-check and pin the resident KV ``match`` found. Allocations since
+        then may have evicted it, and the store was never asked for a copy, so
+        that request recomputes instead: None."""
+        if not hit.resident_len:
+            return hit.device_hit_len, None, None
+        matched, node, pinned = self.cache.tree_core.match_full_device_prefix(
+            hit.resident_key
+        )
+        if matched != hit.resident_len or pinned != matched:
+            self.resident_reuse_stats["stale"] += 1
+            return None
+        return matched, node, self.cache.inc_lock_ref(node).to_dec_params()
+
+    def _record_load(self, reused_tokens: int, loaded_tokens: int) -> None:
+        stats = self.resident_reuse_stats
+        stats["loads"] += 1
+        if reused_tokens:
+            stats["state_only" if loaded_tokens == 0 else "partial"] += 1
+        stats["reused_tokens"] += reused_tokens
+        stats["loaded_tokens"] += loaded_tokens
+        if stats["loads"] % 128 == 0:
+            logger.info("External linker resident KV reuse: %s", stats)
 
     def _update_load(
         self,
@@ -530,7 +813,59 @@ class UnifiedCacheLinkerWrapper:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:
                     continue
-            self._offload_node(node_id, transfers)
+            if self.offload_end_limit:
+                transfers = self._drop_offload_past_end(node_id, transfers)
+                if transfers is None:
+                    continue
+            if self._offload_node(node_id, transfers):
+                state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+                if state is not None:
+                    self._state_offloaded[node_id] = _slot_of(state.device_indices)
+
+    def offload_new_state(self, node_id: NodeId) -> None:
+        """Offload the Mamba state an insert left on ``node_id`` when the
+        write-through chain did not: the node was already stored or pending,
+        or its walk-time offload ran before the state was attached."""
+        if not self._offload_states:
+            return
+        tree_core = self.cache.tree_core
+        value = tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
+        if value is None:
+            return
+        slot = _slot_of(value)
+        if self._state_offloaded.get(node_id) == slot:
+            return
+        if self.offload_end_limit:
+            (path,) = tree_core.collect_path_info([node_id])
+            if not path or path[-1].path_end > self.offload_end_limit:
+                return
+        hashes = tree_core.get_hash_values(node_id)
+        if not hashes:
+            return
+        # The component's own OFFLOAD transfer: one state, keyed by the node end.
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            device_indices=value,
+            keys=[hashes[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        cache = self.cache
+        lock_params = cache.inc_lock_ref(node_id).to_dec_params()
+        try:
+            queued = self.cache_linker.offload(
+                [transfer], session_id=getattr(cache, "insert_session_id", None)
+            )
+        except BaseException:
+            cache.dec_lock_ref(node_id, lock_params)
+            raise
+        if not queued:
+            cache.dec_lock_ref(node_id, lock_params)
+            return
+        self._state_offloaded[node_id] = slot
+        self.offload_stats["state_only"] += 1
+        self.pending_offloads.append(
+            _PendingOffload(node_id, lock_params, [], state_only=True)
+        )
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
@@ -540,6 +875,47 @@ class UnifiedCacheLinkerWrapper:
             yield
         finally:
             self.offload_skip_prefix_len = 0
+
+    @contextmanager
+    def offload_window(self, skip_prefix_len: int, end_limit: int):
+        """During an insert, skip offloading the first ``skip_prefix_len``
+        radix-key units and everything past ``end_limit`` (0: no limit)."""
+        self.offload_skip_prefix_len = skip_prefix_len
+        self.offload_end_limit = end_limit
+        try:
+            yield
+        finally:
+            self.offload_skip_prefix_len = 0
+            self.offload_end_limit = 0
+
+    def _drop_offload_past_end(
+        self, node_id: NodeId, transfers: list[PoolTransfer]
+    ) -> Optional[list[PoolTransfer]]:
+        info = self.cache.tree_core.collect_path_info([node_id])[0][-1]
+        limit = self.offload_end_limit
+        if info.path_end <= limit:
+            return transfers
+        if info.path_start >= limit:
+            self.offload_stats["output_skipped"] += 1
+            return None
+        page = self.cache.page_size
+        kept = []
+        for transfer in transfers:
+            # The state sits at the node end, past the limit.
+            if transfer.name == PoolName.MAMBA:
+                continue
+            first = info.path_end - len(transfer.keys) * page
+            keep = max(0, (limit - first) // page)
+            if keep:
+                kept.append(
+                    replace(
+                        transfer,
+                        keys=transfer.keys[:keep],
+                        device_indices=transfer.device_indices[: keep * page],
+                    )
+                )
+        self.offload_stats["output_trimmed"] += 1
+        return kept or None
 
     def _drop_offload_skip_prefix(
         self, node_id: NodeId, transfers: list[PoolTransfer]
@@ -571,7 +947,7 @@ class UnifiedCacheLinkerWrapper:
             kept.append(transfer)
         return kept
 
-    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
+    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> bool:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
@@ -583,16 +959,17 @@ class UnifiedCacheLinkerWrapper:
             raise
         if not queued:
             cache.dec_lock_ref(node_id, lock_params)
-            return
+            return False
 
         cache.tree_core.mark_external_linker_offload_pending(node_id)
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        return True
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
     ) -> None:
         for index, pending in enumerate(self.pending_offloads):
-            if pending.lock_node_id != ack_id:
+            if pending.lock_node_id != ack_id or pending.state_only:
                 continue
             publish_node_ids = []
             for node_id in pending.publish_node_ids:
@@ -618,9 +995,15 @@ class UnifiedCacheLinkerWrapper:
         assert len(successes) <= len(self.pending_offloads)
         for success in successes:
             pending = self.pending_offloads.pop(0)
-            self.cache.tree_core.finish_external_linker_offload(
-                pending.publish_node_ids, pending.lock_node_id, success
-            )
+            if not pending.state_only:
+                self.cache.tree_core.finish_external_linker_offload(
+                    pending.publish_node_ids, pending.lock_node_id, success
+                )
+            if not success:
+                # The state never landed; a later insert of the node retries it.
+                self._state_offloaded.pop(pending.lock_node_id, None)
+                if pending.state_only:
+                    self.offload_stats["state_only_failed"] += 1
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
@@ -664,6 +1047,9 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self._touched.clear()
+        self._state_offloaded.clear()
+        self._logged_short.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
@@ -672,14 +1058,16 @@ class UnifiedCacheLinkerWrapper:
 
     def _release_pending_offloads(self) -> None:
         for pending in self.pending_offloads:
-            self.cache.tree_core.finish_external_linker_offload(
-                pending.publish_node_ids, pending.lock_node_id, False
-            )
+            if not pending.state_only:
+                self.cache.tree_core.finish_external_linker_offload(
+                    pending.publish_node_ids, pending.lock_node_id, False
+                )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self._logged_short.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
