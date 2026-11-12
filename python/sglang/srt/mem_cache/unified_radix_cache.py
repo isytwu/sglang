@@ -694,7 +694,11 @@ class UnifiedRadixCache(BasePrefixCache):
             and params.req is not None
             and get_disagg().disaggregation_mode != "decode"
         ):
-            result = self.linker.match(params.key, params.req, result)
+            # Without cow_mamba it is the scheduling policy's probe; admission
+            # matches with cow_mamba and is the one a load can follow.
+            result = self.linker.match(
+                params.key, params.req, result, probe=not params.cow_mamba
+            )
         return result
 
     def supports_full_kv_only_match(self) -> bool:

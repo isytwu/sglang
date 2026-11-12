@@ -318,6 +318,9 @@ class UnifiedCacheLinkerWrapper:
         self.skip_output_offload = (
             os.environ.get("SGLANG_LINKER_SKIP_OUTPUT_OFFLOAD") == "1"
         )
+        # rid -> (key length, device hit, then its last lookup's host hits).
+        self._probe_memo = os.environ.get("SGLANG_LINKER_PROBE_MEMO") == "1"
+        self._probe_results: dict[str, tuple[int, int, int, int, int]] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -342,13 +345,25 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
-    def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+    def match(
+        self, key: RadixKey, req: Req, result: MatchResult, probe: bool = False
+    ) -> MatchResult:
+        """``probe`` marks a match no load follows (scheduling-policy ordering).
+        With SGLANG_LINKER_PROBE_MEMO=1 a probe reuses the request's last lookup
+        while its key and device hit are unchanged, and leaves no hit marker;
+        every rank runs the same match sequence, so all reuse alike."""
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if self._probe_memo and not probe:
+            self.hit_markers.pop(req.rid, None)
         if device_hit_len >= len(key):
             return result
+        if probe and self._probe_memo:
+            memo = self._probe_results.get(req.rid)
+            if memo is not None and memo[:2] == (len(key), device_hit_len):
+                return self._with_host_hit(result, *memo[2:])
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
@@ -363,6 +378,8 @@ class UnifiedCacheLinkerWrapper:
             device_hit_pages=0,
         )
         if hit_pages == 0:
+            if self._probe_memo:
+                self._probe_results[req.rid] = (len(key), device_hit_len, 0, 0, 0)
             return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
         hit_tokens = hit_pages * page
@@ -375,11 +392,41 @@ class UnifiedCacheLinkerWrapper:
         )
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+        if self._probe_memo:
+            self._probe_results[req.rid] = (
+                len(key),
+                device_hit_len,
+                hit_tokens,
+                swa_host_hit_length,
+                mamba_host_hit_length,
+            )
+            if probe:
+                return self._with_host_hit(
+                    result, hit_tokens, swa_host_hit_length, mamba_host_hit_length
+                )
 
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
         )
+        return result._replace(
+            last_host_node=result.best_match_node,
+            host_hit_length=hit_tokens,
+            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            mamba_host_hit_length=max(
+                result.mamba_host_hit_length, mamba_host_hit_length
+            ),
+        )
+
+    @staticmethod
+    def _with_host_hit(
+        result: MatchResult,
+        hit_tokens: int,
+        swa_host_hit_length: int,
+        mamba_host_hit_length: int,
+    ) -> MatchResult:
+        if hit_tokens == 0:
+            return result
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
@@ -820,6 +867,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self._probe_results.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
