@@ -4126,6 +4126,7 @@ class UnifiedRadixCache(BasePrefixCache):
         them."""
         if self.linker is None:
             return []
+        self.linker.touch_running(reqs)
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
         if failed:

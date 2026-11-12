@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -321,6 +322,16 @@ class UnifiedCacheLinkerWrapper:
         # rid -> (key length, device hit, then its last lookup's host hits).
         self._probe_memo = os.environ.get("SGLANG_LINKER_PROBE_MEMO") == "1"
         self._probe_results: dict[str, tuple[int, int, int, int, int]] = {}
+        # A store whose eviction cannot see device hits sets touch_interval_s and
+        # implements touch(): device-hit prefixes are touched there once per node
+        # and interval. NodeIds are never reused.
+        self._touch_interval_s = getattr(cache_linker, "touch_interval_s", None)
+        if self._touch_interval_s is not None and not self._touch_interval_s > 0:
+            raise ValueError(
+                f"touch_interval_s must be None or > 0, got {self._touch_interval_s}."
+            )
+        self._touch_bucket = -1
+        self._touched: set[NodeId] = set()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -358,6 +369,8 @@ class UnifiedCacheLinkerWrapper:
         device_hit_len = result.device_prefix_len
         if self._probe_memo and not probe:
             self.hit_markers.pop(req.rid, None)
+        if device_hit_len >= page and self._touch_interval_s is not None:
+            self._touch(result.last_device_node, device_hit_len // page)
         if device_hit_len >= len(key):
             return result
         if probe and self._probe_memo:
@@ -435,6 +448,59 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _touch(self, node_id: NodeId, pages: Optional[int]) -> None:
+        """Touch the pages up to ``node_id``, once per node and interval;
+        ``pages``, when given, is the path length the node must have.
+
+        Decided from the node and the wall-clock interval, so the ranks of a
+        group touch the same pages; a match that straddles an interval edge
+        can move one rank's touch to its next match.
+        """
+        try:
+            bucket = int(time.time() // self._touch_interval_s)
+            if bucket != self._touch_bucket:
+                self._touch_bucket = bucket
+                self._touched.clear()
+            elif node_id in self._touched:
+                return
+            self._touched.add(node_id)
+            tree_core = self.cache.tree_core
+            hashes = tree_core.get_prefix_hash_values(
+                node_id
+            ) + tree_core.get_hash_values(node_id)
+            if not hashes or (pages is not None and len(hashes) != pages):
+                return
+            transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes
+                )
+                if transfer is None:
+                    return
+                transfers.append(transfer)
+            self.cache_linker.touch(transfers)
+        except Exception:
+            # A hint must never break the rank-lockstep match it runs in.
+            logger.exception("External cache touch failed; touches stop on this rank.")
+            self._touch_interval_s = None
+
+    def touch_running(self, reqs: Sequence[Req]) -> None:
+        """Touch the cached prefix of each request in a batch. A decoding
+        request's prompt-end state may leave the device long before its next
+        turn, and the store's copy ages from when it was written."""
+        if self._touch_interval_s is None:
+            return
+        cache = self.cache
+        for req in reqs:
+            node = req.last_node
+            if not isinstance(node, int) or node == cache.root_node_handle(
+                req.extra_key
+            ):
+                continue
+            self._touch(node, None)
+            if self._touch_interval_s is None:
+                return
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -850,6 +916,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self._state_offloaded.clear()
+        self._touched.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
