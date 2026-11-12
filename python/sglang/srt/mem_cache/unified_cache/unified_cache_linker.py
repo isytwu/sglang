@@ -322,6 +322,14 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # rid -> ((key length, device hit), store hit) of its last lookup. The
+        # scheduler matches every waiting request on each pass to order the
+        # queue; such a probe reuses the hit while the key and the device hit are
+        # unchanged, and admission looks up again. A lookup is a collective, so
+        # the reuse must not depend on time: every rank has to make the same call.
+        self._probe_hits: dict[
+            str, tuple[tuple[int, int], Optional[tuple[int, int, int]]]
+        ] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -380,7 +388,13 @@ class UnifiedCacheLinkerWrapper:
         }
         # Lookups restoring under half of a long tail are logged once per
         # request and shape, with the store's per-pool verdict.
-        self.lookup_stats = {"lookups": 0, "tail_tokens": 0, "hit_tokens": 0, "short": 0}
+        self.lookup_stats = {
+            "lookups": 0,
+            "tail_tokens": 0,
+            "hit_tokens": 0,
+            "short": 0,
+            "probe_reuses": 0,
+        }
         self._logged_short: dict[str, tuple[int, int]] = {}
 
         cache.tree_core.enable_external_cache_linker = True
@@ -406,7 +420,9 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
-    def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+    def match(
+        self, key: RadixKey, req: Req, result: MatchResult, *, probe: bool = False
+    ) -> MatchResult:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -416,13 +432,48 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len >= len(key):
             return result
 
+        shape = (len(key), device_hit_len)
+        if probe:
+            known = self._probe_hits.get(req.rid)
+            if known is not None and known[0] == shape:
+                self.lookup_stats["probe_reuses"] += 1
+                return self._with_host_hit(result, known[1])
+        else:
+            # init_load_back follows admission, so it must load what this finds.
+            self.hit_markers.pop(req.rid, None)
+        hit = self._lookup_tail(key, req, result, device_hit_len)
+        self._probe_hits[req.rid] = (shape, hit)
+        return self._with_host_hit(result, hit)
+
+    @staticmethod
+    def _with_host_hit(
+        result: MatchResult, hit: Optional[tuple[int, int, int]]
+    ) -> MatchResult:
+        if hit is None:
+            return result
+        hit_tokens, swa_host_hit_length, mamba_host_hit_length = hit
+        return result._replace(
+            last_host_node=result.best_match_node,
+            host_hit_length=hit_tokens,
+            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            mamba_host_hit_length=max(
+                result.mamba_host_hit_length, mamba_host_hit_length
+            ),
+        )
+
+    def _lookup_tail(
+        self, key: RadixKey, req: Req, result: MatchResult, device_hit_len: int
+    ) -> Optional[tuple[int, int, int]]:
+        """The store's hit past the device prefix as (tokens, SWA tokens, Mamba
+        slots), or None. A hit leaves the marker init_load_back consumes."""
+        page = self.cache.page_size
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
-            return result
+            return None
 
         lookup_transfers = self._lookup_transfers(tail_hashes)
         if not lookup_transfers:
-            return result
+            return None
         resident_ends = self._resident_ends(
             key, device_hit_len, device_hit_len + len(tail_hashes) * page
         )
@@ -435,7 +486,7 @@ class UnifiedCacheLinkerWrapper:
             req, len(key), device_hit_len, len(tail_hashes), resident_ends, hit_pages
         )
         if hit_pages == 0:
-            return result
+            return None
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
         hit_tokens = hit_pages * page
 
@@ -457,14 +508,7 @@ class UnifiedCacheLinkerWrapper:
             resident_len=resident_len,
             resident_key=key[:resident_len] if resident_len else None,
         )
-        return result._replace(
-            last_host_node=result.best_match_node,
-            host_hit_length=hit_tokens,
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
-            mamba_host_hit_length=max(
-                result.mamba_host_hit_length, mamba_host_hit_length
-            ),
-        )
+        return hit_tokens, swa_host_hit_length, mamba_host_hit_length
 
     def _touch(self, node_id: NodeId, pages: Optional[int]) -> None:
         """Touch the pages up to ``node_id``, once per node and interval;
@@ -1051,6 +1095,7 @@ class UnifiedCacheLinkerWrapper:
         self._state_offloaded.clear()
         self._logged_short.clear()
         self.hit_markers.clear()
+        self._probe_hits.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -1067,6 +1112,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self._probe_hits.pop(rid, None)
         self._logged_short.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.

@@ -694,7 +694,14 @@ class UnifiedRadixCache(BasePrefixCache):
             and params.req is not None
             and get_disagg().disaggregation_mode != "decode"
         ):
-            result = self.linker.match(params.key, params.req, result)
+            # Admission copies the request's Mamba state; a match without the copy
+            # only orders the waiting queue, so it may reuse the last lookup.
+            result = self.linker.match(
+                params.key,
+                params.req,
+                result,
+                probe=self.supports_mamba() and not params.cow_mamba,
+            )
         return result
 
     def supports_full_kv_only_match(self) -> bool:
