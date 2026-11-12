@@ -1272,6 +1272,12 @@ class MambaComponent(TreeComponent):
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, MambaEvictExcessPathStates):
             result = BaseEvictionResult()
+            linker = self.cache.linker
+            holders = (
+                linker.path_state_holders(action.tail_node_id)
+                if linker is not None
+                else []
+            )
             # Drain even if the walk raises so tombstoned slots are not leaked;
             # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
@@ -1283,6 +1289,8 @@ class MambaComponent(TreeComponent):
                 )
             finally:
                 self.cache._apply_eviction_result(result)
+            if holders:
+                linker.remove_replaced_states(holders)
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:

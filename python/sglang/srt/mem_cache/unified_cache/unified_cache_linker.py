@@ -170,6 +170,8 @@ class UnifiedCacheLinker(ABC):
     # Seconds between touches of one device node, set in __init__ and read once
     # when the cache attaches the linker; None never calls touch().
     touch_interval_s: Optional[float] = None
+    # Whether remove() drops stored objects; set in __init__.
+    supports_remove: bool = False
 
     def record_transfer_ready(self) -> TransferReady:
         """Record what a transfer waits on before it touches device pages.
@@ -195,6 +197,16 @@ class UnifiedCacheLinker(ABC):
         name the pages it holds (TRAILING_PAGES: the window ending at the
         boundary). Called inside the rank-lockstep match, so it must not
         block, raise, or communicate across ranks.
+        """
+
+    def remove(self, transfers: list[PoolTransfer]) -> None:
+        """Best-effort drop of stored objects no lookup should restore again:
+        a Mamba state the device cache replaced deeper along its path, which
+        would otherwise hold store space until eviction reached it.
+
+        LOOKUP-phase transfers naming the objects' pages. Called inside the
+        rank-lockstep insert, so it must not block, raise, or communicate
+        across ranks.
         """
 
     @abstractmethod
@@ -385,7 +397,9 @@ class UnifiedCacheLinkerWrapper:
             "state_only_failed": 0,
             "output_trimmed": 0,
             "output_skipped": 0,
+            "states_removed": 0,
         }
+        self._remove_states = cache_linker.supports_remove
         # Lookups restoring under half of a long tail are logged once per
         # request and shape, with the store's per-pool verdict.
         self.lookup_stats = {
@@ -1086,6 +1100,67 @@ class UnifiedCacheLinkerWrapper:
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
         )
         return rids
+
+    # ---- path cap: drop the store's copies of the states it replaced ----
+
+    def path_state_holders(self, tail: NodeId) -> list[NodeId]:
+        """Nodes above ``tail`` holding a device Mamba state, read before the
+        path cap runs, when the store can drop what it evicts."""
+        if not self._remove_states:
+            return []
+        try:
+            tree_core = self.cache.tree_core
+            (path,) = tree_core.collect_path_info([tail])
+            return [
+                info.node_id
+                for info in path[:-1]
+                if tree_core.get_component_device_value(
+                    info.node_id, ComponentType.MAMBA
+                )
+                is not None
+            ]
+        except Exception:
+            self._stop_removing_states()
+            return []
+
+    def remove_replaced_states(self, holders: list[NodeId]) -> None:
+        """Drop the stored copies of the states the path cap took off the
+        device. A deeper state on the same path replaced each one, and the
+        store would hold it until eviction reached it."""
+        try:
+            tree_core = self.cache.tree_core
+            hashes = []
+            for node_id in holders:
+                if (
+                    tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
+                    is not None
+                ):
+                    continue
+                # A state attached to this node again must be offloaded again.
+                self._state_offloaded.pop(node_id, None)
+                node_hashes = tree_core.get_hash_values(node_id)
+                if node_hashes:
+                    # A node's state is stored under the hash of its last page.
+                    hashes.append(node_hashes[-1])
+            mamba = self.cache.components[ComponentType.MAMBA]
+            for page_hash in hashes:
+                # A Mamba LOOKUP transfer names only its trailing page.
+                transfer = mamba.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, [page_hash]
+                )
+                if transfer is not None:
+                    self.cache_linker.remove([transfer])
+                    self.offload_stats["states_removed"] += 1
+        except Exception:
+            self._stop_removing_states()
+
+    def _stop_removing_states(self) -> None:
+        # A store cleanup must never break the insert it runs in.
+        logger.exception(
+            "Dropping replaced Mamba states from the store failed; they now stay "
+            "until eviction on this rank."
+        )
+        self._remove_states = False
 
     # ---- lifecycle ----
 

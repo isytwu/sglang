@@ -7,7 +7,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 import torch
@@ -45,6 +45,12 @@ CHUNK_PAGES = 64
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 # Pending touches beyond this are dropped: the store has stopped answering.
 _TOUCH_QUEUE_LIMIT = 1024
+
+
+class _Removal(NamedTuple):
+    """Transfers whose stored objects the touch thread drops."""
+
+    transfers: list[PoolTransfer]
 
 
 def _storage_suffix(
@@ -330,6 +336,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         "UMBP touch_interval_s is ignored: this mori client has no "
                         "batch_touch."
                     )
+            # Without batch_remove a replaced KDA state stays until eviction.
+            self.supports_remove = callable(getattr(client, "batch_remove", None))
             get_backend_mode = getattr(client, "get_backend_mode", None)
             self.backend_mode = (
                 get_backend_mode() if callable(get_backend_mode) else None
@@ -389,8 +397,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "touched": 0,
             "touch_failures": 0,
             "touch_dropped": 0,
+            # removed / remove_keys is how many dropped objects were stored.
+            "remove_keys": 0,
+            "removed": 0,
+            "remove_failures": 0,
         }
-        self._touch_queue: Queue[list[PoolTransfer] | None] = Queue(
+        # Touches, removals (_Removal) and the stop sentinel, in issue order.
+        self._touch_queue: Queue[list[PoolTransfer] | _Removal | None] = Queue(
             maxsize=_TOUCH_QUEUE_LIMIT
         )
         self._load_thread = threading.Thread(
@@ -411,7 +424,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
-        if self.touch_interval_s is not None:
+        if self.touch_interval_s is not None or self.supports_remove:
             self._touch_thread.start()
 
     def _register_buffers(self) -> None:
@@ -1058,6 +1071,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # Only a store that stopped answering backs up this far.
             self._stats["touch_dropped"] += 1
 
+    def remove(self, transfers: list[PoolTransfer]) -> None:
+        if not self.supports_remove:
+            return
+        try:
+            self._touch_queue.put_nowait(_Removal(transfers))
+        except Full:
+            self._stats["touch_dropped"] += 1
+
     def _touch_thread_func(self) -> None:
         while True:
             batch = [self._touch_queue.get()]
@@ -1068,8 +1089,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     batch.append(self._touch_queue.get_nowait())
                 except Empty:
                     break
+            touches = [item for item in batch if isinstance(item, list)]
+            removals = [item.transfers for item in batch if isinstance(item, _Removal)]
             try:
-                self._send_touches([item for item in batch if item is not None])
+                self._send_touches(touches)
             except Exception:
                 self._stats["touch_failures"] += 1
                 failures = self._stats["touch_failures"]
@@ -1077,8 +1100,36 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     logger.warning(
                         "UMBP touch failed (%d so far)", failures, exc_info=True
                     )
+            # After the touches, so a key both touched and dropped ends up dropped.
+            try:
+                self._send_removes(removals)
+            except Exception:
+                self._stats["remove_failures"] += 1
+                failures = self._stats["remove_failures"]
+                if failures == 1 or failures % 1000 == 0:
+                    logger.warning(
+                        "UMBP remove failed (%d so far)", failures, exc_info=True
+                    )
             if None in batch:
                 return
+
+    def _send_removes(self, removals: list[list[PoolTransfer]]) -> None:
+        keys = []
+        for transfers in removals:
+            # A state-only drop names no KV pages.
+            for transfer in self.pool_group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
+            ):
+                object_keys, _ = self._object_keys_for_pages(
+                    list(transfer.keys), transfer
+                )
+                keys.extend(object_keys)
+        per_call = CHUNK_PAGES * self.num_layers
+        for start in range(0, len(keys), per_call):
+            self._stats["removed"] += self.storage.client.batch_remove(
+                keys[start : start + per_call]
+            )
+        self._stats["remove_keys"] += len(keys)
 
     def _send_touches(self, touches: list[list[PoolTransfer]]) -> None:
         keys = []
