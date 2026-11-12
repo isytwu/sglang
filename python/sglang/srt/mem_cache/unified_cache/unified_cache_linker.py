@@ -351,6 +351,7 @@ class UnifiedCacheLinkerWrapper:
             ComponentType.MAMBA in cache.components
             and ComponentType.SWA not in cache.components
             and not cache.tree_core.is_eagle
+            and os.environ.get("SGLANG_LINKER_RESIDENT_KV", "1") != "0"
         )
         self.resident_reuse_stats = {
             "loads": 0,
@@ -382,6 +383,39 @@ class UnifiedCacheLinkerWrapper:
         # request and shape, with the store's per-pool verdict.
         self.lookup_stats = {"lookups": 0, "tail_tokens": 0, "hit_tokens": 0, "short": 0}
         self._logged_short: dict[str, tuple[int, int]] = {}
+        # A probe match (scheduling-policy ordering, no load follows) reuses the
+        # request's last restorable length while its key and device hit are
+        # unchanged, and leaves no hit marker: the admitting match, which every
+        # load follows, always asks the store. Every rank sees the same match
+        # sequence, so all take or skip the rank-group reduction together.
+        self._probe_memo = os.environ.get("SGLANG_LINKER_PROBE_MEMO") == "1"
+        self._probe_results: dict[str, tuple[int, int, int, int, int]] = {}
+        self.match_timing = {
+            "probe_matches": 0,
+            "admit_matches": 0,
+            "probe_memo_hits": 0,
+            "probe_lookups": 0,
+            "admit_lookups": 0,
+            "match_s": 0.0,
+            "hash_s": 0.0,
+            "resident_s": 0.0,
+            "lookup_s": 0.0,
+            "sync_s": 0.0,
+        }
+        # Why an admitting lookup restores less than its tail: the first missing
+        # Full page was offloaded earlier (the store evicted it), was never
+        # offloaded, or every probed Full page is there and a state is missing.
+        # Offloaded pages are remembered by a 60-bit prefix of their hash.
+        self._offloaded_kv: set[int] = set()
+        self._offloaded_kv_limit = 8_000_000
+        self.miss_stats = {
+            "admit_tail_tokens": 0,
+            "admit_hit_tokens": 0,
+            "evicted_tokens": 0,
+            "never_stored_tokens": 0,
+            "state_tokens": 0,
+            "offloaded_pages": 0,
+        }
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -406,35 +440,112 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
-    def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+    def match(
+        self, key: RadixKey, req: Req, result: MatchResult, probe: bool = False
+    ) -> MatchResult:
+        """``probe`` marks a match no load follows (scheduling-policy ordering)."""
+        timing = self.match_timing
+        timing["probe_matches" if probe else "admit_matches"] += 1
+        start = time.perf_counter()
+        try:
+            return self._match(key, req, result, probe)
+        finally:
+            timing["match_s"] += time.perf_counter() - start
+            if (timing["probe_matches"] + timing["admit_matches"]) % 4096 == 0:
+                logger.info(
+                    "External linker match timing: %s misses: %s",
+                    {
+                        name: round(value, 3) if isinstance(value, float) else value
+                        for name, value in timing.items()
+                    },
+                    self.miss_stats,
+                )
+
+    @staticmethod
+    def _hash_tag(page_hash: str) -> int:
+        return hash(page_hash)
+
+    def _record_offloaded(self, transfers: list[PoolTransfer]) -> None:
+        kv = next((t for t in transfers if t.name == PoolName.KV), None)
+        if kv is None or not kv.keys:
+            return
+        if len(self._offloaded_kv) >= self._offloaded_kv_limit:
+            self._offloaded_kv.clear()
+        self._offloaded_kv.update(self._hash_tag(key) for key in kv.keys)
+        self.miss_stats["offloaded_pages"] += len(kv.keys)
+
+    def _classify_miss(
+        self, tail_hashes: list[str], hit_pages: int, page: int
+    ) -> None:
+        stats = self.miss_stats
+        stats["admit_tail_tokens"] += len(tail_hashes) * page
+        stats["admit_hit_tokens"] += hit_pages * page
+        lost = (len(tail_hashes) - hit_pages) * page
+        if lost <= 0:
+            return
+        detail = getattr(self.cache_linker, "last_lookup_detail", None) or []
+        kv = next((entry for entry in detail if entry[0] == "kv"), None)
+        if kv is None or kv[3] >= kv[1] or kv[3] >= len(tail_hashes):
+            stats["state_tokens"] += lost
+        elif self._hash_tag(tail_hashes[kv[3]]) in self._offloaded_kv:
+            stats["evicted_tokens"] += lost
+        else:
+            stats["never_stored_tokens"] += lost
+
+    def _match(
+        self, key: RadixKey, req: Req, result: MatchResult, probe: bool
+    ) -> MatchResult:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if self._probe_memo and not probe:
+            self.hit_markers.pop(req.rid, None)
         if device_hit_len >= page and self._touch_interval_s is not None:
             self._touch(result.last_device_node, device_hit_len // page)
         if device_hit_len >= len(key):
             return result
 
+        timing = self.match_timing
+        if probe and self._probe_memo:
+            memo = self._probe_results.get(req.rid)
+            if memo is not None and memo[:2] == (len(key), device_hit_len):
+                timing["probe_memo_hits"] += 1
+                return self._with_host_hit(result, *memo[2:])
+
+        started = time.perf_counter()
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
+        timing["hash_s"] += time.perf_counter() - started
         if not tail_hashes:
             return result
 
         lookup_transfers = self._lookup_transfers(tail_hashes)
         if not lookup_transfers:
             return result
+        started = time.perf_counter()
         resident_ends = self._resident_ends(
             key, device_hit_len, device_hit_len + len(tail_hashes) * page
         )
-        hit_pages = self._sync_restorable_prefix(
-            self._lookup(req.rid, lookup_transfers, device_hit_len, resident_ends),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
+        looked_up = time.perf_counter()
+        restorable = self._lookup(
+            req.rid, lookup_transfers, device_hit_len, resident_ends
         )
+        synced = time.perf_counter()
+        hit_pages = self._sync_restorable_prefix(
+            restorable, num_pages=len(tail_hashes), device_hit_pages=0
+        )
+        timing["resident_s"] += looked_up - started
+        timing["lookup_s"] += synced - looked_up
+        timing["sync_s"] += time.perf_counter() - synced
+        timing["probe_lookups" if probe else "admit_lookups"] += 1
         self._record_lookup(
             req, len(key), device_hit_len, len(tail_hashes), resident_ends, hit_pages
         )
+        if not probe:
+            self._classify_miss(tail_hashes, hit_pages, page)
         if hit_pages == 0:
+            if self._probe_memo:
+                self._probe_results[req.rid] = (len(key), device_hit_len, 0, 0, 0)
             return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
         hit_tokens = hit_pages * page
@@ -447,6 +558,18 @@ class UnifiedCacheLinkerWrapper:
         )
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+        if self._probe_memo:
+            self._probe_results[req.rid] = (
+                len(key),
+                device_hit_len,
+                hit_tokens,
+                swa_host_hit_length,
+                mamba_host_hit_length,
+            )
+            if probe:
+                return self._with_host_hit(
+                    result, hit_tokens, swa_host_hit_length, mamba_host_hit_length
+                )
 
         resident_len = (
             min(device_hit_len + hit_tokens, resident_ends[-1]) if resident_ends else 0
@@ -457,6 +580,19 @@ class UnifiedCacheLinkerWrapper:
             resident_len=resident_len,
             resident_key=key[:resident_len] if resident_len else None,
         )
+        return self._with_host_hit(
+            result, hit_tokens, swa_host_hit_length, mamba_host_hit_length
+        )
+
+    @staticmethod
+    def _with_host_hit(
+        result: MatchResult,
+        hit_tokens: int,
+        swa_host_hit_length: int,
+        mamba_host_hit_length: int,
+    ) -> MatchResult:
+        if hit_tokens == 0:
+            return result
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
@@ -961,6 +1097,7 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             return False
 
+        self._record_offloaded(transfers)
         cache.tree_core.mark_external_linker_offload_pending(node_id)
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
         return True
@@ -1068,6 +1205,7 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
         self._logged_short.pop(rid, None)
+        self._probe_results.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
