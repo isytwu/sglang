@@ -244,6 +244,18 @@ def _req_radix_key(
     )
 
 
+def admission_radix_key(req: Req, tree_cache: BasePrefixCache) -> Optional[RadixKey]:
+    """The key ``Req.init_next_round_input`` will match for ``req``, or None
+    when its bounds come from state only that call sets up."""
+    if req.is_dllm() or req.positional_embed_overrides is not None:
+        return None
+    req.refresh_fill_ids()
+    token_ids = req.full_untruncated_fill_ids
+    return _req_radix_key(
+        tree_cache, req, token_ids, req._compute_max_prefix_len(len(token_ids))
+    )
+
+
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     tree_cache.touch_prefix(
         _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)

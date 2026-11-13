@@ -232,6 +232,23 @@ class UnifiedCacheLinker(ABC):
         Local to this rank; the tree intersects the sets across ranks.
         """
 
+    def lookup_batch(
+        self, requests: Sequence[tuple[str, list[PoolTransfer], int]]
+    ) -> list[tuple[list[int], object]]:
+        """``lookup`` for several ``(rid, transfers, resident_pages)`` at once,
+        as ``(restorable lengths, detail)`` per request, where ``detail`` is
+        what the store reports about a short lookup. A store that can should
+        answer them with fewer round trips than one lookup each."""
+        results = []
+        for rid, transfers, resident_pages in requests:
+            restorable = (
+                self.lookup(rid, transfers, resident_pages=resident_pages)
+                if resident_pages
+                else self.lookup(rid, transfers)
+            )
+            results.append((restorable, getattr(self, "last_lookup_detail", None)))
+        return results
+
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a load into the given device indices.
@@ -295,6 +312,29 @@ class ExternalCacheHitMarker(NamedTuple):
     resident_key: Optional[RadixKey] = None
 
 
+class _LookupRecord(NamedTuple):
+    """A request's last store lookup.
+
+    ``shape`` is (device hit, tail pages), which fixes the tail hashes for a
+    request's tokens; ``round`` is the scheduling round that looked it up.
+    """
+
+    shape: tuple[int, int]
+    hit: Optional[tuple[int, int, int]]
+    marker: Optional[ExternalCacheHitMarker]
+    round: int
+
+
+class _TailLookup(NamedTuple):
+    """One tail ready for the store: what ``_lookup_tails`` asks and reduces."""
+
+    key: RadixKey
+    device_hit_len: int
+    tail_hashes: list[str]
+    transfers: list[PoolTransfer]
+    resident_ends: list[int]
+
+
 def _slot_of(indices: torch.Tensor) -> int:
     return int(indices.reshape(-1)[0].item())
 
@@ -338,14 +378,21 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
-        # rid -> ((key length, device hit), store hit) of its last lookup. The
-        # scheduler matches every waiting request on each pass to order the
-        # queue; such a probe reuses the hit while the key and the device hit are
-        # unchanged, and admission looks up again. A lookup is a collective, so
-        # the reuse must not depend on time: every rank has to make the same call.
-        self._probe_hits: dict[
-            str, tuple[tuple[int, int], Optional[tuple[int, int, int]]]
-        ] = {}
+        # rid -> its last lookup. The scheduler matches every waiting request
+        # on each pass to order the queue; such a probe reuses the hit while
+        # the device hit and the tail are unchanged. Admission reuses only a
+        # lookup of the same scheduling round, as fresh as one made then. A
+        # lookup is a collective, so the reuse must not depend on time: every
+        # rank has to make the same call.
+        self._probe_hits: dict[str, _LookupRecord] = {}
+        # Scheduling rounds, counted alike on every rank (0 until the scheduler
+        # starts one, which reuses nothing at admission), and the device hit
+        # each request's probe found in the current one.
+        self._lookup_round = 0
+        self._round_device_hits: dict[str, tuple[int, NodeId]] = {}
+        # Requests admitted in a round are looked up together, at most this
+        # many; 0 looks each one up on its own.
+        self.lookup_batch_size = int(os.environ.get("SGLANG_LINKER_LOOKUP_BATCH", "8"))
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -414,6 +461,9 @@ class UnifiedCacheLinkerWrapper:
             "hit_tokens": 0,
             "short": 0,
             "probe_reuses": 0,
+            "round_reuses": 0,
+            "batched": 0,
+            "batches": 0,
         }
         self._logged_short: dict[str, tuple[int, int]] = {}
 
@@ -452,18 +502,107 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len >= len(key):
             return result
 
-        shape = (len(key), device_hit_len)
+        shape = (device_hit_len, (len(key) - device_hit_len) // page)
+        known = self._probe_hits.get(req.rid)
         if probe:
-            known = self._probe_hits.get(req.rid)
-            if known is not None and known[0] == shape:
+            self._round_device_hits[req.rid] = (
+                device_hit_len,
+                result.last_device_node,
+            )
+            if known is not None and known.shape == shape:
                 self.lookup_stats["probe_reuses"] += 1
-                return self._with_host_hit(result, known[1])
+                return self._with_host_hit(result, known.hit)
+        elif (
+            known is not None
+            and known.shape == shape
+            and known.round == self._lookup_round > 0
+        ):
+            # This round looked the tail up already (its probe, or the batch
+            # ahead of admission), so the hit is as fresh as a new lookup.
+            self.lookup_stats["round_reuses"] += 1
+            self._set_hit_marker(req.rid, known.marker)
+            return self._with_host_hit(result, known.hit)
         else:
             # init_load_back follows admission, so it must load what this finds.
             self.hit_markers.pop(req.rid, None)
-        hit = self._lookup_tail(key, req, result, device_hit_len)
-        self._probe_hits[req.rid] = (shape, hit)
+        lookup = self._prepare_tail(key, result.last_device_node, device_hit_len)
+        if lookup is None:
+            hit, marker = None, None
+        else:
+            hit, marker = self._finish_tail(
+                req, lookup, *self._lookup_tails([req.rid], [lookup])[0]
+            )
+        if marker is not None:
+            self.hit_markers[req.rid] = marker
+        self._probe_hits[req.rid] = _LookupRecord(
+            shape, hit, marker, self._lookup_round
+        )
         return self._with_host_hit(result, hit)
+
+    def _set_hit_marker(
+        self, rid: str, marker: Optional[ExternalCacheHitMarker]
+    ) -> None:
+        if marker is None:
+            self.hit_markers.pop(rid, None)
+        else:
+            self.hit_markers[rid] = marker
+
+    def begin_lookup_round(self) -> None:
+        """Start a scheduling round; admission reuses only this round's lookups."""
+        self._lookup_round += 1
+        self._round_device_hits.clear()
+
+    def prefetch_lookups(self, entries: Sequence[tuple[Req, RadixKey]]) -> None:
+        """Look up, together, the admission keys of requests this round will
+        likely admit: one hash pass, one store round trip per pool and one
+        cross-rank reduction for all of them, which their admission matches
+        then reuse.
+
+        ``entries`` must be the same on every rank. A request whose probe did
+        not run this round, whose admission hit cannot be told from its probe,
+        or whose tail this round already looked up, is left to its admission.
+        """
+        if self._lookup_round == 0:
+            return
+        page = self.cache.page_size
+        reqs, lookups, shapes = [], [], []
+        for req, key in entries:
+            key, _ = key.maybe_to_bigram_view(self.cache.tree_core.is_eagle)
+            probed = self._round_device_hits.get(req.rid)
+            if probed is None:
+                continue
+            device_hit_len, last_device_node = probed
+            # A shorter key keeps the probe's device hit while that ends
+            # within it; past that, admission matches a shallower state.
+            tail_pages = (len(key) - device_hit_len) // page
+            if tail_pages <= 0:
+                continue
+            shape = (device_hit_len, tail_pages)
+            known = self._probe_hits.get(req.rid)
+            if (
+                known is not None
+                and known.shape == shape
+                and known.round == self._lookup_round
+            ):
+                continue
+            lookup = self._prepare_tail(key, last_device_node, device_hit_len)
+            if lookup is None:
+                continue
+            reqs.append(req)
+            lookups.append(lookup)
+            shapes.append(shape)
+        if not lookups:
+            return
+        self.lookup_stats["batches"] += 1
+        self.lookup_stats["batched"] += len(lookups)
+        found = self._lookup_tails([req.rid for req in reqs], lookups)
+        for req, lookup, shape, (hit_pages, detail) in zip(
+            reqs, lookups, shapes, found
+        ):
+            hit, marker = self._finish_tail(req, lookup, hit_pages, detail)
+            self._probe_hits[req.rid] = _LookupRecord(
+                shape, hit, marker, self._lookup_round
+            )
 
     @staticmethod
     def _with_host_hit(
@@ -481,33 +620,82 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
-    def _lookup_tail(
-        self, key: RadixKey, req: Req, result: MatchResult, device_hit_len: int
-    ) -> Optional[tuple[int, int, int]]:
-        """The store's hit past the device prefix as (tokens, SWA tokens, Mamba
-        slots), or None. A hit leaves the marker init_load_back consumes."""
-        page = self.cache.page_size
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
+    def _prepare_tail(
+        self, key: RadixKey, last_device_node: NodeId, device_hit_len: int
+    ) -> Optional[_TailLookup]:
+        """The store lookup for the tail past the device prefix, or None when
+        there is nothing to ask."""
+        tail_hashes = self._tail_hashes(key, last_device_node, device_hit_len)
         if not tail_hashes:
             return None
-
-        lookup_transfers = self._lookup_transfers(tail_hashes)
-        if not lookup_transfers:
+        transfers = self._lookup_transfers(tail_hashes)
+        if not transfers:
             return None
         resident_ends = self._resident_ends(
-            key, device_hit_len, device_hit_len + len(tail_hashes) * page
+            key,
+            device_hit_len,
+            device_hit_len + len(tail_hashes) * self.cache.page_size,
         )
-        hit_pages = self._sync_restorable_prefix(
-            self._lookup(req.rid, lookup_transfers, device_hit_len, resident_ends),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
+        return _TailLookup(key, device_hit_len, tail_hashes, transfers, resident_ends)
+
+    def _lookup_tails(
+        self, rids: list[str], lookups: list[_TailLookup]
+    ) -> list[tuple[int, object]]:
+        """Ask the store for every tail at once and intersect the results
+        across ranks in one reduction: per tail, the restorable pages all
+        ranks share and the store's detail."""
+        page = self.cache.page_size
+        requests = []
+        for rid, lookup in zip(rids, lookups):
+            resident_pages = (
+                (lookup.resident_ends[-1] - lookup.device_hit_len) // page
+                if lookup.resident_ends
+                else 0
+            )
+            requests.append((rid, lookup.transfers, resident_pages))
+        answers = self.cache_linker.lookup_batch(requests)
+        restorables = []
+        for lookup, (_, _, resident_pages), (restorable, _) in zip(
+            lookups, requests, answers
+        ):
+            if lookup.resident_ends:
+                # Resident KV needs no stored copy, only a state where the hit
+                # ends, and a hit ends inside it only at a node end.
+                node_ends = {
+                    (end - lookup.device_hit_len) // page
+                    for end in lookup.resident_ends
+                }
+                restorable = [
+                    pages
+                    for pages in restorable
+                    if pages > resident_pages or pages in node_ends
+                ]
+            restorables.append(restorable)
+        hit_pages = self._sync_restorable_prefixes(
+            restorables, [len(lookup.tail_hashes) for lookup in lookups]
         )
+        return [(pages, detail) for pages, (_, detail) in zip(hit_pages, answers)]
+
+    def _finish_tail(
+        self, req: Req, lookup: _TailLookup, hit_pages: int, detail: object
+    ) -> tuple[Optional[tuple[int, int, int]], Optional[ExternalCacheHitMarker]]:
+        """The store's hit past the device prefix as (tokens, SWA tokens, Mamba
+        slots) and the marker init_load_back consumes, or (None, None)."""
+        page = self.cache.page_size
+        device_hit_len = lookup.device_hit_len
+        resident_ends = lookup.resident_ends
         self._record_lookup(
-            req, len(key), device_hit_len, len(tail_hashes), resident_ends, hit_pages
+            req,
+            len(lookup.key),
+            device_hit_len,
+            len(lookup.tail_hashes),
+            resident_ends,
+            hit_pages,
+            detail,
         )
         if hit_pages == 0:
-            return None
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+            return None, None
+        by_pool = {transfer.name: transfer for transfer in lookup.transfers}
         hit_tokens = hit_pages * page
 
         swa_transfer = by_pool.get(PoolName.SWA)
@@ -522,13 +710,13 @@ class UnifiedCacheLinkerWrapper:
         resident_len = (
             min(device_hit_len + hit_tokens, resident_ends[-1]) if resident_ends else 0
         )
-        self.hit_markers[req.rid] = ExternalCacheHitMarker(
-            tail_hashes=list(tail_hashes[:hit_pages]),
+        marker = ExternalCacheHitMarker(
+            tail_hashes=list(lookup.tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
             resident_len=resident_len,
-            resident_key=key[:resident_len] if resident_len else None,
+            resident_key=lookup.key[:resident_len] if resident_len else None,
         )
-        return hit_tokens, swa_host_hit_length, mamba_host_hit_length
+        return (hit_tokens, swa_host_hit_length, mamba_host_hit_length), marker
 
     def _touch(self, node_id: NodeId, pages: Optional[int]) -> None:
         """Touch the pages up to ``node_id``, once per node and interval;
@@ -591,8 +779,11 @@ class UnifiedCacheLinkerWrapper:
         tail_pages: int,
         resident_ends: list[int],
         hit_pages: int,
+        detail: object = None,
     ) -> None:
         page = self.cache.page_size
+        if detail is None:
+            detail = getattr(self.cache_linker, "last_lookup_detail", None)
         stats = self.lookup_stats
         stats["lookups"] += 1
         stats["tail_tokens"] += tail_pages * page
@@ -611,7 +802,7 @@ class UnifiedCacheLinkerWrapper:
                     resident_ends[-1] if resident_ends else 0,
                     tail_pages,
                     hit_pages,
-                    getattr(self.cache_linker, "last_lookup_detail", None),
+                    detail,
                 )
         if stats["lookups"] % 1024 == 0:
             logger.info(
@@ -630,15 +821,35 @@ class UnifiedCacheLinkerWrapper:
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
         makes the reduction an intersection.
         """
-        mask = torch.zeros(num_pages + 1, dtype=torch.int)
-        for pages in restorable:
-            if device_hit_pages < pages <= num_pages:
-                mask[pages] = 1
+        restorable = [pages for pages in restorable if pages > device_hit_pages]
+        return self._sync_restorable_prefixes([restorable], [num_pages])[0]
+
+    def _sync_restorable_prefixes(
+        self, restorables: list[list[int]], num_pages: list[int]
+    ) -> list[int]:
+        """``_sync_restorable_prefix`` for several tails in one reduction: their
+        masks laid end to end."""
+        offsets = [0]
+        for pages in num_pages:
+            offsets.append(offsets[-1] + pages + 1)
+        values = [0] * offsets[-1]
+        for restorable, start, limit in zip(restorables, offsets, num_pages):
+            for pages in restorable:
+                if 0 < pages <= limit:
+                    values[start + pages] = 1
+        mask = torch.tensor(values, dtype=torch.int)
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        common = mask.nonzero()
-        if common.numel() == 0:
-            return 0
-        return int(common[-1].item())
+        values = mask.tolist()
+        common = []
+        for start, end in zip(offsets, offsets[1:]):
+            segment = values[start:end]
+            common.append(
+                next(
+                    (pages for pages in reversed(range(end - start)) if segment[pages]),
+                    0,
+                )
+            )
+        return common
 
     def _resident_ends(self, key: RadixKey, start: int, end: int) -> list[int]:
         """Node ends past ``start`` on the device-resident Full path of
@@ -653,36 +864,13 @@ class UnifiedCacheLinkerWrapper:
         (path,) = tree_core.collect_path_info([node])
         return [info.path_end for info in path if start < info.path_end <= matched]
 
-    def _lookup(
-        self,
-        rid: str,
-        transfers: list[PoolTransfer],
-        device_hit_len: int,
-        resident_ends: list[int],
-    ) -> list[int]:
-        """Restorable tail lengths in pages. Resident KV needs no stored copy,
-        only a state where the hit ends, and a hit ends inside it only at a
-        node end."""
-        if not resident_ends:
-            return self.cache_linker.lookup(rid, transfers)
-        page = self.cache.page_size
-        resident_pages = (resident_ends[-1] - device_hit_len) // page
-        node_ends = {(end - device_hit_len) // page for end in resident_ends}
-        return [
-            pages
-            for pages in self.cache_linker.lookup(
-                rid, transfers, resident_pages=resident_pages
-            )
-            if pages > resident_pages or pages in node_ends
-        ]
-
     def _tail_hashes(
-        self, key: RadixKey, result: MatchResult, device_hit_len: int
+        self, key: RadixKey, last_device_node: NodeId, device_hit_len: int
     ) -> list[str]:
         """Per-page storage hashes for the device-uncached tail of the prefix."""
         last_hash = None
         if device_hit_len > 0:
-            last_hash = self.cache.get_last_hash_value(result.last_device_node)
+            last_hash = self.cache.get_last_hash_value(last_device_node)
             if last_hash is None:
                 # Without the anchor the tail would hash as if it started at the
                 # sequence head, yielding keys that can never match.
@@ -1222,6 +1410,7 @@ class UnifiedCacheLinkerWrapper:
         self._logged_short.clear()
         self.hit_markers.clear()
         self._probe_hits.clear()
+        self._round_device_hits.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -1239,6 +1428,7 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
         self._probe_hits.pop(rid, None)
+        self._round_device_hits.pop(rid, None)
         self._logged_short.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.

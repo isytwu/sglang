@@ -704,6 +704,25 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return result
 
+    def _linker_looks_up(self) -> bool:
+        return self.linker is not None and get_disagg().disaggregation_mode != "decode"
+
+    def begin_linker_lookup_round(self) -> None:
+        """Start a scheduling round: admission may reuse only this round's
+        external-store lookups. Every rank must call it at the same point."""
+        if self._linker_looks_up():
+            self.linker.begin_lookup_round()
+
+    def linker_lookup_batch_size(self) -> int:
+        """At most this many admissions are looked up together; 0 for none."""
+        return self.linker.lookup_batch_size if self._linker_looks_up() else 0
+
+    def prefetch_linker_lookups(self, entries: Sequence[tuple[Req, RadixKey]]) -> None:
+        """Look up together the admission keys of the requests this round is
+        about to admit; see :meth:`UnifiedCacheLinkerWrapper.prefetch_lookups`."""
+        if self._linker_looks_up() and entries:
+            self.linker.prefetch_lookups(entries)
+
     def supports_full_kv_only_match(self) -> bool:
         # Host or external-store hits carry Mamba-gated load plans.
         return (

@@ -150,6 +150,23 @@ def _config_seconds(value: Any, key: str) -> float:
     )
 
 
+def _pool_verdict(
+    transfer: PoolTransfer,
+    end: int,
+    page_exists: list[bool],
+    valid_pages: list[int],
+) -> tuple[str, int, int, int, int]:
+    """One pool's lookup verdict for the wrapper's short-lookup log: (name,
+    pages probed, pages present, first missing page, longest candidate left)."""
+    return (
+        str(getattr(transfer.name, "value", transfer.name)),
+        end,
+        sum(page_exists),
+        next((i for i, present in enumerate(page_exists) if not present), -1),
+        valid_pages[-1] if valid_pages else 0,
+    )
+
+
 def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
     """Materialize CPU indices used to derive per-pool row locations."""
     return indices.detach().to(device="cpu", dtype=torch.int64).flatten()
@@ -465,26 +482,49 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return component_keys, multiplier
 
     def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
-        entry = self.pools[transfer.name]
+        return self._pages_exist([(page_keys, transfer)])[0]
+
+    def _pages_exist(
+        self, probes: list[tuple[list[str], PoolTransfer]]
+    ) -> list[list[bool]]:
+        """Which pages of each probe are stored, for probes of one pool, with
+        their keys packed into as few existence RPCs as the budget allows."""
+        if not probes:
+            return []
+        entry = self.pools[probes[0][1].name]
         objects_per_page = 1 if entry.packed else len(entry.components)
         max_objects = CHUNK_PAGES * self.num_layers
         pages_per_call = max(1, max_objects // objects_per_page)
 
-        page_exists = []
-        for start in range(0, len(page_keys), pages_per_call):
-            chunk_pages = page_keys[start : start + pages_per_call]
-            object_keys, _ = self._object_keys_for_pages(chunk_pages, transfer)
-            exists = list(self.storage.client.batch_exists(object_keys))
-            if len(exists) != len(object_keys):
-                raise RuntimeError(
-                    f"UMBP exists result-size mismatch for pool {transfer.name}: "
-                    f"expected={len(object_keys)} actual={len(exists)}."
+        object_keys = []
+        for page_keys, transfer in probes:
+            for start in range(0, len(page_keys), pages_per_call):
+                keys, _ = self._object_keys_for_pages(
+                    page_keys[start : start + pages_per_call], transfer
                 )
-            page_exists.extend(
-                all(exists[index : index + objects_per_page])
-                for index in range(0, len(exists), objects_per_page)
-            )
-        return page_exists
+                object_keys.extend(keys)
+        # Whole pages per call: objects_per_page divides the call size.
+        per_call = pages_per_call * objects_per_page
+        exists = []
+        for start in range(0, len(object_keys), per_call):
+            chunk = object_keys[start : start + per_call]
+            found = list(self.storage.client.batch_exists(chunk))
+            if len(found) != len(chunk):
+                raise RuntimeError(
+                    f"UMBP exists result-size mismatch for pool {entry.name}: "
+                    f"expected={len(chunk)} actual={len(found)}."
+                )
+            exists.extend(found)
+        page_exists = [
+            all(exists[index : index + objects_per_page])
+            for index in range(0, len(exists), objects_per_page)
+        ]
+        result = []
+        start = 0
+        for page_keys, _ in probes:
+            result.append(page_exists[start : start + len(page_keys)])
+            start += len(page_keys)
+        return result
 
     @staticmethod
     def _apply_hit_policy(
@@ -519,8 +559,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return []
 
         valid_pages = list(range(1, len(page_keys) + 1))
-        # Per pool: (name, pages probed, pages present, first missing page,
-        # longest candidate left), for the wrapper's short-lookup log.
         detail = []
         for transfer in expanded:
             # Probe only as far as the surviving boundary: no hit policy reads
@@ -536,18 +574,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 page_keys[resident:end], transfer
             )
             valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
-            detail.append(
-                (
-                    str(getattr(transfer.name, "value", transfer.name)),
-                    end,
-                    sum(page_exists),
-                    next(
-                        (i for i, present in enumerate(page_exists) if not present),
-                        -1,
-                    ),
-                    valid_pages[-1] if valid_pages else 0,
-                )
-            )
+            detail.append(_pool_verdict(transfer, end, page_exists, valid_pages))
             if not valid_pages:
                 break
         self.last_lookup_detail = detail
@@ -561,6 +588,56 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 len(valid_pages),
             )
         return valid_pages
+
+    def lookup_batch(self, requests):
+        # lookup()'s pool-by-pool walk over every request at once, so that a
+        # pool costs one existence RPC (per budget chunk) for all of them.
+        probing = []
+        results = []
+        for _, transfers, resident_pages in requests:
+            expanded = self.pool_group.resolve_transfers(transfers)
+            kv = next((t for t in transfers if t.name == PoolName.KV), None)
+            page_keys = list(kv.keys or []) if expanded and kv is not None else []
+            valid_pages = list(range(1, len(page_keys) + 1))
+            results.append((valid_pages, []))
+            if page_keys:
+                probing.append((len(results) - 1, expanded, page_keys, resident_pages))
+        position = 0
+        while probing:
+            probes = []
+            for index, expanded, page_keys, resident_pages in probing:
+                transfer = expanded[position]
+                end = results[index][0][-1]
+                resident = 0
+                if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                    resident = min(resident_pages, end)
+                probes.append((page_keys[resident:end], transfer, resident, end))
+            exists = [None] * len(probes)
+            by_pool: dict[PoolName, list[int]] = {}
+            for index, (_, transfer, _, _) in enumerate(probes):
+                by_pool.setdefault(transfer.name, []).append(index)
+            for indices in by_pool.values():
+                found = self._pages_exist([probes[i][:2] for i in indices])
+                for index, present in zip(indices, found):
+                    exists[index] = present
+            still_probing = []
+            for request, probe, present in zip(probing, probes, exists):
+                index, expanded = request[0], request[1]
+                _, transfer, resident, end = probe
+                page_exists = [True] * resident + present
+                valid_pages = self._apply_hit_policy(
+                    results[index][0], page_exists, transfer
+                )
+                detail = results[index][1]
+                detail.append(_pool_verdict(transfer, end, page_exists, valid_pages))
+                results[index] = (valid_pages, detail)
+                if valid_pages and position + 1 < len(expanded):
+                    still_probing.append(request)
+            probing = still_probing
+            position += 1
+
+        self._stats["lookup"] += len(requests)
+        return results
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Lookup establishes a restorable boundary before insert de-duplicates

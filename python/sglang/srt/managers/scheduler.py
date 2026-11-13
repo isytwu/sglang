@@ -328,6 +328,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import (
+    admission_radix_key,
     checkpoint_kv_cache,
     peek_uncached_tokens,
 )
@@ -4446,6 +4447,27 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _linker_admission_candidates(self, adder: PrefillAdder) -> List[tuple]:
+        """The head of the waiting queue this round's token budget will likely
+        admit, with the keys their admission will match, so that their
+        external-store lookups run as one batch. Only rank-consistent state
+        picks them: the queue order and each request's probe hit."""
+        limit = self.tree_cache.linker_lookup_batch_size()
+        remaining = adder.rem_input_tokens
+        if adder.rem_chunk_tokens is not None:
+            remaining = min(remaining, adder.rem_chunk_tokens)
+        candidates = []
+        for req in self.waiting_queue:
+            if len(candidates) >= limit or remaining <= 0:
+                break
+            key = admission_radix_key(req, self.tree_cache)
+            if key is None:
+                continue
+            candidates.append((req, key))
+            # The one that overruns the budget is matched too, then chunked.
+            remaining -= max(1, len(key) - req.prefix_len - req.host_hit_length)
+        return candidates
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4506,6 +4528,8 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        if self.enable_unified_cache_external_linker:
+            self.tree_cache.begin_linker_lookup_round()
         # Get priority queue
         self.waiting_queue.replace(
             self.policy.calc_priority(
@@ -4600,6 +4624,10 @@ class Scheduler(
                     ),
                 )
 
+        if self.enable_unified_cache_external_linker:
+            self.tree_cache.prefetch_linker_lookups(
+                self._linker_admission_candidates(adder)
+            )
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
