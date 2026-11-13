@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import msgspec
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 from mori.cpp import TransferStatus
 from mori.io import (
@@ -75,6 +76,18 @@ def _normalize_state_indices_per_component(
         else:
             out.append(np.asarray(entry, dtype=np.int32).ravel())
     return out
+
+
+def _flatten_state_indices_per_component(
+    state_indices: Optional[List],
+) -> Optional[List[Optional[np.ndarray]]]:
+    """Flat views that read no element: the host copy may still be in flight."""
+    if state_indices is None:
+        return None
+    return [
+        None if entry is None else np.asarray(entry).reshape(-1)
+        for entry in state_indices
+    ]
 
 
 def _pack_state_indices(
@@ -408,6 +421,7 @@ class MoriKVManager(CommonKVManager):
     kv_status_msg_tag = MORI_GUARD
     kv_status_msg_carries_reason = True
     _coalesce_transfers = False
+    async_host_indices = False
 
     def __init__(
         self,
@@ -433,6 +447,7 @@ class MoriKVManager(CommonKVManager):
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._coalesce_transfers = envs.SGLANG_MORI_COALESCE_TRANSFERS.get()
+            self.async_host_indices = envs.SGLANG_MORI_ASYNC_HOST_INDICES.get()
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
             self._transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(self._num_shards)
@@ -655,6 +670,7 @@ class MoriKVManager(CommonKVManager):
 
         if kv_chunk.wait_event is not None:
             kv_chunk.wait_event.synchronize()
+        self._resolve_host_indices(kv_chunk)
 
         if self._should_skip_transfer(room):
             return True
@@ -688,6 +704,19 @@ class MoriKVManager(CommonKVManager):
             # and on the wire.
             self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
         return True
+
+    def _resolve_host_indices(self, kv_chunk: TransferKVChunk) -> None:
+        """Wait for the chunk's host index copies, then make them int32 arrays."""
+        if not self.async_host_indices:
+            return
+        if kv_chunk.indices_event is not None:
+            kv_chunk.indices_event.synchronize()
+            kv_chunk.indices_event = None
+        if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
+            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
+        kv_chunk.state_indices = _normalize_state_indices_per_component(
+            kv_chunk.state_indices
+        )
 
     def _wait_for_chunk_completion(
         self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
@@ -820,6 +849,9 @@ class MoriKVManager(CommonKVManager):
     ) -> Optional[List]:
         if self._should_skip_cp_replicated_state_transfer():
             return None
+        if self.async_host_indices:
+            # The transfer worker casts them once their copy event completes.
+            return _flatten_state_indices_per_component(state_indices)
         return _normalize_state_indices_per_component(state_indices)
 
     def add_transfer_request(
@@ -862,6 +894,7 @@ class MoriKVManager(CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 wait_event=wait_event,
+                indices_event=indices_event,
             )
         )
 
@@ -2272,6 +2305,10 @@ class MoriKVManager(CommonKVManager):
 
 
 class MoriKVSender(CommonKVSender):
+    @property
+    def supports_host_tensor_indices(self) -> bool:
+        return self.kv_mgr.async_host_indices
+
     def clear(self) -> None:
         if self.kv_mgr.enable_deferred_decode_kv_release:
             with self.kv_mgr._abort_ack_lock:

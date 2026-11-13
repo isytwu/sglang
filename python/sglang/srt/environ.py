@@ -1010,6 +1010,11 @@ class Envs:
     # call drops and retakes the GIL, so a hybrid model's last chunk otherwise
     # makes hundreds of GIL handoffs that stall the scheduler thread.
     SGLANG_MORI_COALESCE_TRANSFERS = EnvBool(False)
+    # Let the prefill scheduler hand the Mori sender asynchronous host copies of
+    # a chunk's page and state indices (as Mooncake does); the transfer worker
+    # waits on their event. Otherwise every send copies them to the host
+    # synchronously on the scheduler thread.
+    SGLANG_MORI_ASYNC_HOST_INDICES = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
     # true forces EPv2; false forces EPv1.
