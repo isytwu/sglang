@@ -216,6 +216,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._keep_states = keep_states
         self.tracks_state_paths = False
+        self.tracks_output_states = False
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -320,6 +321,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if keep_states:
                 if callable(getattr(client, "batch_remove", None)):
                     self.tracks_state_paths = True
+                    self.tracks_output_states = True
                 else:
                     logger.warning(
                         "UMBP keep_states_per_path is ignored: this mori client has "
@@ -381,6 +383,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload_batches": 0,
             # removed / remove_keys is how many objects asked to go were stored.
             "state_dropped": 0,
+            "output_state_dropped": 0,
             "remove_keys": 0,
             "removed": 0,
             "remove_failures": 0,
@@ -389,11 +392,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # keep_states_per_path: per queued offload, the state key it carries,
         # popped with its result; per queued state, the node-boundary keys
         # above it; the droppable states that landed, and per such state the
-        # children its landed descendants leave it by (two or more: a fork).
+        # children its landed descendants leave it by (two or more: a fork);
+        # per node-boundary key, the output states hanging below it that no
+        # later prompt has continued from yet.
         self._offload_state_keys: deque[Optional[str]] = deque()
-        self._state_paths: dict[str, tuple[list[str], bool]] = {}
+        self._state_paths: dict[str, tuple[list[str], bool, bool]] = {}
         self._kept_states: dict[str, None] = {}
         self._state_branches: dict[str, set[str]] = {}
+        self._open_outputs: dict[str, dict[str, None]] = {}
+        self._open_output_count = 0
         self._remove_queue: Queue[list[PoolTransfer] | None] = Queue(
             maxsize=_REMOVE_QUEUE_LIMIT
         )
@@ -1043,17 +1050,27 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     # ---- keep_states_per_path ----
 
     def note_state_path(
-        self, state_key: str, path_keys: list[str], replaceable: bool
+        self,
+        state_key: str,
+        path_keys: list[str],
+        replaceable: bool,
+        output: bool = False,
     ) -> None:
         """The node-boundary keys above the Mamba state ``state_key`` just
         queued, root first. Only a ``replaceable`` state (the end of an
-        inserted prompt or prefill chunk) is ever dropped."""
-        self._state_paths[state_key] = (path_keys, replaceable)
+        inserted prompt or prefill chunk) is ever dropped; an ``output`` state
+        ends a finished request's output."""
+        self._state_paths[state_key] = (path_keys, replaceable, output)
 
     def _state_landed(self, key: str, success: bool) -> None:
         """Once a state lands, drop the keep_states_per_path-th droppable state
         above it on its path, unless branches below that state landed states
         through more than one child.
+
+        An output state waits below its prompt: the first later state whose
+        path passes that prompt either continues from the output, which then
+        counts as any state, or leaves it, which drops it. Until then it
+        neither replaces the states above it nor makes them forks.
 
         Decided from the same queue and completion order on every rank, so the
         ranks drop the same states; a lookup still reads the store, so a dropped
@@ -1061,7 +1078,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         noted = self._state_paths.pop(key, None)
         if noted is None or not success:
             return
-        path_keys, replaceable = noted
+        path_keys, replaceable, output = noted
+        if output:
+            if path_keys:
+                self._open_output(path_keys[-1], key)
+            return
+        self._settle_outputs(path_keys)
         above = []
         for index in range(len(path_keys) - 1, -1, -1):
             ancestor = path_keys[index]
@@ -1090,6 +1112,40 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 del self._kept_states[oldest]
                 self._state_branches.pop(oldest, None)
             self._kept_states[key] = None
+
+    def _open_output(self, bound: str, key: str) -> None:
+        if self._open_output_count >= _KEPT_STATES_LIMIT:
+            # The oldest are left to the store's own eviction.
+            oldest = next(iter(self._open_outputs))
+            self._open_output_count -= len(self._open_outputs.pop(oldest))
+        self._open_outputs.setdefault(bound, {})[key] = None
+        self._open_output_count += 1
+
+    def _settle_outputs(self, path_keys: list[str]) -> None:
+        """A state landed below these boundaries: the open outputs below them
+        that its path continues from become ordinary states, the rest drop."""
+        if not self._open_outputs:
+            return
+        on_path = set(path_keys)
+        for bound in path_keys:
+            outputs = self._open_outputs.pop(bound, None)
+            if not outputs:
+                continue
+            self._open_output_count -= len(outputs)
+            for output_key in outputs:
+                if output_key in on_path:
+                    self._kept_states[output_key] = None
+                    continue
+                self._stats["output_state_dropped"] += 1
+                self.remove(
+                    [
+                        PoolTransfer(
+                            name=PoolName.MAMBA,
+                            keys=[output_key],
+                            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                        )
+                    ]
+                )
 
     def remove(self, transfers: list[PoolTransfer]) -> None:
         """Drop stored objects no later read needs."""
@@ -1144,6 +1200,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._state_paths.clear()
         self._kept_states.clear()
         self._state_branches.clear()
+        self._open_outputs.clear()
+        self._open_output_count = 0
         self.layer_done_counter.reset()
 
     def close(self) -> None:

@@ -740,10 +740,9 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
-        end_limit = 0
-        if self.linker.skip_output_offload and req.finished():
-            # A later turn continues from this prompt, never from its output.
-            end_limit = len(
+        prompt_end = 0
+        if req.finished():
+            prompt_end = len(
                 RadixKey(
                     req.origin_input_ids,
                     req.extra_key,
@@ -751,7 +750,10 @@ class UnifiedRadixCache(BasePrefixCache):
                     cache_salt=req.cache_salt,
                 ).page_aligned(self.page_size)
             )
-        return self.linker.offload_window(len(skip_key), end_limit)
+        # With skip_output_offload a later turn continues from this prompt,
+        # never from its output.
+        end_limit = prompt_end if self.linker.skip_output_offload else 0
+        return self.linker.offload_window(len(skip_key), end_limit, prompt_end)
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()

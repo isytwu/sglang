@@ -315,6 +315,9 @@ class UnifiedCacheLinkerWrapper:
         # Radix-key end past which an insert offloads nothing; 0 is no limit.
         # Set for finished requests when their output is never reused.
         self.offload_end_limit = 0
+        # Radix-key end of a finished request's prompt during its insert; the
+        # states past it end the request's output. 0 outside such an insert.
+        self.offload_prompt_end = 0
         self.skip_output_offload = (
             os.environ.get("SGLANG_LINKER_SKIP_OUTPUT_OFFLOAD") == "1"
         )
@@ -671,7 +674,13 @@ class UnifiedCacheLinkerWrapper:
             for info in path[:-1]
             if info.path_end >= page
         ]
-        self.cache_linker.note_state_path(key, bounds, replaceable)
+        if getattr(self.cache_linker, "tracks_output_states", False):
+            # A state past a finished request's prompt ends its output, which a
+            # later prompt may or may not continue from.
+            output = 0 < self.offload_prompt_end < path[-1].path_end
+            self.cache_linker.note_state_path(key, bounds, replaceable, output=output)
+        else:
+            self.cache_linker.note_state_path(key, bounds, replaceable)
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
@@ -683,16 +692,19 @@ class UnifiedCacheLinkerWrapper:
             self.offload_skip_prefix_len = 0
 
     @contextmanager
-    def offload_window(self, skip_prefix_len: int, end_limit: int):
+    def offload_window(self, skip_prefix_len: int, end_limit: int, prompt_end: int = 0):
         """During an insert, skip offloading the first ``skip_prefix_len``
-        radix-key units and everything past ``end_limit`` (0: no limit)."""
+        radix-key units and everything past ``end_limit`` (0: no limit);
+        ``prompt_end`` is a finished request's prompt end (0: not finished)."""
         self.offload_skip_prefix_len = skip_prefix_len
         self.offload_end_limit = end_limit
+        self.offload_prompt_end = prompt_end
         try:
             yield
         finally:
             self.offload_skip_prefix_len = 0
             self.offload_end_limit = 0
+            self.offload_prompt_end = 0
 
     def _drop_offload_past_end(
         self, node_id: NodeId, transfers: list[PoolTransfer]
