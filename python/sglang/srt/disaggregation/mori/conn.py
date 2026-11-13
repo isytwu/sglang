@@ -2203,7 +2203,18 @@ class MoriKVManager(CommonKVManager):
         if batch is None:
             return result_statuses
         # Post the KV and state writes before aux, the order of the uncoalesced path.
-        result_statuses.extend(self._post_write_batch(batch))
+        try:
+            result_statuses.extend(self._post_write_batch(batch))
+        except Exception:
+            # A post that raised part way (a session it had to create failed)
+            # has started the entries ahead of the failing one, and their
+            # statuses never came back, so no drain can prove the room quiet:
+            # it never ACKs, and decode waits out its release timeout instead
+            # of reusing pages those writes may still land in.
+            if self.enable_deferred_decode_kv_release:
+                with self._abort_ack_lock:
+                    self.poison_deferred_ack_room(bootstrap_room)
+            raise
         for target in aux_targets:
             result_statuses.extend(
                 self.send_aux(
