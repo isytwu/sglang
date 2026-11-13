@@ -1005,6 +1005,11 @@ class Envs:
     # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+    # Post all of a chunk's KV and state writes (every layer and state tensor)
+    # in one engine.batch_write call instead of one call per layer/tensor. Each
+    # call drops and retakes the GIL, so a hybrid model's last chunk otherwise
+    # makes hundreds of GIL handoffs that stall the scheduler thread.
+    SGLANG_MORI_COALESCE_TRANSFERS = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
     # true forces EPv2; false forces EPv1.

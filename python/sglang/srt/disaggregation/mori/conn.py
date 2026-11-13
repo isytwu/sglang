@@ -360,14 +360,40 @@ class _MoriTransferSubmissionError(RuntimeError):
         self.statuses = statuses
 
 
+class _WriteBatch:
+    """Writes collected from one chunk, posted with a single batch_write."""
+
+    def __init__(self) -> None:
+        self.src_descs: List[MemoryDesc] = []
+        self.local_offsets: List[List[int]] = []
+        self.dst_descs: List[MemoryDesc] = []
+        self.remote_offsets: List[List[int]] = []
+        self.sizes: List[List[int]] = []
+
+    def __len__(self) -> int:
+        return len(self.sizes)
+
+    def add(
+        self, src_desc: MemoryDesc, dst_desc: MemoryDesc, plan: BatchTransferPlan
+    ) -> None:
+        self.src_descs.append(src_desc)
+        self.local_offsets.append(plan.local_offsets)
+        self.dst_descs.append(dst_desc)
+        self.remote_offsets.append(plan.remote_offsets)
+        self.sizes.append(plan.sizes)
+
+
 class _SubmissionLocal(threading.local):
     """Per-thread sink for statuses issued by a submission still in progress.
 
     `statuses` is None outside a tracked submission, so a leaf that records
-    into it is a no-op on threads that are not submitting.
+    into it is a no-op on threads that are not submitting. `batch` is set while
+    a submission coalesces its writes; the leaves then queue into it instead of
+    posting.
     """
 
     statuses: Optional[List[TransferStatus]] = None
+    batch: Optional[_WriteBatch] = None
 
 
 class MoriKVManager(CommonKVManager):
@@ -381,6 +407,7 @@ class MoriKVManager(CommonKVManager):
     # is tagged. Mori has always shipped the failure reason with it.
     kv_status_msg_tag = MORI_GUARD
     kv_status_msg_carries_reason = True
+    _coalesce_transfers = False
 
     def __init__(
         self,
@@ -405,6 +432,7 @@ class MoriKVManager(CommonKVManager):
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._coalesce_transfers = envs.SGLANG_MORI_COALESCE_TRANSFERS.get()
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
             self._transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(self._num_shards)
@@ -1272,6 +1300,11 @@ class MoriKVManager(CommonKVManager):
         if plan.empty():
             return []
 
+        batch = self._submission_local.batch
+        if batch is not None:
+            batch.add(src_desc, dst_desc, plan)
+            return []
+
         transfer_uid = self.engine.allocate_transfer_uid()
 
         statuses = self.engine.batch_write(
@@ -1281,6 +1314,26 @@ class MoriKVManager(CommonKVManager):
             [plan.remote_offsets],
             [plan.sizes],
             [transfer_uid],
+        )
+        self._record_submitted_statuses(statuses)
+        return statuses
+
+    def _allocate_transfer_uids(self, n: int) -> List[int]:
+        allocate_many = getattr(self.engine, "allocate_transfer_uids", None)
+        if allocate_many is not None:
+            return list(allocate_many(n))
+        return [self.engine.allocate_transfer_uid() for _ in range(n)]
+
+    def _post_write_batch(self, batch: _WriteBatch) -> List[TransferStatus]:
+        if not len(batch):
+            return []
+        statuses = self.engine.batch_write(
+            batch.src_descs,
+            batch.local_offsets,
+            batch.dst_descs,
+            batch.remote_offsets,
+            batch.sizes,
+            self._allocate_transfer_uids(len(batch)),
         )
         self._record_submitted_statuses(statuses)
         return statuses
@@ -1427,10 +1480,14 @@ class MoriKVManager(CommonKVManager):
                     peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
                 )
             )
+            plan_cache: Dict[int, BatchTransferPlan] = {}
             for layer_id in range(layers_current_pp_stage):
-                layer_plan = self._build_contiguous_transfer_plan(
-                    grouped_plan, self.kv_args.kv_item_lens[layer_id]
-                )
+                item_len = self.kv_args.kv_item_lens[layer_id]
+                if item_len not in plan_cache:
+                    plan_cache[item_len] = self._build_contiguous_transfer_plan(
+                        grouped_plan, item_len
+                    )
+                layer_plan = plan_cache[item_len]
                 statuses.extend(
                     self._submit_batch_transfer_plan(
                         src_descs[layer_id],
@@ -1849,17 +1906,13 @@ class MoriKVManager(CommonKVManager):
                 ]
 
             for src_offset, dst_offset, size in blocks:
-                transfer_uid = self.engine.allocate_transfer_uid()
-                batch_statuses = self.engine.batch_write(
-                    [src_desc],
-                    [[src_offset]],
-                    [dst_desc],
-                    [[dst_offset]],
-                    [[size]],
-                    [transfer_uid],
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_desc,
+                        dst_desc,
+                        BatchTransferPlan([src_offset], [dst_offset], [size]),
+                    )
                 )
-                self._record_submitted_statuses(batch_statuses)
-                statuses.extend(batch_statuses)
 
         return statuses
 
@@ -1974,6 +2027,7 @@ class MoriKVManager(CommonKVManager):
             len(dst_state_mem_descs),
             allow_positional_fallback=self.pp_size == 1,
         )
+        plan_cache: Dict[int, BatchTransferPlan] = {}
         for i, j in pairs:
             src_desc = src_state_mem_descs[i]
             dst_desc = dst_state_mem_descs[j]
@@ -1984,12 +2038,14 @@ class MoriKVManager(CommonKVManager):
                 # descriptor describes an empty allocation. Skipping keeps the
                 # index alignment with state_mem_descs that registration relies on.
                 continue
+            if state_item_len not in plan_cache:
+                plan_cache[state_item_len] = self._build_contiguous_transfer_plan(
+                    grouped_plan, state_item_len
+                )
 
             statuses.extend(
                 self._submit_batch_transfer_plan(
-                    src_desc,
-                    dst_desc,
-                    self._build_contiguous_transfer_plan(grouped_plan, state_item_len),
+                    src_desc, dst_desc, plan_cache[state_item_len]
                 )
             )
 
@@ -2051,52 +2107,79 @@ class MoriKVManager(CommonKVManager):
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
 
         result_statuses: List[TransferStatus] = []
-        for target in targets:
-            info = target.info
-            peer_info = target.peer_info
+        aux_targets: List[TransferTarget] = []
+        batch = _WriteBatch() if self._coalesce_transfers else None
+        if batch is not None:
+            self._submission_local.batch = batch
+        try:
+            for target in targets:
+                info = target.info
+                peer_info = target.peer_info
 
-            if not info.is_dummy:
-                if peer_info.requires_dcp_relayout:
+                if not info.is_dummy:
+                    if peer_info.requires_dcp_relayout:
+                        result_statuses.extend(
+                            self.send_kvcache_dcp(
+                                peer_info,
+                                kv_indices,
+                                info.dst_kv_indices,
+                                src_page_offset=index_slice.start or 0,
+                                decode_prefix_len=info.decode_prefix_len or 0,
+                                num_kv_tokens=num_kv_tokens,
+                            )
+                        )
+                    else:
+                        result_statuses.extend(
+                            self.send_kvcache(
+                                peer_info,
+                                kv_indices,
+                                info.dst_kv_indices[index_slice],
+                            )
+                        )
+
+                if (
+                    is_last_chunk
+                    and state_indices is not None
+                    and not info.is_dummy
+                    and self.state_mem_descs
+                ):
                     result_statuses.extend(
-                        self.send_kvcache_dcp(
-                            peer_info,
-                            kv_indices,
-                            info.dst_kv_indices,
-                            src_page_offset=index_slice.start or 0,
-                            decode_prefix_len=info.decode_prefix_len or 0,
-                            num_kv_tokens=num_kv_tokens,
+                        self.send_state(
+                            peer_info, state_indices, info.dst_state_indices
                         )
                     )
-                else:
-                    result_statuses.extend(
-                        self.send_kvcache(
-                            peer_info,
-                            kv_indices,
-                            info.dst_kv_indices[index_slice],
+
+                if (
+                    is_last_chunk
+                    and aux_index is not None
+                    and info.dst_aux_index >= 0
+                    and self.pp_group.is_last_rank
+                ):
+                    if batch is None:
+                        result_statuses.extend(
+                            self.send_aux(
+                                peer_info, aux_index, info.dst_aux_index, bootstrap_room
+                            )
                         )
-                    )
+                    else:
+                        aux_targets.append(target)
+        finally:
+            if batch is not None:
+                self._submission_local.batch = None
 
-            if (
-                is_last_chunk
-                and state_indices is not None
-                and not info.is_dummy
-                and self.state_mem_descs
-            ):
-                result_statuses.extend(
-                    self.send_state(peer_info, state_indices, info.dst_state_indices)
+        if batch is None:
+            return result_statuses
+        # Post the KV and state writes before aux, the order of the uncoalesced path.
+        result_statuses.extend(self._post_write_batch(batch))
+        for target in aux_targets:
+            result_statuses.extend(
+                self.send_aux(
+                    target.peer_info,
+                    aux_index,
+                    target.info.dst_aux_index,
+                    bootstrap_room,
                 )
-
-            if (
-                is_last_chunk
-                and aux_index is not None
-                and info.dst_aux_index >= 0
-                and self.pp_group.is_last_rank
-            ):
-                result_statuses.extend(
-                    self.send_aux(
-                        peer_info, aux_index, info.dst_aux_index, bootstrap_room
-                    )
-                )
+            )
 
         return result_statuses
 
