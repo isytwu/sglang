@@ -147,6 +147,29 @@ class TestMoriAsyncHostIndices(CustomTestCase):
         self.assertEqual(out[0].shape, (1,))
         self.assertIsNone(out[1])
 
+    def test_scheduler_side_prepare_reads_no_element_of_listed_arrays(self):
+        # _mamba_payload sends the KDA slot as a list holding the host copy.
+        m = _manager(async_host_indices=True)
+        slot = np.array([7], dtype=np.int64)
+        pair = [np.array([1, 2], dtype=np.int64), np.array([3, 4], dtype=np.int64)]
+        out = m.prepare_send_state_indices([[slot], pair])
+        self.assertTrue(np.shares_memory(out[0], slot))
+        self.assertIs(out[1], pair)
+
+    def test_worker_sends_the_slot_the_copy_landed(self):
+        log = []
+        m = _manager(async_host_indices=True)
+        slot = np.array([777777], dtype=np.int64)  # the pinned buffer before the copy
+        pair = [np.array([0, 0], dtype=np.int64), np.array([3, 4], dtype=np.int64)]
+        chunk = _host_chunk(log)
+        chunk.state_indices = m.prepare_send_state_indices([[slot], pair])
+        slot[0] = 7
+        pair[0][:] = [1, 2]
+        m._resolve_host_indices(chunk)
+        self.assertEqual(chunk.state_indices[0].dtype, np.int32)
+        np.testing.assert_array_equal(chunk.state_indices[0], [7])
+        np.testing.assert_array_equal(chunk.state_indices[1], [1, 2, 3, 4])
+
     def test_sync_mode_keeps_casting_on_the_scheduler(self):
         m = _manager(async_host_indices=False)
         out = m.prepare_send_state_indices([np.array([[7]], dtype=np.int64)])

@@ -80,14 +80,23 @@ def _normalize_state_indices_per_component(
 
 def _flatten_state_indices_per_component(
     state_indices: Optional[List],
-) -> Optional[List[Optional[np.ndarray]]]:
-    """Flat views that read no element: the host copy may still be in flight."""
+) -> Optional[List]:
+    """Flat views that read no element: the host copy may still be in flight.
+
+    A component given as a list of arrays (the KDA state slot comes as [slot]) must
+    not go through np.asarray, which copies the elements now, before the copy lands:
+    one array becomes a view of it, several stay a list the worker joins later."""
     if state_indices is None:
         return None
-    return [
-        None if entry is None else np.asarray(entry).reshape(-1)
-        for entry in state_indices
-    ]
+    out = []
+    for entry in state_indices:
+        if isinstance(entry, (list, tuple)) and len(entry) == 1:
+            entry = entry[0]
+        if entry is None or isinstance(entry, (list, tuple)):
+            out.append(entry)
+        else:
+            out.append(np.asarray(entry).reshape(-1))
+    return out
 
 
 def _pack_state_indices(
