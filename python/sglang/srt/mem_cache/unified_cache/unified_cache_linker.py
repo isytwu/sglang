@@ -340,12 +340,15 @@ def _slot_of(indices: torch.Tensor) -> int:
 
 
 class _PendingOffload(NamedTuple):
-    lock_node_id: NodeId
-    lock_params: DecLockRefParams
+    # None for a written-back state, whose node may be gone by its ack.
+    lock_node_id: Optional[NodeId]
+    lock_params: Optional[DecLockRefParams]
     publish_node_ids: list[NodeId]
     # A Mamba state added to a node already stored or pending: the tree tracks
     # no external state for it, so its ack only releases the lock.
     state_only: bool = False
+    # The device slot a written-back state was copied into, freed at the ack.
+    staging: Optional[torch.Tensor] = None
 
 
 class UnifiedCacheLinkerWrapper:
@@ -439,6 +442,22 @@ class UnifiedCacheLinkerWrapper:
         # point, a recompute of an evicted state) would never get there.
         self._offload_states = ComponentType.MAMBA in cache.components
         self._state_offloaded: dict[NodeId, int] = {}
+        # Write a Mamba state back when the device evicts it instead of through
+        # at insert: --mamba-max-states-per-path replaces most states with a
+        # deeper one first, and a replaced state never reaches the store.
+        # Device slot -> (node, page hash) of each tree state not yet written.
+        self._state_write_back = (
+            self._offload_states
+            and os.environ.get("SGLANG_LINKER_STATE_WRITE_BACK") == "1"
+        )
+        self._unwritten_states: dict[int, tuple[NodeId, str]] = {}
+        # Slots freed while set were replaced along their path, not evicted.
+        self._states_superseded = False
+        # Written-back states copied out and not acked yet, at most this many.
+        self.state_write_back_slots = int(
+            os.environ.get("SGLANG_LINKER_STATE_WRITE_BACK_SLOTS", "8")
+        )
+        self._staged_states = 0
         # Radix-key end past which an insert offloads nothing; 0 is no limit.
         # Set for finished requests when their output is never reused.
         self.offload_end_limit = 0
@@ -451,6 +470,8 @@ class UnifiedCacheLinkerWrapper:
             "output_trimmed": 0,
             "output_skipped": 0,
             "states_removed": 0,
+            "states_written_back": 0,
+            "states_dropped": 0,
         }
         self._remove_states = cache_linker.supports_remove
         # Lookups restoring under half of a long tail are logged once per
@@ -1069,10 +1090,15 @@ class UnifiedCacheLinkerWrapper:
                 transfers = self._drop_offload_past_end(node_id, transfers)
                 if transfers is None:
                     continue
-            if self._offload_node(node_id, transfers):
-                state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
-                if state is not None:
-                    self._state_offloaded[node_id] = _slot_of(state.device_indices)
+            state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+            if state is not None and self._state_write_back:
+                self._remember_state(
+                    node_id, _slot_of(state.device_indices), state.keys[-1]
+                )
+                transfers = [t for t in transfers if t.name != PoolName.MAMBA]
+                state = None
+            if self._offload_node(node_id, transfers) and state is not None:
+                self._state_offloaded[node_id] = _slot_of(state.device_indices)
 
     def offload_new_state(self, node_id: NodeId) -> None:
         """Offload the Mamba state an insert left on ``node_id`` when the
@@ -1087,12 +1113,20 @@ class UnifiedCacheLinkerWrapper:
         slot = _slot_of(value)
         if self._state_offloaded.get(node_id) == slot:
             return
+        if (
+            self._state_write_back
+            and self._unwritten_states.get(slot, (None,))[0] == node_id
+        ):
+            return
         if self.offload_end_limit:
             (path,) = tree_core.collect_path_info([node_id])
             if not path or path[-1].path_end > self.offload_end_limit:
                 return
         hashes = tree_core.get_hash_values(node_id)
         if not hashes:
+            return
+        if self._state_write_back:
+            self._remember_state(node_id, slot, hashes[-1])
             return
         # The component's own OFFLOAD transfer: one state, keyed by the node end.
         transfer = PoolTransfer(
@@ -1118,6 +1152,83 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.append(
             _PendingOffload(node_id, lock_params, [], state_only=True)
         )
+
+    # ---- state write-back: a Mamba state reaches the store when evicted ----
+
+    def _remember_state(self, node_id: NodeId, slot: int, page_hash: str) -> None:
+        # A slot holds one tree state at a time: a reused slot names its new one.
+        self._unwritten_states[slot] = (node_id, page_hash)
+
+    @contextmanager
+    def superseded_states(self):
+        """Mark device frees as the path cap's: a deeper state on the same
+        path replaced each one, so none is written back."""
+        self._states_superseded = True
+        try:
+            yield
+        finally:
+            self._states_superseded = False
+
+    def before_state_free(self, slots: torch.Tensor) -> None:
+        """Write back the tree states in ``slots`` before the device frees them.
+
+        Each state is copied into a free slot on the current stream, which every
+        later forward waits on before it can write the freed slot, and the copy
+        is offloaded from there; its slot returns at the offload's ack. Without
+        a free slot, or past ``state_write_back_slots`` copies in flight, the
+        state is dropped, as a store without it would have.
+
+        The tree tracks no external state for a state, and every rank evicts
+        the same states and holds the same free slots, so the ranks agree on
+        every pending offload this queues.
+        """
+        if not self._unwritten_states:
+            return
+        for index, slot in enumerate(slots.reshape(-1).tolist()):
+            entry = self._unwritten_states.pop(slot, None)
+            if entry is None or self._states_superseded:
+                continue
+            node_id, page_hash = entry
+            source = slots.reshape(-1)[index : index + 1]
+            if not self._write_back_state(source, page_hash):
+                self.offload_stats["states_dropped"] += 1
+
+    def _write_back_state(self, source: torch.Tensor, page_hash: str) -> bool:
+        if self._staged_states >= self.state_write_back_slots:
+            return False
+        storage, sub_pool = self.cache.components[ComponentType.MAMBA]._state()
+        staging = storage.take_state_slots(sub_pool, 1)
+        if staging is None:
+            return False
+        storage.copy_state(sub_pool, source, staging)
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            device_indices=staging,
+            keys=[page_hash],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        try:
+            queued = self.cache_linker.offload([transfer])
+        except BaseException:
+            storage.free_state_slots(sub_pool, staging)
+            raise
+        if not queued:
+            storage.free_state_slots(sub_pool, staging)
+            return False
+        self._staged_states += 1
+        self.offload_stats["states_written_back"] += 1
+        self.pending_offloads.append(
+            _PendingOffload(None, None, [], state_only=True, staging=staging)
+        )
+        return True
+
+    def _release_offload(self, pending: _PendingOffload) -> None:
+        if pending.lock_node_id is not None:
+            self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+        if pending.staging is not None:
+            storage, sub_pool = self.cache.components[ComponentType.MAMBA]._state()
+            storage.free_state_slots(sub_pool, pending.staging)
+            self._staged_states -= 1
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
@@ -1300,7 +1411,7 @@ class UnifiedCacheLinkerWrapper:
                 self._state_offloaded.pop(pending.lock_node_id, None)
                 if pending.state_only:
                     self.offload_stats["state_only_failed"] += 1
-            self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+            self._release_offload(pending)
 
     def start_layer_wise_loading(self) -> int:
         self.inflight_load_index = self.cache_linker.start_layer_wise_loading()
@@ -1344,7 +1455,8 @@ class UnifiedCacheLinkerWrapper:
     def path_state_holders(self, tail: NodeId) -> list[NodeId]:
         """Nodes above ``tail`` holding a device Mamba state, read before the
         path cap runs, when the store can drop what it evicts."""
-        if not self._remove_states:
+        # Written back only when evicted, a replaced state is not in the store.
+        if not self._remove_states or self._state_write_back:
             return []
         try:
             tree_core = self.cache.tree_core
@@ -1407,6 +1519,7 @@ class UnifiedCacheLinkerWrapper:
         self._completed_offloads.clear()
         self._touched.clear()
         self._state_offloaded.clear()
+        self._unwritten_states.clear()
         self._logged_short.clear()
         self.hit_markers.clear()
         self._probe_hits.clear()
@@ -1422,7 +1535,7 @@ class UnifiedCacheLinkerWrapper:
                 self.cache.tree_core.finish_external_linker_offload(
                     pending.publish_node_ids, pending.lock_node_id, False
                 )
-            self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+            self._release_offload(pending)
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:

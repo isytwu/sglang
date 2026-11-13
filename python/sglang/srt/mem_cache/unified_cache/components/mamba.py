@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -747,6 +748,9 @@ class MambaComponent(TreeComponent):
         if storage.quantizes_checkpoints(sub_pool):
             storage.free_checkpoints(sub_pool, mamba_value)
         else:
+            linker = self.cache.linker
+            if linker is not None:
+                linker.before_state_free(mamba_value)
             storage.free_state_slots(sub_pool, mamba_value)
 
     def _select_finished_checkpoint(
@@ -1288,7 +1292,10 @@ class MambaComponent(TreeComponent):
                     result.cache_actions,
                 )
             finally:
-                self.cache._apply_eviction_result(result)
+                with (
+                    linker.superseded_states() if linker is not None else nullcontext()
+                ):
+                    self.cache._apply_eviction_result(result)
             if holders:
                 linker.remove_replaced_states(holders)
             return
