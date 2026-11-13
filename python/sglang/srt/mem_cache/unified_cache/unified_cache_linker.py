@@ -31,6 +31,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import replace
+from itertools import islice
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -1385,18 +1386,39 @@ class UnifiedCacheLinkerWrapper:
         )
         return torch.tensor([count, first_failure], dtype=torch.int)
 
-    def commit_offload_completion_report(self, report: torch.Tensor) -> None:
+    def offload_completion_verdicts(self, report: torch.Tensor) -> Optional[torch.Tensor]:
+        """For a reduced report whose earliest failure is not the last result
+        every rank holds, this rank's verdicts on all of those results, to
+        reduce as well: an offload batch fails as a unit, and committing one
+        failure per step would hold every later offload's node lock that
+        long. None otherwise; it reads only the reduced report, so every rank
+        decides alike."""
+        count, first_failure = report.tolist()
+        if first_failure >= count - 1:
+            return None
+        return torch.tensor(
+            [int(ok) for ok in islice(self._completed_offloads, count)],
+            dtype=torch.int,
+        )
+
+    def commit_offload_completion_report(
+        self, report: torch.Tensor, verdicts: Optional[torch.Tensor] = None
+    ) -> None:
         """Commit what a reduced ``offload_completion_report`` agreed on: every
         rank's offloads below the earliest failure landed, and that one failed
-        on some rank. Later results wait for the next step."""
+        on some rank. Later results wait for the next step, unless their
+        reduced ``verdicts`` came along."""
         count, first_failure = report.tolist()
-        committed = min(count, first_failure + 1)
+        if verdicts is None:
+            committed = min(count, first_failure + 1)
+            successes = [index != first_failure for index in range(committed)]
+        else:
+            committed = count
+            successes = [bool(ok) for ok in verdicts.tolist()]
         assert committed <= len(self._completed_offloads)
         for _ in range(committed):
             self._completed_offloads.popleft()
-        self.commit_completed_offloads(
-            [index != first_failure for index in range(committed)]
-        )
+        self.commit_completed_offloads(successes)
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)

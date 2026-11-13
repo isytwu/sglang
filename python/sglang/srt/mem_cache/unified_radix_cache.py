@@ -4170,7 +4170,12 @@ class UnifiedRadixCache(BasePrefixCache):
             report = self.linker.offload_completion_report()
             if report is not None:
                 self._all_reduce_attn_groups(report, torch.distributed.ReduceOp.MIN)
-                self.linker.commit_offload_completion_report(report)
+                verdicts = self.linker.offload_completion_verdicts(report)
+                if verdicts is not None:
+                    self._all_reduce_attn_groups(
+                        verdicts, torch.distributed.ReduceOp.MIN
+                    )
+                self.linker.commit_offload_completion_report(report, verdicts)
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.

@@ -1409,9 +1409,19 @@ def _reduce_with_peer(peer_results, calls):
     """A MIN reduction with one peer rank whose completed offloads, in order,
     are ``peer_results``; the peer commits what the reduction agrees on."""
 
+    verdicts_due = []
+
     def reduce(report, op):
         assert op == torch.distributed.ReduceOp.MIN
         calls.append(report.tolist())
+        if verdicts_due:
+            count = verdicts_due.pop()
+            peer = torch.tensor(
+                [int(ok) for ok in peer_results[:count]], dtype=report.dtype
+            )
+            report.copy_(torch.minimum(report, peer))
+            del peer_results[:count]
+            return
         first_failure = next(
             (index for index, ok in enumerate(peer_results) if not ok),
             len(peer_results),
@@ -1419,7 +1429,10 @@ def _reduce_with_peer(peer_results, calls):
         peer = torch.tensor([len(peer_results), first_failure], dtype=report.dtype)
         report.copy_(torch.minimum(report, peer))
         count, first_failure = report.tolist()
-        del peer_results[: min(count, first_failure + 1)]
+        if first_failure < count - 1:
+            verdicts_due.append(count)
+        else:
+            del peer_results[: min(count, first_failure + 1)]
 
     return reduce
 
@@ -1447,11 +1460,11 @@ def test_check_hicache_events_fails_an_offload_any_rank_failed():
     cache, linker, nodes = _pending_offload_wrapper(3, reduce)
     linker.completed_offloads.extend([True, False, True])
 
-    for _ in range(3):
-        cache.check_hicache_events()
+    cache.check_hicache_events()
 
-    # Each failure commits on its own step, with the successes before it.
-    assert calls == [[3, 1], [2, 0], [1, 1]]
+    # A failure ahead of the last agreed result reduces all their verdicts,
+    # so every agreed result commits in the same step.
+    assert calls == [[3, 1], [1, 0, 1]]
     assert [node.external_cache_stored for node in nodes.values()] == [
         False,
         False,
