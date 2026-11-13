@@ -4147,20 +4147,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
-                [self.linker.num_completed_offloads()],
-                dtype=torch.int,
-                device="cpu",
-            )
-            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            offload_count = int(finish_counts.item())
-            local_successes = self.linker.take_completed_offloads(offload_count)
-            if local_successes:
-                successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
-                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
-                self.linker.commit_completed_offloads(
-                    [bool(success) for success in successes.tolist()]
-                )
+            # One reduction agrees on both the count and the verdicts.
+            report = self.linker.offload_completion_report()
+            if report is not None:
+                self._all_reduce_attn_groups(report, torch.distributed.ReduceOp.MIN)
+                self.linker.commit_offload_completion_report(report)
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.

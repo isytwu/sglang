@@ -1382,31 +1382,122 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
     assert wrapper.inflight_load_rids == []
 
 
-def test_check_hicache_events_commits_common_rank_results():
-    committed = []
+def _pending_offload_wrapper(num_pending, reduce):
+    """A wrapper with ``num_pending`` offloads in flight on a cache whose
+    reduction is ``reduce``."""
+    nodes = {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in range(num_pending)
+    }
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache.linker = SimpleNamespace(
-        num_completed_offloads=lambda: 3,
-        take_completed_offloads=lambda count: [True] * count,
-        commit_completed_offloads=committed.append,
-    )
+    cache.tree_core = _FakeExternalTreeCore(nodes)
+    cache.tree_components = (ComponentType.FULL,)
+    cache._components_tuple = ()
+    cache.components = {}
+    cache.inc_lock_ref = lambda node_id: SimpleNamespace(to_dec_params=lambda: None)
+    cache.dec_lock_ref = lambda node_id, params: None
+    cache._all_reduce_attn_groups = reduce
+    linker = _FakeLinker()
+    cache.linker = UnifiedCacheLinkerWrapper(cache, linker)
+    cache.linker.offload_nodes(list(nodes))
+    return cache, linker, nodes
 
-    reduce_calls = 0
 
-    def reduce_to_common_state(value, op):
-        nonlocal reduce_calls
+def _reduce_with_peer(peer_results, calls):
+    """A MIN reduction with one peer rank whose completed offloads, in order,
+    are ``peer_results``; the peer commits what the reduction agrees on."""
+
+    def reduce(report, op):
         assert op == torch.distributed.ReduceOp.MIN
-        reduce_calls += 1
-        if reduce_calls == 1:
-            value.copy_(torch.tensor([1]))
-        else:
-            value.fill_(0)
+        calls.append(report.tolist())
+        first_failure = next(
+            (index for index, ok in enumerate(peer_results) if not ok),
+            len(peer_results),
+        )
+        peer = torch.tensor([len(peer_results), first_failure], dtype=report.dtype)
+        report.copy_(torch.minimum(report, peer))
+        count, first_failure = report.tolist()
+        del peer_results[: min(count, first_failure + 1)]
 
-    cache._all_reduce_attn_groups = reduce_to_common_state
+    return reduce
+
+
+def test_check_hicache_events_commits_common_rank_results():
+    calls = []
+    # The peer rank has finished one offload, which failed.
+    reduce = _reduce_with_peer([False], calls)
+    cache, linker, nodes = _pending_offload_wrapper(3, reduce)
+    linker.completed_offloads.extend([True, True, True])
 
     cache.check_hicache_events()
 
-    assert committed == [[False]]
+    # One two-element reduction carries the count and the first failure.
+    assert calls == [[3, 3]]
+    assert [node.write_through_pending_id for node in nodes.values()] == [None, 1, 2]
+    assert not nodes[0].external_cache_stored
+    # The two results the peer has not reported wait for the next step.
+    assert cache.linker.num_completed_offloads() == 2
+
+
+def test_check_hicache_events_fails_an_offload_any_rank_failed():
+    calls = []
+    reduce = _reduce_with_peer([False, True, True], calls)
+    cache, linker, nodes = _pending_offload_wrapper(3, reduce)
+    linker.completed_offloads.extend([True, False, True])
+
+    for _ in range(3):
+        cache.check_hicache_events()
+
+    # Each failure commits on its own step, with the successes before it.
+    assert calls == [[3, 1], [2, 0], [1, 1]]
+    assert [node.external_cache_stored for node in nodes.values()] == [
+        False,
+        False,
+        True,
+    ]
+    assert cache.linker.pending_offloads == []
+
+
+def test_check_hicache_events_commits_successes_up_to_the_first_failure():
+    calls = []
+    reduce = _reduce_with_peer([True, True, False], calls)
+    cache, linker, nodes = _pending_offload_wrapper(3, reduce)
+    linker.completed_offloads.extend([True, True, True])
+
+    cache.check_hicache_events()
+
+    assert [node.external_cache_stored for node in nodes.values()] == [
+        True,
+        True,
+        False,
+    ]
+    assert cache.linker.pending_offloads == []
+
+
+def test_check_hicache_events_reports_buffered_results_again():
+    def reduce_identity(report, op):
+        pass
+
+    cache, linker, nodes = _pending_offload_wrapper(2, reduce_identity)
+    linker.completed_offloads.append(True)
+    cache.linker.offload_completion_report()  # taken, never reduced
+    linker.completed_offloads.append(True)
+
+    cache.check_hicache_events()
+
+    assert all(node.external_cache_stored for node in nodes.values())
+    assert cache.linker.pending_offloads == []
+
+
+def test_check_hicache_events_skips_the_collective_with_nothing_pending():
+    reduce = MagicMock()
+    cache, _, _ = _pending_offload_wrapper(0, reduce)
+
+    cache.check_hicache_events()
+
+    reduce.assert_not_called()
 
 
 @pytest.mark.parametrize(

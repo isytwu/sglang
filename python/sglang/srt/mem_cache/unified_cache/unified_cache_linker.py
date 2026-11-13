@@ -26,6 +26,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -68,6 +69,9 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
         ComponentType.MAMBA,
     }
 )
+
+# Offload results a rank takes from its backend ahead of the ranks' agreement.
+OFFLOAD_REPORT_WINDOW = 32
 
 
 class LayerWiseLoadCounter:
@@ -350,6 +354,8 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Results taken from the backend that the ranks have not agreed on yet.
+        self._completed_offloads: deque[bool] = deque()
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
         self._touch_interval_s = cache_linker.touch_interval_s
@@ -1042,12 +1048,56 @@ class UnifiedCacheLinkerWrapper:
 
     def num_completed_offloads(self) -> int:
         return min(
-            self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
+            len(self._completed_offloads) + self.cache_linker.num_completed_offloads(),
+            len(self.pending_offloads),
         )
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
-        return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
+        taken = []
+        for _ in range(finish_count):
+            if self._completed_offloads:
+                taken.append(self._completed_offloads.popleft())
+            else:
+                taken.append(self.cache_linker.pop_completed_offload())
+        return taken
+
+    def offload_completion_report(self) -> Optional[torch.Tensor]:
+        """This rank's completed offloads for the per-step MIN reduction, as
+        ``[count, first failure]``, the failure index being the count when
+        none failed. Two elements, because a gloo reduction of one or two
+        costs half of one of four or more.
+
+        None when no offload is pending: inserts queue offloads in rank
+        lockstep, so every rank skips the reduction together.
+        """
+        if not self.pending_offloads:
+            return None
+        window = min(len(self.pending_offloads), OFFLOAD_REPORT_WINDOW)
+        while (
+            len(self._completed_offloads) < window
+            and self.cache_linker.num_completed_offloads()
+        ):
+            self._completed_offloads.append(self.cache_linker.pop_completed_offload())
+        count = len(self._completed_offloads)
+        first_failure = next(
+            (index for index, ok in enumerate(self._completed_offloads) if not ok),
+            count,
+        )
+        return torch.tensor([count, first_failure], dtype=torch.int)
+
+    def commit_offload_completion_report(self, report: torch.Tensor) -> None:
+        """Commit what a reduced ``offload_completion_report`` agreed on: every
+        rank's offloads below the earliest failure landed, and that one failed
+        on some rank. Later results wait for the next step."""
+        count, first_failure = report.tolist()
+        committed = min(count, first_failure + 1)
+        assert committed <= len(self._completed_offloads)
+        for _ in range(committed):
+            self._completed_offloads.popleft()
+        self.commit_completed_offloads(
+            [index != first_failure for index in range(committed)]
+        )
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
@@ -1166,6 +1216,7 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self._completed_offloads.clear()
         self._touched.clear()
         self._state_offloaded.clear()
         self._logged_short.clear()
@@ -1197,6 +1248,7 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
+        self._completed_offloads.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()
