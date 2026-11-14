@@ -28,7 +28,8 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
-from sglang.srt.utils.common import is_gfx95_supported, rank0_log
+from sglang.srt.utils.device import is_gfx95_supported
+from sglang.srt.utils.log_utils import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -537,13 +538,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             self._fused_chain_verify_fn = fused_kda_conv_gating_verify
             rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
-        self._hip_chain_verify_fn = None
-        if is_gfx95_supported() and verify_backend.is_triton():
-            from sglang.srt.layers.attention.linear.kda_backend_hip import (
-                kda_chain_verify_gfx950,
-            )
-
-            self._hip_chain_verify_fn = kda_chain_verify_gfx950
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -755,13 +749,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
-        if (
-            self.kernel_dispatcher.extend_kernel.wants_int64_query_start_loc
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self.forward_metadata.query_start_loc_i64 = (
-                self.forward_metadata.query_start_loc.to(torch.int64)
-            )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1214,7 +1201,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            query_start_loc_i64=self.forward_metadata.query_start_loc_i64,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
@@ -1346,7 +1332,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
             forward_batch.req_pool_indices,
-            lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
             self.req_to_token_pool.size,
         )
 
@@ -1386,26 +1372,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
-            if self._hip_chain_verify_fn is not None:
-                core_attn_out = self._hip_chain_verify_fn(
-                    layer,
-                    mixed_qkv=mixed_qkv,
-                    a=a,
-                    b=b,
-                    draft_token_num=draft_token_num,
-                    conv_states=conv_states,
-                    conv_state_indices=conv_state_indices,
-                    ssm_states=ssm_states,
-                    intermediate_state_cache=intermediate_state_cache,
-                    intermediate_conv_window_cache=intermediate_conv_window_cache,
-                    intermediate_state_indices=intermediate_state_indices[:batch_size],
-                    retrieve_next_token=retrieve_next_token,
-                    retrieve_next_sibling=retrieve_next_sibling,
-                    retrieve_parent_token=retrieve_parent_token,
-                    ring_kwargs=ring_kwargs,
-                )
-                if core_attn_out is not None:
-                    return core_attn_out
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
@@ -1833,9 +1799,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
-        # Only per-token scratch grows with the verify window; the staged
-        # recurrent state is independent of its length.
-        if not 2 <= draft_token_num <= 16:
+        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
+        # specialized per block size and capped at 8 by shared-memory growth.
+        if not 2 <= draft_token_num <= 8:
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -1863,9 +1829,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if layer.conv_weights.dtype != torch.float32:
             return False
+        # fp32 or bf16 state (bf16 load/store, fp32 recurrence in-kernel).
+        if ssm_states.dtype == torch.float32:
+            state_align = 4
+        elif ssm_states.dtype == torch.bfloat16:
+            state_align = 8
+        else:
+            return False
+        # 16-byte cp.async of the state: slot pitch / offset in whole vectors.
         if (
-            ssm_states.dtype != torch.float32
-            or tuple(ssm_states.shape[-3:])
+            tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
             or tuple(ssm_states.stride()[-3:])
             != (
@@ -1873,8 +1846,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 1,
             )
-            or ssm_states.stride(0) % 4 != 0
-            or ssm_states.storage_offset() % 4 != 0
+            or ssm_states.stride(0) % state_align != 0
+            or ssm_states.storage_offset() % state_align != 0
         ):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
@@ -1885,6 +1858,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # no recurrent fallback without intermediate_ssm).
             return replayssm_rawv is not None
         if intermediate_state_cache.shape[1] < draft_token_num:
+            return False
+        if intermediate_state_cache.dtype != ssm_states.dtype:
             return False
         if tuple(intermediate_state_cache.shape[-3:]) != (
             layer.num_v_heads,

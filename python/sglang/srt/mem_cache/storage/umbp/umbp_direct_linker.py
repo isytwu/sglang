@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
-from queue import Empty, Full, Queue
+from queue import Empty, Queue
 from typing import Any, Callable
 
 import numpy as np
@@ -43,8 +42,6 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
-# Pending touches beyond this are dropped: the store has stopped answering.
-_TOUCH_QUEUE_LIMIT = 1024
 
 
 def _storage_suffix(
@@ -129,21 +126,6 @@ def _config_bool(value: Any, key: str) -> bool:
     raise ValueError(f"UMBP linker config {key!r} must be boolean, got {value!r}.")
 
 
-def _config_seconds(value: Any, key: str) -> float:
-    if not isinstance(value, bool):
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            pass
-        else:
-            if math.isfinite(seconds) and seconds >= 0:
-                return seconds
-    raise ValueError(
-        f"UMBP linker config {key!r} must be a finite number of seconds >= 0, "
-        f"got {value!r}."
-    )
-
-
 def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
     """Materialize CPU indices used to derive per-pool row locations."""
     return indices.detach().to(device="cpu", dtype=torch.int64).flatten()
@@ -160,6 +142,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         _storage=None,
         forward_stream=None,
     ):
+        extra_config = dict(extra_config or {})
+        if extra_config.pop("load_mode", "layer_wise") != "layer_wise":
+            raise ValueError("UMBP linker does not implement prefetch loading.")
         self.forward_stream = forward_stream
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
@@ -213,12 +198,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = dict(extra_config or {})
-        # Seconds between touches of one device-hit prefix; 0 turns them off.
-        touch_requested = "touch_interval_s" in extra_config
-        touch_interval_s = _config_seconds(
-            extra_config.pop("touch_interval_s", 30), "touch_interval_s"
-        )
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -320,16 +299,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     "(both scratch arenas must be non-zero), and note that a "
                     "read-only SharedSSDFollower is whole-object by design."
                 )
-            # The DRAM tier evicts by last write or read, and device hits read
-            # nothing, so the prefixes hottest on the device look oldest here.
-            if touch_interval_s > 0:
-                if callable(getattr(client, "batch_touch", None)):
-                    self.touch_interval_s = touch_interval_s
-                elif touch_requested:
-                    logger.warning(
-                        "UMBP touch_interval_s is ignored: this mori client has no "
-                        "batch_touch."
-                    )
             get_backend_mode = getattr(client, "get_backend_mode", None)
             self.backend_mode = (
                 get_backend_mode() if callable(get_backend_mode) else None
@@ -359,12 +328,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # it could not have shown an embedded run for what it was.
             logger.info(
                 "UMBPDirectLinker topology=%s+%s ranged_io=yes "
-                "rank_replicated=%s suffix=%s touch_interval_s=%s",
+                "rank_replicated=%s suffix=%s",
                 mode.name,
                 self.backend_mode.name if self.backend_mode is not None else None,
                 rank_replicated,
                 rank_suffix,
-                self.touch_interval_s,
             )
         except BaseException:
             self.storage.close()
@@ -384,25 +352,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
-            # touched / touch_keys is how many touched objects were stored.
-            "touch_keys": 0,
-            "touched": 0,
-            "touch_failures": 0,
-            "touch_dropped": 0,
-            # removed / remove_keys is how many objects asked to go were stored.
-            "remove_keys": 0,
-            "removed": 0,
-            "remove_failures": 0,
-            "remove_dropped": 0,
         }
-        self._touch_queue: Queue[list[PoolTransfer] | None] = Queue(
-            maxsize=_TOUCH_QUEUE_LIMIT
-        )
-        self._remove_queue: Queue[list[PoolTransfer] | None] = Queue(
-            maxsize=_TOUCH_QUEUE_LIMIT
-        )
-        # A mori without BatchRemove keeps every object until it evicts it.
-        self.can_remove = hasattr(self.storage.client, "batch_remove")
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -413,23 +363,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             daemon=True,
             name=f"umbp-offload-tp{tp_rank}",
         )
-        self._touch_thread = threading.Thread(
-            target=self._touch_thread_func,
-            daemon=True,
-            name=f"umbp-touch-tp{tp_rank}",
-        )
-        self._remove_thread = threading.Thread(
-            target=self._remove_thread_func,
-            daemon=True,
-            name=f"umbp-remove-tp{tp_rank}",
-        )
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
-        if self.touch_interval_s is not None:
-            self._touch_thread.start()
-        if self.can_remove:
-            self._remove_thread.start()
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -510,10 +446,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ]
         raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
-    def lookup(
-        self, rid: str, transfers: list[PoolTransfer], resident_pages: int = 0
-    ) -> list[int]:
-        self.last_lookup_detail = []
+    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -523,38 +456,16 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return []
 
         valid_pages = list(range(1, len(page_keys) + 1))
-        # Per pool: (name, pages probed, pages present, first missing page,
-        # longest candidate left), for the wrapper's short-lookup log.
-        detail = []
         for transfer in expanded:
             # Probe only as far as the surviving boundary: no hit policy reads
             # past its own end offset, so pages beyond the longest candidate
             # cannot change the answer. This runs synchronously inside the
             # scheduler's prefill batch build, and DP-attention ranks are
             # lockstep, so every extra key is stall charged to all of them.
-            end = valid_pages[-1]
-            resident = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                resident = min(resident_pages, end)
-            page_exists = [True] * resident + self._page_exists(
-                page_keys[resident:end], transfer
-            )
+            page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer)
             valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
-            detail.append(
-                (
-                    str(getattr(transfer.name, "value", transfer.name)),
-                    end,
-                    sum(page_exists),
-                    next(
-                        (i for i, present in enumerate(page_exists) if not present),
-                        -1,
-                    ),
-                    valid_pages[-1] if valid_pages else 0,
-                )
-            )
             if not valid_pages:
                 break
-        self.last_lookup_detail = detail
 
         self._stats["lookup"] += 1
         if valid_pages:
@@ -565,6 +476,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 len(valid_pages),
             )
         return valid_pages
+
+    def prefetch(self, transfers: list[PoolTransfer]) -> None:
+        return None
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Lookup establishes a restorable boundary before insert de-duplicates
@@ -927,10 +841,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None
     ) -> bool:
-        # A state added to a node already stored goes out alone, with no KV.
-        expanded = self.pool_group.resolve_transfers(
-            transfers, allow_partial=True, allow_missing_kv=True
-        )
+        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
         self._freeze_gc_once()
@@ -1068,92 +979,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self._offload_results.get_nowait()
 
-    def touch(self, transfers: list[PoolTransfer]) -> None:
-        try:
-            self._touch_queue.put_nowait(transfers)
-        except Full:
-            # Only a store that stopped answering backs up this far.
-            self._stats["touch_dropped"] += 1
-
-    def _touch_thread_func(self) -> None:
-        while True:
-            batch = [self._touch_queue.get()]
-            # Coalesce what queued up meanwhile instead of dropping it, so a
-            # rank with slower RPCs still touches the same keys as the others.
-            while True:
-                try:
-                    batch.append(self._touch_queue.get_nowait())
-                except Empty:
-                    break
-            try:
-                self._send_touches([item for item in batch if item is not None])
-            except Exception:
-                self._stats["touch_failures"] += 1
-                failures = self._stats["touch_failures"]
-                if failures == 1 or failures % 1000 == 0:
-                    logger.warning(
-                        "UMBP touch failed (%d so far)", failures, exc_info=True
-                    )
-            if None in batch:
-                return
-
-    def _send_touches(self, touches: list[list[PoolTransfer]]) -> None:
-        keys = []
-        for transfers in touches:
-            for transfer in self.pool_group.resolve_transfers(transfers):
-                object_keys, _ = self._object_keys_for_pages(
-                    list(transfer.keys), transfer
-                )
-                # Tail first within each pool: the store moves keys to its
-                # recent end in order, so a prefix head is its pool's last to go.
-                keys.extend(reversed(object_keys))
-        per_call = CHUNK_PAGES * self.num_layers
-        for start in range(0, len(keys), per_call):
-            self._stats["touched"] += self.storage.client.batch_touch(
-                keys[start : start + per_call]
-            )
-        self._stats["touch_keys"] += len(keys)
-
-    def remove(self, transfers: list[PoolTransfer]) -> None:
-        """Drop stored objects the caller will never read again."""
-        try:
-            self._remove_queue.put_nowait(transfers)
-        except Full:
-            self._stats["remove_dropped"] += 1
-
-    def _remove_thread_func(self) -> None:
-        while True:
-            batch = [self._remove_queue.get()]
-            while True:
-                try:
-                    batch.append(self._remove_queue.get_nowait())
-                except Empty:
-                    break
-            try:
-                keys = []
-                for transfers in batch:
-                    if transfers is None:
-                        continue
-                    for transfer in self.pool_group.resolve_transfers(
-                        transfers, allow_partial=True, allow_missing_kv=True
-                    ):
-                        object_keys, _ = self._object_keys_for_pages(
-                            list(transfer.keys), transfer
-                        )
-                        keys.extend(object_keys)
-                if keys:
-                    self._stats["removed"] += self.storage.client.batch_remove(keys)
-                    self._stats["remove_keys"] += len(keys)
-            except Exception:
-                self._stats["remove_failures"] += 1
-                failures = self._stats["remove_failures"]
-                if failures == 1 or failures % 1000 == 0:
-                    logger.warning(
-                        "UMBP remove failed (%d so far)", failures, exc_info=True
-                    )
-            if None in batch:
-                return
-
     def reset(self) -> None:
         self._pending.clear()
         self._load_queue.join()
@@ -1169,15 +994,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if self._closed:
             return
         self.reset()
-        # Touches still queued matter no more.
-        while True:
-            try:
-                self._touch_queue.get_nowait()
-            except Empty:
-                break
         for thread, queue in (
-            (self._touch_thread, self._touch_queue),
-            (self._remove_thread, self._remove_queue),
             (self._offload_thread, self._offload_queue),
             (self._load_thread, self._load_queue),
         ):

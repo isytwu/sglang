@@ -351,10 +351,6 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
 
 
 class TestDcpDsaIndexKTransfer(unittest.TestCase):
-    """A DCP decode shards the DSA index-K by token like its KV (Kimi-K3.1):
-    each token's key and scale move with its KV row into the page layout of
-    the owning rank (keys of a page, then their scales)."""
-
     def test_moves_keys_and_scales_to_owner_rows(self):
         page_size, value_bytes, scale_bytes, dcp = 64, 8, 4, 8
         page_bytes = page_size * (value_bytes + scale_bytes)
@@ -377,7 +373,7 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
 
         for dst_rank in range(dcp):
             with self.subTest(dst_rank=dst_rank):
-                layers = {500000: None, 600000: None}  # two index-K layers
+                layers = {500000: None, 600000: None}
                 src_buffers = {10000: np.zeros(1024 * 8, dtype=np.uint8)}
                 for base in layers:
                     src = np.zeros(16 * page_bytes, dtype=np.uint8)
@@ -413,6 +409,9 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
                     max_transfer_batch_indices=0,
                     enable_custom_mem_pool=False,
                     _transfer_data=transfer,
+                    _await_transfer_futures=lambda futures: max(
+                        f.result() for f in futures
+                    ),
                     get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
                 )
                 manager._dsa_index_k_dcp_params = lambda *args, **kwargs: (
@@ -551,6 +550,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            send_record=MagicMock(),
+            note_send_enqueued=MagicMock(),
         )
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
@@ -612,6 +613,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             _maybe_ack_drained_abort=MagicMock(),
             validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
+            note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue

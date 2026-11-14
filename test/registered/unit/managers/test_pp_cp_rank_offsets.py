@@ -57,7 +57,7 @@ def _make_receiver() -> SchedulerRequestReceiver:
         ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        request_retirer=None,
         get_last_batch=lambda: None,
         rust_server_mode=False,
     )
@@ -172,7 +172,6 @@ class TestPPCPRankOffsets(unittest.TestCase):
     def test_pp_mixin_uses_cp_size_for_pyobj_send_and_recv_rank(self):
         enter_scope(self, _published_topology())
         scheduler = SchedulerPPMixin()
-        scheduler.scheduler_stage_metrics = None  # the stage-labeled helpers read it
         scheduler.world_group = _fake_group()
         scheduler.attn_tp_group = _fake_group()
         scheduler.attn_tp_cpu_group = _fake_group()

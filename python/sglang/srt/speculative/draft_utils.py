@@ -3,7 +3,7 @@ from typing import Optional
 
 from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     cpu_has_amx_support,
     is_blackwell,
     is_cpu,
@@ -114,6 +114,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
+            "ernie55": self._create_ernie55_decode_backend,
         }
 
         return self._create_backend(
@@ -138,12 +139,14 @@ class DraftBackendFactory:
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
-            "cutedsl_mla": self._create_cutedsl_mla_prefill_backend,
+            # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
+            "cutedsl_mla": self._create_trtllm_mla_prefill_backend,
             "dsa": self._create_dsa_prefill_backend,
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
+            "ernie55": self._create_ernie55_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -457,6 +460,22 @@ class DraftBackendFactory:
             ),
         )
 
+    def _create_ernie55_decode_backend(self):
+        from sglang.srt.layers.attention.ernie55_backend import (
+            Ernie5_5MultiStepBackend,
+        )
+
+        return "ernie55", Ernie5_5MultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_ernie55_prefill_backend(self):
+        from sglang.srt.layers.attention.ernie55_backend import Ernie5_5AttnBackend
+
+        return "ernie55", Ernie5_5AttnBackend(
+            self.draft_model_runner, skip_prefill=False
+        )
+
     def _create_flashinfer_prefill_backend(self):
         if not self.draft_model_runner.use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
@@ -548,19 +567,6 @@ class DraftBackendFactory:
         return (
             "trtllm_mla",
             TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False),
-        )
-
-    def _create_cutedsl_mla_prefill_backend(self):
-        if not self.draft_model_runner.use_mla_backend:
-            raise ValueError(
-                "cutedsl_mla backend requires MLA model (use_mla_backend=True)."
-            )
-
-        from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
-
-        return (
-            "cutedsl_mla",
-            CuteDslMLABackend(self.draft_model_runner, skip_prefill=False),
         )
 
     def _create_ascend_prefill_backend(self):

@@ -40,8 +40,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
-            "kernels over CUDA symmetric memory. On ROCm, set "
-            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
+            "kernels over CUDA symmetric memory. On ROCm it runs aiter MegaMoEv2."
         )
 
 
@@ -126,7 +125,7 @@ def flydsl_decode_tokens_per_rank(cfg) -> int | None:
 
 
 def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
-    if not (get_platform().is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()):
+    if not get_platform().is_hip:
         return
     decode_mtpr = envs.SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR.get()
     if decode_mtpr <= 0 or decode_mtpr >= envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get():
@@ -210,11 +209,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         )
 
     prefill_tokens = cfg.chunked_prefill_size
-    kimi = model_label in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    kimi = model_label == "KimiK31ForConditionalGeneration"
     if kimi:
         prefill_tokens = max(prefill_tokens, getattr(cfg, "max_prefill_tokens", 0) or 0)
         graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
@@ -251,14 +246,6 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             1,
         )
         local_chunked_prefill_size = cfg.chunked_prefill_size
-    elif kimi and cfg.tp_size // cfg.attn_cp_size > 1:
-        # Kimi SP-MoE: each rank feeds MegaMoE its attention-TP shard of the rows.
-        token_partition_size = cfg.tp_size // cfg.attn_cp_size
-        token_partition_name = "attn_tp_size (SP-MoE rows)"
-        token_alignment = 1
-        local_chunked_prefill_size = (
-            prefill_tokens + token_partition_size - 1
-        ) // token_partition_size
     else:
         # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1

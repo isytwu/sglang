@@ -78,6 +78,7 @@ def test_selector_rejects_a_quantized_target_lm_head():
     model = SimpleNamespace(
         lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
         candidate_selector=SimpleNamespace(top_k=4),
+        merge_candidates_fused=False,
     )
     with pytest.raises(RuntimeError, match="requires a dense"):
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
@@ -136,10 +137,11 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=4),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
-        lambda: SimpleNamespace(tp_group=SimpleNamespace(world_size=1)),
+        lambda: SimpleNamespace(tp_size=1),
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
@@ -155,17 +157,12 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     torch.testing.assert_close(unary_logits, expected_logits)
 
 
-@pytest.mark.parametrize("dp_lm_head", [False, True])
-def test_selector_gathers_global_candidates_across_vocab_shards(
-    monkeypatch, dp_lm_head
-):
+def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     """Pins the TP gather contract on the quantized path: the per-shard
     org-vocab restriction, the global id offset, and the fp32 cast before the
     all-gather -- a
     regression in any of them returns wrong global candidates only under TP,
-    which no single-rank test observes. A head sharded within attention TP
-    (--enable-dp-lm-head) gathers over that group: under DP attention the full
-    TP group would mix other DP ranks' rows."""
+    which no single-rank test observes."""
     torch.manual_seed(0)
     k = 4
     # bf16 like production: makes the fp32 upcast before the gather observable.
@@ -179,12 +176,12 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
         weight=torch.empty(8, 2, dtype=torch.int8),
         quant_method=quant_method,
         shard_indices=SimpleNamespace(num_org_elements=6, org_vocab_start_index=6),
-        use_attn_tp_group=dp_lm_head,
     )
     model = SimpleNamespace(
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=k),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
 
     # Rank 0's gathered contribution, synthesized from the reference weights.
@@ -198,17 +195,12 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
             return torch.cat([rank0_vals.float(), x], dim=dim)
         return torch.cat([rank0_ids.long(), x], dim=dim)
 
-    def wrong_group_gather(x, dim):
-        raise AssertionError("gathered over the group the head is not sharded on")
-
-    shard_group = SimpleNamespace(world_size=2, all_gather=fake_all_gather)
-    other_group = SimpleNamespace(world_size=4, all_gather=wrong_group_gather)
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
-        lambda: SimpleNamespace(
-            tp_group=other_group if dp_lm_head else shard_group,
-            attn_tp_group=shard_group if dp_lm_head else other_group,
-        ),
+        lambda: SimpleNamespace(tp_size=2),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.tensor_model_parallel_all_gather", fake_all_gather
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk

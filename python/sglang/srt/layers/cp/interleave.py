@@ -392,7 +392,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         layer: Any = None,
         k: Any = None,
         v: Any = None,
-        swa_loc: Optional[Any] = None,
+        window_locs: Optional[Any] = None,
     ) -> Any:
         raise NotImplementedError(
             f"{self.name} strategy does not support dense K/V materialization"
@@ -450,8 +450,6 @@ class DSAInterleaveCPIndexerOverlap:
         )
 
     def _can_overlap(self):
-        # Function-local: dsa_backend imports sglang.srt.layers.cp, which imports this.
-        from sglang.srt.layers.attention.dsa_backend import uses_raw_fp8_dsa_kv_layout
         from sglang.srt.model_executor.forward_context import get_attn_backend
         from sglang.srt.utils import is_cuda
 
@@ -466,7 +464,7 @@ class DSAInterleaveCPIndexerOverlap:
             return True
         backend = get_attn_backend()
         return (
-            uses_raw_fp8_dsa_kv_layout(getattr(backend, "dsa_prefill_impl", None))
+            getattr(backend, "dsa_prefill_impl", None) == "trtllm"
             and not backend.use_mha
         )
 

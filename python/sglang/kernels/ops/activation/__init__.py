@@ -111,11 +111,10 @@ def situ_and_mul(
     out: Optional[torch.Tensor],
     beta: float,
     linear_beta: Optional[float],
-    cast: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
-    return impl(input, out, beta, linear_beta, cast)
+    return impl(input, out, beta, linear_beta)
 
 
 __all__ = [
@@ -154,6 +153,16 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="activation.multimax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.multimax:multimax",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 register_kernel(
     KernelSpec(
@@ -165,7 +174,15 @@ register_kernel(
 )
 
 
-# MXFP8-quantizing SwiGLU-OAI producers; registered for inventory.
+# MXFP8-quantizing SwiGLU producers; registered for inventory.
+register_kernel(
+    KernelSpec(
+        op="activation.silu_mul_mxfp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:silu_mul_mxfp8",
+        capabilities=CUDA_ONLY,
+    )
+)
 for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
     register_kernel(
         KernelSpec(
