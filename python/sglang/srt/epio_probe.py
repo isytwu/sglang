@@ -26,6 +26,16 @@ def enabled() -> bool:
     return bool(_DIR)
 
 
+def tp_rank() -> int:
+    """Global TP rank of this scheduler process (the Scheduler object has no tp_rank here)."""
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        return int(get_parallel().tp_rank)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def rank_enabled(rank: int) -> bool:
     return enabled() and (_RANKS == "all" or str(rank) in _RANKS.split(","))
 
@@ -75,7 +85,7 @@ class StepProbe:
 
         self.torch = torch
         self.sched = scheduler
-        self.rank = int(getattr(scheduler, "tp_rank", 0))
+        self.rank = tp_rank()
         role = getattr(getattr(scheduler, "disaggregation_mode", None), "value", "null")
         self.role = role
         self.w = writer(f"step_{role}_tp{self.rank}.jsonl")
@@ -143,7 +153,13 @@ class StepProbe:
                 time.sleep(0.0005)
                 continue
             ev0, ev1, rec = item
-            if not ev1.query():
+            try:
+                done = ev1.query()
+            except Exception:  # noqa: BLE001
+                with self.lock:
+                    self.pending.popleft()
+                continue
+            if not done:
                 time.sleep(0.0003)
                 continue
             t_obs = time.time()
@@ -160,7 +176,7 @@ class StepProbe:
 
 
 def maybe_install_scheduler(scheduler):
-    if not rank_enabled(int(getattr(scheduler, "tp_rank", 0))):
+    if not rank_enabled(tp_rank()):
         return
     try:
         mw = scheduler.model_worker
@@ -243,7 +259,7 @@ class EpProfSnapshotter:
     records a host/GPU clock anchor taken by launching a 1-thread wall_clock64 kernel."""
 
     def __init__(self, scheduler):
-        self.rank = int(getattr(scheduler, "tp_rank", 0))
+        self.rank = tp_rank()
         self.trig = os.path.join(_DIR, "epprof.trigger")
         self.seen = None
         self.n = 0

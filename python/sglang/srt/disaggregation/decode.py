@@ -3740,7 +3740,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._commit_transfer_to_req(decode_req)
                 if epio_probe.enabled():
                     epio_probe.kv_arrival(
-                        self.scheduler.tp_rank,
+                        epio_probe.tp_rank(),
                         {
                             "t": time.time(),
                             "rid": decode_req.req.rid,
