@@ -123,22 +123,31 @@ class StepProbe:
             pass
         return m
 
-    def wrap(self, fn):
+    def wrap(self, fn, worker):
         torch = self.torch
 
         def wrapped(batch, *a, **k):
-            ev0 = torch.cuda.Event(enable_timing=True)
-            ev1 = torch.cuda.Event(enable_timing=True)
+            # An event recorded while the stream is being captured belongs to the graph and never
+            # completes on the stream, so capture-time calls get wall-clock times only.
+            timed = not torch.cuda.is_current_stream_capturing()
+            ev0 = ev1 = None
             t_launch = time.time()
-            ev0.record()
+            if timed:
+                ev0 = torch.cuda.Event(enable_timing=True)
+                ev1 = torch.cuda.Event(enable_timing=True)
+                ev0.record()
             out = fn(batch, *a, **k)
-            ev1.record()
             t_ret = time.time()
-            rec = {"step": self.step, "t_launch": t_launch, "t_ret": t_ret}
+            rec = {"step": self.step, "w": worker, "t_launch": t_launch, "t_ret": t_ret}
             rec.update(self._meta(batch))
             self.step += 1
-            with self.lock:
-                self.pending.append((ev0, ev1, rec))
+            if timed and not torch.cuda.is_current_stream_capturing():
+                ev1.record()
+                with self.lock:
+                    self.pending.append((ev0, ev1, rec))
+            else:
+                rec["gpu_ms"] = -1.0
+                self.w.write(rec)
             return out
 
         return wrapped
@@ -160,6 +169,13 @@ class StepProbe:
                     self.pending.popleft()
                 continue
             if not done:
+                # a step's work is done within seconds; an event that is not must never block the rest
+                if time.time() - rec["t_ret"] > 5.0:
+                    with self.lock:
+                        self.pending.popleft()
+                    rec["gpu_ms"] = -2.0
+                    self.w.write(rec)
+                    continue
                 time.sleep(0.0003)
                 continue
             t_obs = time.time()
@@ -179,9 +195,17 @@ def maybe_install_scheduler(scheduler):
     if not rank_enabled(tp_rank()):
         return
     try:
-        mw = scheduler.model_worker
         probe = StepProbe(scheduler)
-        mw.forward_batch_generation = probe.wrap(mw.forward_batch_generation)
+        # With speculative decoding the scheduler later points model_worker at the draft worker, whose
+        # forward is the whole draft + verify step; idle batches go straight to tp_worker. Wrap each once
+        # ("w" tells them apart; the draft worker's verify forward through tp_worker nests inside its step).
+        done = []
+        for name in ("draft_worker", "model_worker", "tp_worker"):
+            w = getattr(scheduler, name, None)
+            if w is None or any(w is d for d in done) or not hasattr(w, "forward_batch_generation"):
+                continue
+            w.forward_batch_generation = probe.wrap(w.forward_batch_generation, name)
+            done.append(w)
         scheduler._epio_step_probe = probe
         if os.environ.get("EPIO_EPPROF") == "1":
             EpProfSnapshotter(scheduler)
