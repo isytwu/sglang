@@ -749,6 +749,11 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
 
+        # EP x KV-transfer contention probes; no-op unless EPIO_PROBE_DIR is set
+        from sglang.srt import epio_probe
+
+        epio_probe.maybe_install_scheduler(self)
+
         # Init Unlimited-OCR document-window hooks and crop transfer
         self.maybe_init_uocr_runtime()
 

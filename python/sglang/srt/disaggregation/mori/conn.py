@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
 )
+from sglang.srt import epio_probe
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -441,6 +442,8 @@ class MoriKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.engine = self._init_engine()
+        if epio_probe.enabled():
+            self.engine = epio_probe.CountingEngine(self.engine)
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
         self.aux_mem_descs: List[MemoryDesc] = []
@@ -677,6 +680,9 @@ class MoriKVManager(CommonKVManager):
         if self._should_skip_transfer(room):
             return True
 
+        probe = epio_probe.enabled()
+        if probe:
+            t_start = time.time()
         if kv_chunk.wait_event is not None:
             kv_chunk.wait_event.synchronize()
         self._resolve_host_indices(kv_chunk)
@@ -684,7 +690,13 @@ class MoriKVManager(CommonKVManager):
         if self._should_skip_transfer(room):
             return True
 
+        if probe:
+            t_evt = time.time()
+            epio_probe.reset_counts()
         statuses = self._submit_transfer_chunk(kv_chunk)
+        if probe:
+            t_sub = time.time()
+            kv_chunk._epio = (t_start, t_evt, t_sub) + epio_probe.take_counts()
 
         if self._should_skip_transfer(room):
             if not self.enable_deferred_decode_kv_release:
@@ -697,6 +709,29 @@ class MoriKVManager(CommonKVManager):
         failure_reason, is_quiescent = self._wait_for_chunk_completion(
             kv_chunk, statuses
         )
+        if probe:
+            t_start, t_evt, t_sub, nbytes, nsegs, ncalls = kv_chunk._epio
+            epio_probe.xfer_record(
+                self.kv_args.engine_rank,
+                {
+                    "room": room,
+                    "t_enq": getattr(kv_chunk, "_epio_t_enq", None),
+                    "t_start": t_start,
+                    "t_evt": t_evt,
+                    "t_sub": t_sub,
+                    "t_done": time.time(),
+                    "bytes": nbytes,
+                    "segs": nsegs,
+                    "calls": ncalls,
+                    "n_status": len(statuses),
+                    "last": bool(kv_chunk.is_last_chunk),
+                    "tok": kv_chunk.num_kv_tokens,
+                    "pages": int(len(kv_chunk.prefill_kv_indices)),
+                    "ok": failure_reason is None,
+                    "thr": threading.current_thread().name,
+                    "dev": self.kv_args.ib_device,
+                },
+            )
         if not is_quiescent:
             # The drainer now owns the decrement.
             return False
@@ -893,19 +928,20 @@ class MoriKVManager(CommonKVManager):
             return
 
         shard_idx = bootstrap_room % self._num_shards
-        self._transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                wait_event=wait_event,
-                indices_event=indices_event,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            wait_event=wait_event,
+            indices_event=indices_event,
         )
+        if epio_probe.enabled():
+            chunk._epio_t_enq = time.time()
+        self._transfer_queues[shard_idx].put(chunk)
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
         """Thread-local ZMQ socket cache with shared Context.

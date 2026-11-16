@@ -88,6 +88,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt import epio_probe
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
@@ -3377,6 +3378,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         device_admission_refused = True
                         continue
                 self._commit_transfer_to_req(decode_req)
+                if epio_probe.enabled():
+                    epio_probe.kv_arrival(
+                        epio_probe.tp_rank(),
+                        {
+                            "t": time.time(),
+                            "rid": decode_req.req.rid,
+                            "room": getattr(decode_req.req, "bootstrap_room", None),
+                            "in_len": len(decode_req.req.origin_input_ids),
+                        },
+                    )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 outcomes[decode_req.req.rid] = isinstance(
