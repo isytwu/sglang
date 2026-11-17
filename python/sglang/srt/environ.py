@@ -823,6 +823,9 @@ class Envs:
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBool(False)
+    # External cache linker: a finished request's insert offloads nothing past
+    # its prompt, so an output reaches the store only once a later prompt reuses it.
+    SGLANG_LINKER_SKIP_OUTPUT_OFFLOAD = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
