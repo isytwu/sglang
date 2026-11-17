@@ -31,6 +31,8 @@ class _KeepingLinker(base._InMemoryUnifiedCacheLinker):
     tracks_state_paths = True
     note_state_path = UMBPDirectLinker.note_state_path
     _state_landed = UMBPDirectLinker._state_landed
+    _open_output = UMBPDirectLinker._open_output
+    _settle_outputs = UMBPDirectLinker._settle_outputs
 
     def __init__(self, keep_states):
         super().__init__(defaultdict(set))
@@ -40,6 +42,8 @@ class _KeepingLinker(base._InMemoryUnifiedCacheLinker):
         self._state_paths = {}
         self._kept_states = {}
         self._state_branches = {}
+        self._open_outputs = {}
+        self._open_output_count = 0
         self.removed = []
 
     # As UMBPDirectLinker.offload / pop_completed_offload around the store.
@@ -91,9 +95,10 @@ class _KeepStatesPerPath:
         (first,) = self._turn(list(range(1, 5)))
         (second,) = self._turn(list(range(1, 9)))
         self._insert(self.cache, self.allocator, self.req_pool, list(range(1, 13)))
-        ((path, replaceable),) = self.store._state_paths.values()
+        ((path, replaceable, output),) = self.store._state_paths.values()
         self.assertEqual(path, [first, second])
         self.assertTrue(replaceable)
+        self.assertFalse(output)
 
     def test_third_state_drops_the_first(self):
         self._cache(keep_states=2)
