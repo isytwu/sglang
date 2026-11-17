@@ -23,6 +23,7 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -311,6 +312,14 @@ class UnifiedCacheLinkerWrapper:
         # point, a recompute of an evicted state) would never get there.
         self._offload_states = ComponentType.MAMBA in cache.components
         self._state_offloaded: dict[NodeId, int] = {}
+        # Radix-key end past which an insert offloads nothing; 0 is no limit.
+        # With SGLANG_LINKER_SKIP_OUTPUT_OFFLOAD=1 a finished request's insert
+        # stops at its prompt: the output reaches the store only once a later
+        # prompt reuses it, as that insert writes the reused nodes through.
+        self.offload_end_limit = 0
+        self.skip_output_offload = (
+            os.environ.get("SGLANG_LINKER_SKIP_OUTPUT_OFFLOAD") == "1"
+        )
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -544,6 +553,10 @@ class UnifiedCacheLinkerWrapper:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:
                     continue
+            if self.offload_end_limit:
+                transfers = self._drop_offload_past_end(node_id, transfers)
+                if transfers is None:
+                    continue
             if self._offload_node(node_id, transfers):
                 state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
                 if state is not None:
@@ -562,6 +575,10 @@ class UnifiedCacheLinkerWrapper:
         slot = _slot_of(value)
         if self._state_offloaded.get(node_id) == slot:
             return
+        if self.offload_end_limit:
+            (path,) = tree_core.collect_path_info([node_id])
+            if not path or path[-1].path_end > self.offload_end_limit:
+                return
         hashes = tree_core.get_hash_values(node_id)
         if not hashes:
             return
@@ -597,6 +614,45 @@ class UnifiedCacheLinkerWrapper:
             yield
         finally:
             self.offload_skip_prefix_len = 0
+
+    @contextmanager
+    def offload_window(self, skip_prefix_len: int, end_limit: int):
+        """During an insert, skip offloading the first ``skip_prefix_len``
+        radix-key units and everything past ``end_limit`` (0: no limit)."""
+        self.offload_skip_prefix_len = skip_prefix_len
+        self.offload_end_limit = end_limit
+        try:
+            yield
+        finally:
+            self.offload_skip_prefix_len = 0
+            self.offload_end_limit = 0
+
+    def _drop_offload_past_end(
+        self, node_id: NodeId, transfers: list[PoolTransfer]
+    ) -> Optional[list[PoolTransfer]]:
+        info = self.cache.tree_core.collect_path_info([node_id])[0][-1]
+        limit = self.offload_end_limit
+        if info.path_end <= limit:
+            return transfers
+        if info.path_start >= limit:
+            return None
+        page = self.cache.page_size
+        kept = []
+        for transfer in transfers:
+            # The state sits at the node end, past the limit.
+            if transfer.name == PoolName.MAMBA:
+                continue
+            first = info.path_end - len(transfer.keys) * page
+            keep = max(0, (limit - first) // page)
+            if keep:
+                kept.append(
+                    replace(
+                        transfer,
+                        keys=transfer.keys[:keep],
+                        device_indices=transfer.device_indices[: keep * page],
+                    )
+                )
+        return kept or None
 
     def _drop_offload_skip_prefix(
         self, node_id: NodeId, transfers: list[PoolTransfer]
