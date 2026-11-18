@@ -1,17 +1,29 @@
-# K3.1-Pro AgentX PD：KV 传输 / UMBP 会不会拖慢 MoRI EP —— 我们在 MI355X 上的测试
+# K3.1-Pro AgentX PD：KV 传输 / UMBP 和 MoRI EP 的相互影响 —— 我们在 MI355X 上的测试
 
-这份文档说明我们怎么测、测了什么、看到了什么。每张图下面都写了"怎么看"和"说明了什么"；明细表格折叠在各节末尾。
+这份文档记录我们怎么测、测了什么、看到了什么，分两部分：
+
+- **端到端**（第 2–4 节）：真实的 K3.1-Pro PD 部署（2 台 prefill + 跨 2 台机器、EP16 的 decode），跑 InferenceY 的 AgentX 负载，看 KV 传输有没有让 decode 变慢；再主动往 decode 节点打流量加压。
+- **单测**（第 5 节）：mori 自带的 EP16 跨机用例 + 同时跑 MoRI IO，直接测单次 dispatch / combine 被拖慢多少，并拆开看 IO 和 EP 在哪里相遇时影响大、在哪里相遇时影响小。
+
+每张图下面都写了"怎么看"和"说明了什么"；明细表格折叠在各节末尾。
 
 ## 结论
 
-- **KV 传输对 EP 有影响，但很小，在 decode 上测不出来。** 我们测的是 decode 每一步的耗时（跨机 EP 的 dispatch / combine 都在这一步里），没有直接测单次 EP 操作的耗时。
-  - 真实负载下，一步执行期间流入的 KV 越多，这一步最多也只慢 0.3%；KV 突发前后，EP 的流量没有变化。
-  - 主动加压：往 decode 的 GPU 显存额外打 KV 形状的流量，每张网卡 38 GB/s，每一次 EP 都和它撞上，decode 每一步慢 1.3%（单个窗口的噪声是 ±2%）。把多出来的约 3 ms 全算到 EP 头上，单次 EP 最多慢约 16%；这是上限，不是直接测量。
-- **影响小有三层原因**（第 5 节）：KV 是突发的，EP 很少碰上它；碰上了，EP 每次只传很少的数据，在无损网络里只是多排一会儿队；EP 只占 decode GPU 内核时间的 9%。
-- **会拖慢 decode 的是写 decode 主机内存、而且跨 NUMA 的流量**：最高让 decode 每一步慢 14%；同 NUMA 时不到 1%，测不出来。多出来的时间是不是 EP 变慢造成的，这次分不清。
-- 对照：把所有 RDMA 流量都放进有损的 TC 0，KV 突发会丢包，EP 也会跟着重传；无损的 TC 104 下没有这个问题。
+1. **KV 这类 RDMA 流量会拖慢单次 EP 操作，拖慢多少主要看 IO 和 EP 在哪里相遇**（第 5 节，单测，用 K3.1 decode 的 EP 形状）。
+   - **EP 节点一边跑 EP、一边往外发 IO**（同一张网卡既发 EP 又发 IO）：dispatch 平均慢 43%–52%，combine 慢 22%–33%。IO 平均只有每张网卡 2 GB/s 时，dispatch 平均仍慢 14%、p99 慢 55%。
+   - **IO 只是写进 EP 节点**（只在接收侧相遇）：dispatch 平均慢 4%–9%，combine 慢 4%–11%，网卡打到接近线速也是这个量级。
+   - 把 IO 放到低优先级的 TC 0 只能缓解一点（发送侧 dispatch +52% → +43%）。
+   - 一年前单测的做法（IO 直接在两台 EP 节点之间跑，发送侧和接收侧都有）这次复现出来了：mori 默认形状下 dispatch 平均慢到 2.1 倍、combine 1.3 倍，和一年前测到的 2.0 倍、1.3 倍一致。
+2. **我们的 PD 部署里没有"EP 节点往外发大流量"的情况**：KV 从 prefill 写进 decode，decode 节点只收 KV、不往外发；prefill 是单机 TP8 + DCP8，不跑跨机 EP。所以只剩接收侧的影响，加上 EP 只占 decode GPU 内核时间的 9%，在 decode 上几乎测不出来（第 3、4 节）：
+   - 真实负载（1 小时）：一步执行期间流入的 KV 越多，这一步最多也只慢 0.3%。
+   - 主动往两台 decode 的 GPU 显存写 KV 形状的流量，每张网卡 38 GB/s、每一次 EP 都和它撞上：decode 每一步平均慢 1.3%（单个窗口的噪声是 ±2%）。按单测里接收侧单次 EP 慢 4%–11% 折算，预期是 0.3%–0.9%，量级一致。
+3. **写 host 内存、而且跨 NUMA 最重**：端到端注入时 decode 每一步慢 14%（同 NUMA 时不到 1%）；单测里 IO 在两台 EP 节点之间跨 NUMA 写 host 内存，dispatch 平均慢 121%。
+4. **全部放进有损的 TC 0** 时，KV 突发会丢包，EP 也跟着重传（第 8 节）；无损的 TC 104 下 EP 没有重传。
+5. **UMBP** 在这个部署里是 prefill 本机的 DRAM 缓存，读写不经过网卡，和 EP 碰不到（第 7 节）。
 
-## 1. 测的是什么
+## 1. 测试环境
+
+### 1.1 端到端
 
 | 项 | 内容 |
 |---|---|
@@ -19,21 +31,34 @@
 | 模型 | Kimi-K3.1-Pro（fp4），DFLASH 投机解码（每步 5 个草稿 token，接受长度按 InferenceY recipe 模拟为 3.25） |
 | 框架 | sglang 0.5.24 + K3.1 的 MoRI PD / UMBP 补丁（本分支），MoRI = ROCm/mori PR #996（EPv2 跨机） |
 | 部署 | 2 台 prefill（各 TP8 + DCP8，各带本机 UMBP DRAM 缓存）+ 1 个跨 2 台机器的 decode（每台一个 attention DP 组，TP8 + DCP8；MoE 是跨两台的 EP16，MoRI EPv2） |
+| EP 的形状 | hidden 3584（K3.1 的路由专家在 3584 维的隐空间上算）、896 个专家（每卡 56 个）、每个 token 选 16 个、bf16 dispatch 和 combine；decode 时每次 dispatch 每卡约 44–49 个 token，走 `v2_ll` 低延迟 kernel |
 | KV 传输 | MoRI IO 用 RDMA 写，从 prefill 的 GPU 显存直接写进 decode 的 GPU 显存；prefill 的 GPU i 走 rail i 写 decode 的 GPU i |
 | 流量类别 | EP、KV、跨机 RCCL 都在 TC 104（DSCP 26，无损，带 PFC） |
 | 负载 | InferenceY 的 K3.1 AgentX（AIPerf，Claude Code 轨迹回放），参数与 InferenceY CI 相同，并发 256；先 warmup（只填缓存），再测 3600 s |
 
 完整的启动参数和环境变量见文末附录。
 
-## 2. 怎么测
+### 1.2 单测
+
+| 项 | 内容 |
+|---|---|
+| 机器 | 同一套集群的另外 3 台 MI355X（网络和端到端完全一样）。node06 + node07 跑 EP16；node08 作为第三台机器，用来"只在发送侧"或"只在接收侧"加 IO；速率扫描在 node06 + node08 上做 |
+| 镜像 / mori | K3.1 InferenceY 镜像的基础镜像（ROCm 10.0.0）+ mori PR #996（3a869d5f），和端到端是同一个 mori |
+| EP | mori 自带的 EPv2 跨机用例 `test_dispatch_combine_v2_internode.py --cmd bench`，环境变量和端到端 decode 相同 |
+| IO | mori 自带的 IO benchmark（`tests/python/io/benchmark.py`，一年前单测用的就是它），以及端到端注入用的 `io_inject.py`（KV 形状的写） |
+
+## 2. 端到端：怎么测
 
 - **decode 每一步的耗时**：在每个 DP 组的主 rank 上，用 GPU 事件记录每一步（draft + verify）的 GPU 时间和这一步的 batch 大小。EP 的 dispatch / combine 都在这一步里，所以 EP 如果变慢，这一步就会变慢。两个 DP 组每一层 MoE 都要通过 EP 互相交换 token，所以两组的步长是同步的。
 - **网卡流量**：4 台机器每张网卡每 5 ms 记一次收发字节数，另外记 PFC 暂停时间和重传次数。
 - **把 KV 和 EP 分开**：两台 decode 之间只有 EP；prefill 的网卡只发 KV。所以某台 decode 收到的字节，减去另一台 decode 发给它的（就是 EP），剩下的就是流入它的 KV。
 - **对比时去掉 batch 的影响**：batch 越大，一步越慢。比较时，每一步都和"同样 batch 大小的步"的中位数比，看它慢了多少。
 - **客户端**：AIPerf 的每个请求记录（TTFT、ITL、每条流式消息的到达时间）。
+- 端到端只能看到 decode 整步的耗时，看不到单次 EP 慢了多少；单次 EP 的变化由第 5 节的单测直接测。
 
-## 3. 真实负载下：KV 会不会拖慢 EP
+## 3. 端到端实验一：真实负载下，KV 会不会让 decode 变慢
+
+**目的**：在真实负载下，看 KV 传输有没有让 decode（其中包括跨机 EP）变慢。**做法**：跑 1 小时 AgentX，记录每个 decode 步的耗时和同一时间流入 decode 节点的 KV，按 KV 多少分组比较；再把 KV 突发对齐，看突发前后 EP 的流量。
 
 ### 3.1 KV 和 EP 的流量长什么样
 
@@ -51,7 +76,7 @@
 
 ![decode 步 vs 同时到达的 KV](img/fig2_step_vs_kv.png)
 
-**怎么看**：把 1 小时里约 3 万个 decode 步，按"这一步执行期间流入 decode 节点的 KV 有多快"分成几档；纵轴是每档比"没有 KV 的步"慢多少（已经扣掉 batch 大小的影响），柱子上的数字是这一档有多少步，步数越少越不准（比如 TC 0 的 50–100 档只有 35 步）。蓝色是实际配置（TC 104），橙色是 TC 0 对照（第 7 节）。
+**怎么看**：把 1 小时里约 3 万个 decode 步，按"这一步执行期间流入 decode 节点的 KV 有多快"分成几档；纵轴是每档比"没有 KV 的步"慢多少（已经扣掉 batch 大小的影响），柱子上的数字是这一档有多少步，步数越少越不准（比如 TC 0 的 50–100 档只有 35 步）。蓝色是实际配置（TC 104），橙色是 TC 0 对照（第 8 节）。
 
 **说明了什么**：在 TC 104 下，就算一步执行期间流入 20–100 GB/s 的 KV，这一步也只慢 0.1%–0.3%（217 ms 里不到 1 ms）。
 
@@ -61,7 +86,9 @@
 
 **怎么看**：找出 855 次 KV 突发，把每次突发开始的时刻对齐到 0，前后的流量取平均。上图是 KV，下图是同一时间流入同一节点的 EP（虚线是突发前的平均值）。
 
-**说明了什么**：KV 在几毫秒内冲到约 60 GB/s 并持续几十毫秒，同一时间 EP 流量保持在 2.4 GB/s 左右，没有下降（变化不到 0.5%）。如果 KV 让 EP 出现网卡暂停、丢包这种毫秒级的停顿，这里会看到 EP 下凹。5 ms 粒度的字节计数看不出单次 EP 微秒级的变慢，这一点看第 4 节的加压实验。
+**说明了什么，以及不能说明什么**：
+- KV 在几毫秒内冲到约 60 GB/s 并持续几十毫秒，同一时间 EP 流量保持在 2.4 GB/s 左右，没有下降（变化不到 0.5%）。所以 KV 突发没有让 EP 出现毫秒级的停顿（比如 PFC 暂停、丢包重传造成的卡顿）。
+- 这张图**不能**说明单次 EP 没有变慢。每 5 ms 里 EP 传多少字节由 decode 的节奏决定，单次 dispatch / combine 慢几微秒到几十微秒，在这个粒度上看不出来。单次 EP 被拖慢多少，看第 5 节的单测：IO 只写进 EP 节点时单次 EP 慢 4%–11%，正好是这张图看不出来的量级。
 
 <details>
 <summary>真实负载的数据表</summary>
@@ -96,11 +123,12 @@
 
 </details>
 
-## 4. 加压：主动往 decode 节点打流量
+## 4. 端到端实验二：主动往 decode 节点打流量
 
-真实 KV 大部分时间是空的，EP 很少和它撞上。为了看"撞上时 EP 受多大影响"，我们在真实负载跑着的时候，额外往 decode 节点打 RDMA 写。
+**目的**：真实 KV 大部分时间是空的，EP 很少和它撞上。为了看"撞上时 decode 受多大影响"，在真实负载跑着的时候，额外往 decode 节点打 RDMA 写。
 
-- **怎么打**：用 MoRI IO 从 prefill 的 GPU 显存写到 decode 上的一块 1 GB 缓冲；GPU i 走 rail i，8 条 rail 全覆盖，和 EP 的跨机流量走同一个交换机出口、进同一张网卡。
+**做法**：
+- **怎么打**：用 MoRI IO 从 prefill 的 GPU 显存写到 decode 上的一块 1 GB 缓冲；GPU i 走 rail i，8 条 rail 全覆盖，和 EP 的跨机流量走同一个交换机出口、进同一张网卡。decode 节点只接收这些流量，不往外发——这和真实的 KV 传输一样。
 - **写到哪**：三种目标——decode 的 GPU 显存（就是 KV 的写法）；decode 的主机内存，和网卡在同一个 NUMA 节点；decode 的主机内存，在另一个 NUMA 节点。
 - **多快**：每次发 16 MB，以接近线速发完（约 0.4 ms），靠调两次发送之间的空闲时间控制平均速率。38 GB/s 档是连续不停地发，此时每一次 EP 都和注入撞上；低速档只有一部分 EP 撞上（20 GB/s 约 65%，5 GB/s 约 17%）。
 - **怎么比**：每个窗口打 60 s，和窗口结束后的 52 s 比；每个窗口里 decode 跑了 230–270 步。
@@ -118,9 +146,9 @@
 **怎么看**：横轴是每张网卡的注入速率，三种颜色是三种写入目标；柱子是 decode 每一步比不注入时慢多少（同档的多个窗口、两个 DP 组取平均，误差线是最大 / 最小窗口）；灰色带是单个窗口的噪声范围（±2%）。
 
 **说明了什么**：
-- 写 GPU 显存（蓝色，就是 KV 的写法）：一直加到 38 GB/s（每台 decode 约 300 GB/s，每次 EP 都撞上），也只慢 1.3%，在噪声范围内。两台 prefill 同时打一台 decode（接收网卡接近线速）也不超过 1%（图中没画）。
+- 写 GPU 显存（蓝色，就是 KV 的写法）：一直加到 38 GB/s（每台 decode 约 300 GB/s，每次 EP 都撞上），decode 每一步平均也只慢 1.3%，在噪声范围内。两台 prefill 同时打一台 decode（接收网卡接近线速）也不超过 1%（图中没画）。把多出来的约 3 ms 全算到 EP 头上，单次 EP 最多慢约 16%；单测（第 5 节）里接收侧单次 EP 实测慢 4%–11%，在这个上限以内。
 - 写主机内存、同 NUMA（紫色）：不到 1%。
-- 写主机内存、跨 NUMA（红色）：5–21 GB/s 慢 3%，36 GB/s 慢 14%。
+- 写主机内存、跨 NUMA（红色）：5–21 GB/s 慢 3%，36 GB/s 慢 14%。多出来的时间里有多少是 EP 变慢造成的，端到端分不清。
 
 客户端看到的 ITL 也一样：写 GPU 显存的各档，ITL p90 和不注入时相比在 −3 到 +4 ms 之间，有升有降；跨 NUMA 36 GB/s 时 ITL p90 从 72 ms 升到 84 ms（明细见下面折叠的表）。
 
@@ -155,15 +183,144 @@
 
 </details>
 
-## 5. 为什么影响小
+## 5. 单测：EP16 + 同时跑 MoRI IO
+
+### 5.1 为什么还要做单测
+
+端到端只能看到 decode 整步的耗时，单次 dispatch / combine 慢了多少看不到（3.3 的字节计数也看不出微秒级的变化）。而一年前我们做过 mori EP16 和 mori IO 同时跑的单测，IO 让 EP 明显变慢（5.3 的表）。所以这次在端到端用的同一套网络上，用同一个 mori，把单测重做一遍，并且拆开看：IO 和 EP 在发送端网卡相遇、在接收端相遇，影响各有多大。
+
+### 5.2 怎么做
+
+**EP**：mori 自带的 EPv2 跨机用例 `tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py --cmd bench`，两台机器、16 张卡，`v2_ll` 低延迟 kernel，bf16，每个 PE 8 个 QP；环境变量和端到端 decode 相同（EP 在 TC 104、关闭 RDMA 原子操作、rail-only）。测两种形状：
+
+- **K3.1 decode 形状**：每卡每次 48 个 token、hidden 3584、每卡 56 个专家、每个 token 选 16 个——和端到端 decode 的 EP 相同。下文不特别说明时都是这个形状。
+- **mori 默认形状**：每卡每次 128 个 token、hidden 7168、每个 token 选 8 个，用来和一年前的数字对比。
+
+每次跑 2000 轮（先预热 100 轮），每个场景跑 2 次。"最快 / 平均 / p99"是在全部"轮 × 16 个 rank"的样本上算的：最快 = 最快的一次，平均 = 所有样本的平均。这和一年前用的 v1 用例里 Best / Average 的定义一样。
+
+**IO 有两种**：
+
+- **mori 自带的 IO benchmark**（`tests/python/io/benchmark.py`），参数和一年前的 `io.sh` 一样：每次传输 32 KB、每批 8192 次、用批量和 session 接口、一直跑不停；默认 1 对卡（GPU 0 → GPU 0，只走 rail 0），另外也测了 8 对卡。唯一的改动：它默认用 RDMA 读，在这套网络上读不过它自己的数据校验（端到端的 KV 传输只用写），所以改成写。每张网卡能跑到约 44 GB/s（线速的 88%）。
+- **KV 形状的写**（端到端注入用的 `io_inject.py`）：MoRI IO RDMA 写，GPU i → GPU i 走 rail i，8 条 rail；每次 16 MB 以线速发完，靠两次之间的空闲时间控制平均速率（背靠背时每张网卡约 40 GB/s）；接收端可以是 GPU 显存，或 host 内存（和网卡同 NUMA / 跨 NUMA）。
+
+**IO 的流量类别**：`MORI_IO_TC=104`（和 EP 同一个无损类）、`MORI_IO_TC=0`（有损的低优先级类），或 `MORI_IO_TC_DISABLE=1`（QP 上不设 TC，在这套网络上等同于 TC 0）。
+
+**IO 和 EP 在哪里相遇**（用第三台机器 node08 拆开）：
+
+| 叫法 | IO 从哪到哪 | 在哪里相遇 | 对应 PD 里的什么 |
+|---|---|---|---|
+| 两台 EP 节点之间（一年前的做法） | node06 → node07 | node06 的网卡既发 EP 又发 IO；node07 的网卡既收 EP 又收 IO | – |
+| 只在发送侧 | node06 → node08 | 只有 node06 的发送端网卡；往 node07 的方向没有多余流量 | 一个节点既跑跨机 EP、又往外发 KV 或别的大流量 |
+| 只在接收侧 | node08 → node07 | 只有 node07 的接收端（交换机往 node07 的出口、node07 的网卡）；node06 不发 IO | PD 的 decode 节点接收 KV（我们的部署就是这种） |
+
+**每个场景的步骤**：先起 IO，等 15–30 s 稳定，用网卡计数确认 IO 速率，再跑 EP，最后停 IO；前后记录网卡的重传、ACK 超时和 PFC 计数。不跑 IO 的基线在开头、中间、结尾各跑一次：node06 + node07 上 5 次基线之间，dispatch 平均 62.6–62.9 µs、combine 平均 50.7–51.0 µs，漂移不到 1%。EP 自己的流量很小（K3.1 形状每卡每次约 0.3 MB）。
+
+### 5.3 结果一：一年前的单测复现出来了
+
+| 场景 | 一年前：dispatch 最快 / 平均 | 一年前：combine 最快 / 平均 | 这次 mori 默认形状：dispatch | 这次 mori 默认形状：combine | 这次 K3.1 形状：dispatch | 这次 K3.1 形状：combine |
+|---|---|---|---|---|---|---|
+| 不跑 IO | 97 / 112 µs | 95 / 108 µs | 79 / 92 µs | 68 / 93 µs | 47 / 62.7 µs | 35 / 50.9 µs |
+| IO 和 EP 同一个优先级 | 170 / 228（2.0 倍） | 81 / 141（1.3 倍） | 80 / 197（2.1 倍） | 62 / 122（1.3 倍） | 46 / 91（1.46 倍） | 35 / 62（1.21 倍） |
+| IO 放低优先级（TC 0） | 98 / 197（1.8 倍） | 94 / 126（1.2 倍） | 80 / 145（1.6 倍） | 68 / 103（1.1 倍） | 46 / 76（1.22 倍） | 35 / 59（1.17 倍） |
+| IO 不设 TC | 96 / 297（2.7 倍） | 79 / 167（1.5 倍） | 79 / 145（1.6 倍） | 66 / 103（1.1 倍） | 46 / 77（1.22 倍） | 35 / 59（1.17 倍） |
+
+**怎么看**：括号里是平均延迟相对"不跑 IO"的倍数。"这次"的 IO 都是 mori IO benchmark、1 对卡、每张网卡约 44 GB/s，在两台 EP 节点之间跑（node06 → node07），和一年前的做法一样。
+
+**说明了什么**：
+- IO 和 EP 同一个优先级时，mori 默认形状下 dispatch 平均变成 2.1 倍、combine 1.3 倍，和一年前（2.0 倍、1.3 倍）几乎一样：一年前测到的现象在这套网络上同样存在。
+- "最快"那一列基本不变，变的是平均：不是每一次 EP 都变慢，而是相当一部分 EP 撞上 IO 后明显变慢。
+- IO 放到 TC 0 能缓解一部分，但平均仍慢 22%（K3.1 形状）到 57%（默认形状）。在这套网络上，"不设 TC"就是 TC 0，所以两行一样；一年前那套网络上两者不一样。
+- 一年前和这次的差别：一年前在另一套集群上（SL 3 / TC 96），用 mori 的 v1 EP 用例，IO 用 RDMA 读；这次是 TC 104（DSCP 26，带 PFC）、mori PR #996 的 EPv2，IO 用 RDMA 写。
+
+### 5.4 结果二：IO 和 EP 在哪里相遇，决定了 EP 慢多少
+
+![IO 和 EP 在哪里相遇](img/fig7_microbench_where.png)
+
+**怎么看**：每一行是一个场景，蓝色是 dispatch、橙色是 combine，柱长是平均延迟比不跑 IO 时慢多少。分三组：上面是 IO 在两台 EP 节点之间跑（一年前的做法），中间是只在发送侧相遇，下面是只在接收侧相遇。三组的定义见 5.2 的表。
+
+**说明了什么**：
+- **影响几乎都来自发送侧**。只在发送侧相遇时 dispatch 慢 43%–52%、combine 慢 22%–33%，和"两台 EP 节点之间"差不多（1 对卡：发送侧 +43%，两台之间 +46%）。只在接收侧相遇时 dispatch 只慢 4%–9%、combine 慢 4%–11%；接收端网卡打到接近线速（每张约 41–45 GB/s）也是这个量级。
+- **交换机上的优先级管不了发送侧**。IO 放到 TC 0，发送侧 dispatch 只从 +52% 降到 +43%。而且这些场景里 PFC 暂停很少（最多是发送端在一个约 100 秒的场景里共被暂停 16–62 ms，不到 0.06% 的时间），EP 也没有重传。所以 EP 主要是在发送端网卡上排在 IO 后面，而不是在交换机里排队或被暂停。具体是网卡的发送调度、还是网卡从 GPU 显存读数据的 PCIe 带宽，这次没有区分。
+- **两边都相遇、而且双向时最重**：KV 形状的写在两台 EP 节点之间双向跑（每台既发又收），dispatch 慢 91%–98%、combine 慢 37%–52%。
+- **写 host 内存跨 NUMA 最重**：IO 在两台 EP 节点之间跨 NUMA 写 host 内存，dispatch 慢 121%、combine 慢 83%；同 NUMA 时（+55%）和写 GPU 显存（+54%）差不多。这和端到端注入里"跨 NUMA 最重"一致。
+- mori 默认形状（每卡 128 token）下规律相同，幅度更大：只在接收侧 dispatch 慢 23%–33%，只在发送侧慢 102%–108%（明细见本节末）。
+
+### 5.5 结果三：EP 慢多少和 IO 速率的关系
+
+![EP 变慢和 IO 速率的关系](img/fig8_microbench_rate.png)
+
+**怎么看**：实线是 IO 从一台 EP 节点写到另一台（发送侧和接收侧都有，以发送侧为主），虚线是第三台往 EP 节点写（只在接收侧）。横轴是每张网卡的 IO 平均速率；IO 每次都以线速发 16 MB，速率低只是两次之间空得久。实线在 node06 + node08 上测，其中 20 GB/s 一点取自 node06 + node07（两组机器背靠背时的结果几乎一样：+53% 和 +54%）。
+
+**说明了什么**：
+- 发送侧的影响随 IO 速率增加：每张网卡 2 / 5 / 10 / 20 / 40 GB/s 时，dispatch 平均慢 14% / 27% / 39% / 52% / 53%，combine 慢 6% / 13% / 25% / 31% / 34%。
+- 平均速率很低也有影响：2 GB/s 时 IO 只有约 5% 的时间在发，dispatch 平均慢 14%，p99 从约 78 µs 涨到 121 µs（+55%）。因为 IO 一发就是线速，撞上 IO 的那部分 EP 会慢很多。
+- 只在接收侧时，20 GB/s 和背靠背都只慢 6%–10%，和速率关系不大。
+
+### 5.6 单测和端到端怎么对上
+
+- **我们的 PD 部署只有接收侧的相遇**：KV 从 prefill 写进 decode，decode 节点只收不发；prefill 是单机 TP8 + DCP8，不跑跨机 EP，所以 prefill 发 KV 也碰不到 EP。
+- **端到端注入和单测的接收侧对得上**：单测里接收侧单次 EP 慢 4%–11%；EP 每步约 18 ms，占 decode 一步（约 217 ms）的 8%，折算 decode 每一步慢 0.3%–0.9%。端到端注入（每张网卡 38 GB/s、只写进 decode）实测平均慢 1.3%，单个窗口的噪声是 ±2%，量级一致。
+- **真实负载下更小**：KV 是突发的，流入 decode 超过 10 GB/s 的时间只有 2.5%–2.7%，大部分 EP 碰不到它，所以 decode 每一步最多慢 0.3%（3.2）。
+- **3.3 为什么看不出来**：接收侧单次 EP 慢几微秒（4%–11% × 50–60 µs），5 ms 粒度的字节计数看不出来；3.3 只能排除毫秒级的停顿。
+- **什么情况下 KV 会明显拖慢 EP**：一个节点既跑跨机 EP、又往外发 KV 或别的大流量时（比如 prefill 也用跨机 EP 并且发 KV，或者 decode 节点往外写 KV 缓存）。按单测，这时发送端每张网卡平均只发 2 GB/s，dispatch 平均也要慢 14%、p99 慢 55%；发 10–40 GB/s 时慢 39%–53%。我们的部署里没有这种节点。
+
+### 5.7 单测的局限
+
+- mori IO benchmark 默认的 RDMA 读在这套网络上读不过它自己的数据校验，所以复现一年前的单测时改用了写（数据方向 node06 → node07）。
+- EP 用例用的是 mori 自己生成的均匀路由和固定的 token 数，GPU 上没有别的计算；真实 decode 里 EP 和计算交替进行。
+- "只在接收侧 / 只在发送侧"的 T3、T4、T7 三组（见下表）跑的时候，node07 上同事的作业正好在初始化；RDMA 计数显示那段时间 node07 上没有它的流量，紧接着跑的不带 IO 的基线也正常（dispatch 62.9 µs），结果和对应的 T1、T2 一致。
+- 单测镜像的 mori 和端到端相同（PR #996），只是编译时关掉了 UMBP（EP 和 IO 用不到）。
+
+<details>
+<summary>全部场景明细（K3.1 decode 形状）</summary>
+
+| 场景 | IO 实测（每张网卡 GB/s） | dispatch 最快 / 平均 / p99（µs） | 平均变化 | combine 最快 / 平均 / p99（µs） | 平均变化 |
+|---|---|---|---|---|---|
+| 不跑 IO（node06 + node07，5 次合并） | – | 45–47 / 62.6–62.9 / 76–77 | – | 35–36 / 50.7–51.0 / 65–67 | – |
+| **IO 在两台 EP 节点之间（node06 → node07）** | | | | | |
+| U1：IO benchmark，1 对卡，TC 104 | 44（1 张） | 46 / 91.4 / 128 | +46% | 35 / 61.8 / 98 | +21% |
+| U2：IO benchmark，1 对卡，TC 0 | 45（1 张） | 46 / 76.3 / 127 | +22% | 35 / 59.3 / 114 | +17% |
+| U3：IO benchmark，1 对卡，不设 TC | 44（1 张） | 46 / 76.6 / 127 | +22% | 35 / 59.4 / 114 | +17% |
+| U4：IO benchmark，8 对卡，TC 104 | 44（8 张） | 65 / 103.0 / 183 | +64% | 37 / 73.9 / 143 | +46% |
+| U5：IO benchmark，8 对卡，TC 0 | 44（8 张） | 49 / 87.9 / 131 | +40% | 37 / 68.0 / 115 | +34% |
+| K1：KV 形状写，背靠背，单向 | 41（8 张） | 63 / 96.7 / 128 | +54% | 36 / 68.7 / 97 | +35% |
+| K3：KV 形状写，每张 20 GB/s，单向 | 21（8 张） | 48 / 95.2 / 127 | +52% | 36 / 66.6 / 105 | +31% |
+| K2：KV 形状写，背靠背，双向 | 40（8 张） | 65 / 119.5 / 157 | +91% | 37 / 77.5 / 109 | +52% |
+| K4：KV 形状写，每张 20 GB/s，双向 | 21（8 张） | 64 / 124.2 / 160 | +98% | 36 / 69.7 / 113 | +37% |
+| K5：KV 形状写，背靠背，单向，TC 0 | 41（8 张） | 48 / 90.4 / 133 | +44% | 36 / 67.7 / 115 | +33% |
+| K6：KV 形状写，背靠背，双向，TC 0 | 40（8 张） | 47 / 110.1 / 161 | +75% | 36 / 73.2 / 133 | +44% |
+| H1：写 node07 的 host 内存，同 NUMA | 41（8 张） | 49 / 97.5 / 161 | +55% | 35 / 68.4 / 126 | +34% |
+| H2：写 node07 的 host 内存，跨 NUMA | 39（8 张） | 47 / 138.5 / 219 | +121% | 35 / 93.2 / 175 | +83% |
+| **只在发送侧（node06 → node08）** | | | | | |
+| T6：IO benchmark，1 对卡，TC 104 | 44（1 张） | 47 / 90.1 / 128 | +43% | 35 / 61.8 / 99 | +22% |
+| T2：KV 形状写，背靠背，TC 104 | 41（8 张） | 48 / 95.3 / 126 | +52% | 35 / 67.4 / 106 | +33% |
+| T4：KV 形状写，背靠背，TC 0 | 41（8 张） | 47 / 90.1 / 130 | +43% | 35 / 63.4 / 107 | +25% |
+| **只在接收侧（node08 → node07）** | | | | | |
+| T5：IO benchmark，1 对卡，TC 104 | 45（1 张） | 47 / 68.4 / 86 | +9% | 35 / 52.8 / 71 | +4% |
+| T1：KV 形状写，背靠背，TC 104 | 41（8 张） | 47 / 66.7 / 85 | +6% | 35 / 55.7 / 74 | +10% |
+| T7：KV 形状写，每张 20 GB/s，TC 104 | 21（8 张） | 47 / 67.7 / 85 | +8% | 36 / 54.7 / 75 | +8% |
+| T3：KV 形状写，背靠背，TC 0 | 41（8 张） | 46 / 65.5 / 85 | +4% | 36 / 56.4 / 77 | +11% |
+| **速率扫描（node06 → node08，两台都跑 EP；基线 63.0–63.6 / 50.6–51.9 µs）** | | | | | |
+| R2：KV 形状写，每张 2 GB/s | 2（8 张） | 46 / 71.8 / 121 | +14% | 35 / 54.2 / 99 | +6% |
+| R5：每张 5 GB/s | 5（8 张） | 47 / 80.1 / 124 | +27% | 36 / 57.8 / 100 | +13% |
+| R10：每张 10 GB/s | 11（8 张） | 47 / 88.1 / 126 | +39% | 36 / 64.0 / 121 | +25% |
+| R40：背靠背 | 41（8 张） | 59 / 96.9 / 128 | +53% | 36 / 68.6 / 97 | +34% |
+
+mori 默认形状（每卡 128 token）：不跑 IO 时 dispatch 平均 92–94 µs、combine 93–94 µs；只在接收侧 T1 / T5 dispatch +23% / +33%、combine +21% / +3%；只在发送侧 T2 / T6 dispatch +102% / +108%、combine +56% / +32%；两台之间 U4（8 对卡，TC 104）dispatch +115%、combine +54%，K2（KV 形状双向）+131% / +82%。
+
+网卡计数：IO 在 TC 104 的场景里，EP 和 IO 都没有重传；PFC 只在 U1、T6、U4 里出现，是发送端 node06 收到交换机的暂停，整个场景（约 100–110 秒）共 16 ms、16 ms、62 ms。IO 在 TC 0 的场景里，发送端每个场景重传 2 万–61 万个包（有损类里 IO 自己被丢的包），ACK 超时最多 6 次。
+
+</details>
+
+## 6. 为什么在我们的 decode 上影响小
 
 三层原因叠在一起：
 
 1. **撞上的机会少（KV 的特点）**：KV 是突发的，流入 decode 节点超过 10 GB/s 的时间只占 2.5%–2.7%，大部分 EP 操作碰不到 KV。真实负载下只慢 0.3%，主要靠这一点。
-2. **撞上了，EP 也慢不了多少（EP 的特点，加上无损网络）**：一次 dispatch 或 combine，每条 rail 每个方向只传约 0.35 MB，按线速约 7 µs；而一次操作要 80–100 µs，大部分时间花在打包数据、发起传输和等其他 rank 上。KV 就算分走一半带宽，每次也只多几 µs。TC 104 无损，KV 再猛，EP 也只是排队，不会丢包重传。
+2. **撞上了，影响也有限（我们部署的特点）**：decode 节点只接收 KV、不往外发，所以只有接收侧的相遇。单测里接收侧单次 EP 只慢 4%–11%；如果 EP 节点同时往外发流量（发送侧），会慢 43%–52%（第 5 节）。TC 104 无损，KV 再猛，EP 也只是排队，不会丢包重传。
 3. **EP 在 decode 里占比低（这个部署的特点）**：EP 只占 decode GPU 内核时间的 9%（下图），EP 慢 10%，decode 只慢约 0.8%。
 
-第 4 节的加压强制每次 EP 都撞上，相当于去掉了第 1 层，decode 仍然只慢 1.3%，靠的是第 2、3 层。这三层都和负载、配置有关：KV 越密、每次 EP 要传的数据越多、EP 在 decode 里占比越高，影响就越大。
+第 4 节的加压强制每次 EP 都撞上，相当于去掉了第 1 层，decode 仍然只慢 1.3%，靠的是第 2、3 层。这三层都和负载、配置有关：KV 越密、EP 节点自己也往外发大流量、EP 在 decode 里占比越高，影响就越大。
 
 ![decode 一步里 GPU 在做什么](img/fig6_step_breakdown.png)
 
@@ -182,13 +339,13 @@ EP 流量的明细（真实负载）：
 | 每一步 | 约 0.51 GB / 方向 / 台 |
 | 每次 dispatch 或 combine | 约 2.8 MB / 方向 / 台（每条 rail 约 0.35 MB） |
 
-## 6. UMBP
+## 7. UMBP
 
 - 这套部署（和 InferenceY recipe 一样）里，UMBP 是每台 prefill 本机的 DRAM 缓存，读写只走本机 GPU 和主机内存之间的 PCIe，不经过网卡；EP 只在两台 decode 之间。所以 UMBP 和 EP 碰不到一起。
 - 每台 prefill 上 UMBP 读入 GPU 约 2.7–3.0 GB/s、写出约 1.4 GB/s；同一时间 prefill 发 KV 的速度没有被它压低（两者都随负载一起升高，相关系数 0.6–0.9）。
-- 如果把 UMBP 的远端缓存放到 decode 节点上，它的流量就是"写 decode 主机内存"：对应第 4 节的紫色（同 NUMA，不到 1%）和红色（跨 NUMA，3%–14%）。真实 UMBP 的流量摊到每张网卡约 0.2–0.7 GB/s，低于第 4 节测过的最低档（5 GB/s）。
+- 如果把 UMBP 的远端缓存放到 decode 节点上，它的流量就是"写 decode 主机内存"：对应第 4 节的紫色（同 NUMA，不到 1%）和红色（跨 NUMA，3%–14%）。真实 UMBP 的流量摊到每张网卡约 0.2–0.7 GB/s，低于第 4 节测过的最低档（5 GB/s）。如果反过来由 decode 节点往外写 UMBP 远端池，就成了第 5 节的"发送侧"，按单测会明显拖慢 EP。
 
-## 7. 对照：全部改成有损的 TC 0
+## 8. 对照：全部改成有损的 TC 0
 
 同样的配置和负载，只把 `MORI_RDMA_TC / MORI_IO_TC / NCCL_IB_TC` 改成 0，跑了约 40 分钟。端到端和 decode 每步耗时都和 TC 104 一样，但网络上开始丢包：
 
@@ -206,7 +363,7 @@ EP 流量的明细（真实负载）：
 ## 附录
 
 <details>
-<summary>完整启动参数</summary>
+<summary>端到端：完整启动参数</summary>
 
 decode（两台各一个进程，node-rank 0 / 1）：
 
@@ -254,7 +411,7 @@ agentx-harness 1.0.13；环境变量 `AIPERF_HTTP_TCP_USER_TIMEOUT=900000 AIPERF
 </details>
 
 <details>
-<summary>RDMA 相关的环境变量</summary>
+<summary>端到端：RDMA 相关的环境变量</summary>
 
 | | decode | prefill |
 |---|---|---|
@@ -268,9 +425,54 @@ agentx-harness 1.0.13；环境变量 `AIPERF_HTTP_TCP_USER_TIMEOUT=900000 AIPERF
 </details>
 
 <details>
+<summary>单测：命令</summary>
+
+环境变量（两台都一样，和端到端 decode 相同）：
+
+```
+MORI_RDMA_TC=104 MORI_EP_DISABLE_RDMA_ATOMICS=1 MORI_ENABLE_RAIL_ONLY=1 MORI_DEVICE_NIC=ionic \
+MORI_RDMA_DEVICES=ionic_0,...,ionic_7 MORI_ENABLE_SDMA=0 MORI_EP_LAUNCH_CONFIG_MODE=AUTO \
+MORI_IB_GID_INDEX=1 MORI_DISABLE_IONIC_CCQE=1 MORI_IB_ENABLE_RELAXED_ORDERING=0 \
+MORI_IO_RAIL_AFFINITY=1 MORI_IO_QP_MAX_SEND_WR=32767 HSA_NO_SCRATCH_RECLAIM=1 \
+GLOO_SOCKET_IFNAME=eth1 MORI_SOCKET_IFNAME=eth1 PYTHONPATH=<mori>:<mori>/python
+# IO 的流量类别三选一：MORI_IO_TC=104 | MORI_IO_TC=0 | MORI_IO_TC_DISABLE=1
+```
+
+EP16（每台一个 torchrun 进程，用例自己拉起 8 个 rank）：
+
+```
+torchrun --nnodes=2 --node_rank={0,1} --nproc_per_node=1 --master_addr=<node06> --master_port=<port> \
+  tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py --cmd bench \
+  --kernel-type v2_ll --max-tokens 48 --hidden-dim 3584 --topk 16 --experts-per-rank 56 \
+  --dtype bf16 --combine-dtype bf16 --num-qp 8 --scale-dim 0 --rounds 2000 --warmup 100
+# mori 默认形状：--max-tokens 128 --hidden-dim 7168 --topk 8（去掉 --experts-per-rank）
+```
+
+mori IO benchmark（rank 0 = 发起方，rank 1 = 目标方；每台一个 torchrun 进程）：
+
+```
+torchrun --nnodes=2 --node_rank={0,1} --nproc_per_node=1 --master_addr=<发起方> --master_port=<port> \
+  tests/python/io/benchmark.py --host=<本机 IP> --enable-batch-transfer --enable-sess \
+  --buffer-size 32768 --transfer-batch-size 8192 --iters 1000000000 --op-type write \
+  [--num-initiator-dev 8 --num-target-dev 8]
+```
+
+KV 形状的写（同目录 `io_inject.py`）：
+
+```
+# 接收端
+python3 io_inject.py recv --devs 0-7 --port-base <p> --mem gpu --buf-gb 1 --serve-forever   # 或 --mem host --numa local|remote
+# 发送端：--period-ms 0 = 背靠背；16 MB / period = 每张网卡的平均速率（0.8 ms ≈ 20 GB/s，8 ms ≈ 2 GB/s）
+python3 io_inject.py send --peer <接收端 IP> --devs 0-7 --port-base <p> --mem gpu --buf-gb 1 \
+  --chunk-mb 16 --period-ms <ms> --duration <s> --out <dir>
+```
+
+</details>
+
+<details>
 <summary>代码</summary>
 
 - 测量探针（本分支）：`python/sglang/srt/epio_probe.py`、`epio_clock.py`；挂在 `disaggregation/mori/conn.py`（KV 传输的入队 / 提交 / 完成时间和字节数）、`disaggregation/decode.py`（KV 到达）、`managers/scheduler.py`（每一步的 GPU 时间）。`EPIO_PROBE_DIR=<dir> EPIO_PROBE_RANKS=0,8` 打开。
-- 注入工具：同目录的 `io_inject.py`（MoRI IO RDMA 写；接收端可选 GPU 显存 / 主机内存及 NUMA，可调每次大小和间隔，按指定时刻开始）。
+- 注入工具：同目录的 `io_inject.py`（MoRI IO RDMA 写；接收端可选 GPU 显存 / 主机内存及 NUMA，可调每次大小和间隔，按指定时刻开始）。端到端注入和单测里"KV 形状的写"都用它。
 
 </details>
