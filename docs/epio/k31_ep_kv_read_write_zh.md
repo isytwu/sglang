@@ -6,18 +6,29 @@
 
 - **READ 能不能用**（第 1 节）：先确认 MoRI IO 的 READ 在这套网络上读回来的数据对不对。
 - **单测**（第 2 节）：EP16 旁边一直跑 MoRI IO，READ 和 WRITE 各三种摆法（IO 在两台 EP 节点之间；从 EP 节点发往第三台；从第三台进 EP 节点），看 EP 每次 dispatch / combine 慢多少、为什么。
-- **端到端**（第 3–5 节）：一个汇总了所有修正的 decode 配置（含 `SGLANG_MORI_MOE_MAX_INPUT_TOKENS`），以及它的正确性；在这个配置上把 READ 和 WRITE 注入放在同一次跑里比较（合成负载）。AgentX 上的自然流量和注入因为 decode 死锁没有跑成（第 3.3、5 节）。
-- **跨 NUMA 的补充**（第 6 节）：几张网卡、多大速率才会触发；READ 是不是一样。
+- **端到端**（第 3–5 节）：一个汇总了所有修正的 decode 配置（含 `SGLANG_MORI_MOE_MAX_INPUT_TOKENS`），以及它的正确性；在这个配置上把 READ 和 WRITE 注入放在同一次跑里比较（合成负载）；在第一轮的 d1024 配置上跑一次 AgentX（256 路），前 30 分钟重做自然流量分析，后半段做 READ / WRITE 注入（第 5 节）。
+- **跨 NUMA 的补充**（第 6 节）：几张网卡、多大速率才会触发；READ 是不是一样；decode 里被堵 GPU 上的小内核为什么变慢。
 
 ## 结论
 
 先说端到端（第 3–6 节），再说 READ 的正确性和单测（第 1–2 节）。
 
-- **`SGLANG_MORI_MOE_MAX_INPUT_TOKENS=2048` 值得加**：decode 每步 114 → 88 ms（−23%），MoE 专家 GEMM / 排序 44 → 25 ms；输出质量没有变化（第 3.1 节）。这一轮的端到端都在"dispatch 上限 1024 + MoE 输入上限 2048"上跑。
+- **`SGLANG_MORI_MOE_MAX_INPUT_TOKENS=2048` 值得加**：decode 每步 114 → 88 ms（−23%），MoE 专家 GEMM / 排序 44 → 25 ms；输出质量没有变化（第 3.1 节）。第 4 节的合成负载注入在"dispatch 上限 1024 + MoE 输入上限 2048"上跑；第 5 节的 AgentX 和 6.4 节的 decode 验证用第一轮的 d1024 配置（不设 MoE 输入上限）。
 - **KV 的正常路径（写进 decode GPU 显存）用 READ 还是 WRITE，对 decode 都几乎没有影响**：每张网卡 38 GB/s 背靠背注入，decode 每步只慢约 1%；写进本 NUMA 的主机内存也一样（第 4 节）。
 - **写进另一个 NUMA 的主机内存仍然最伤，而且 READ 比 WRITE 更重**：背靠背 +54%（WRITE +39%），每张网卡 20 GB/s 时 +12%（WRITE +7%）；多出来的集中在 node02（READ 的发起方、a-147 固件）（第 4 节）。
-- **跨 NUMA 的触发条件补齐了**（第 6 节）：要同一颗 CPU 下的 4 张网卡一起往另一颗 CPU 写（合计约 145 GB/s）才会触发，1–3 张不触发；READ 和 WRITE 一样；限速后是"开关式"的，给不出干净的安全阈值。关掉 CUDA graph、命令队列放显存都消除不了 decode 里被堵 GPU 上的内核卡顿。避开的办法仍是把 RDMA 主机缓冲放在网卡所在的 NUMA 上。
-- **这一轮没有拿到 AgentX 的端到端结果**（第 3.3、5 节）：AgentX 的流量每次都让 decode 死锁（同组的 rank 停在不同的集合通信上，与 MoE 输入上限无关，合成负载下不出现），六次都没跑成；连带出现了 prefill 积压时两次 GPU 卡死、router 默认健康检查把忙碌的 decode 摘掉、崩溃后显存不释放。自然流量仍以第一轮为准，需要在 decode 死锁修好后重测。
+- **跨 NUMA 为什么让 decode 变慢，找到了**（第 6 节）：
+  - 触发条件是同一颗 CPU 下的 4 张网卡一起往另一颗 CPU 写（合计约 145 GB/s），1–3 张不触发；READ 和 WRITE 一样；限速后是"开关式"的。这时和这些网卡共用根端口的 GPU 往主机方向的读写要多等 10–15 µs。
+  - decode 会被放大，是因为它每一步都有一条 stream 在 GPU 上等另一条 stream：有新请求并入时，调度 stream 要等这一步前向跑完（`disaggregation/decode.py` 里的 `schedule_stream.wait_stream(forward_stream)`）。我们的理解是：整步前向期间，GPU 的命令处理器要反复去主机内存读这条等待的信号，每次读都被拥塞拖慢，前向 stream 上的每个小内核也跟着等（从合成测试推断，见 6.4 节）。
+  - 合成测试加上同样一条等待就复现出来（只在被堵的 GPU 上，小内核每个 +2–5 µs），去掉就没有。之前怀疑的 CUDA graph、命令队列位置、系统范围的屏障、peer access、GPU 往网卡的流量都不是原因。
+  - 在真实 decode 里关掉重叠调度（`--disable-overlap-schedule`，这条等待随之消失），背靠背拥塞时每步的变慢从 +22.8% 降到 +8.9%（READ 注入）、+17.5% 降到 +6.5%（WRITE 注入），约去掉六成；不拥塞时每步仍是 114 ms，没有损失。剩下约四成另有原因，还没查。
+  - 避开的办法：RDMA 主机缓冲放在网卡所在的 NUMA 上（不触发拥塞）；在这套配置上，合成负载下 `--disable-overlap-schedule` 不花代价（AgentX 下没测）；sglang 侧可以让 decode 并入新请求时不在 GPU 上挂着等前向。
+- **AgentX 上的结果**（第 5 节，第一轮的 d1024 配置，不设 MoE 输入上限）：
+  - decode 每步 p50 从第一轮的 217 ms 降到 114 ms，输出 2,705 tok/s（第一轮同一窗口 2,321），ITL p50 34 ms（第一轮 68 ms）。
+  - KV 流入的量和突发形态和第一轮一样（每台均值 2.0–2.5 GB/s，100 ms p99 62 GB/s），对 decode 步的影响仍然很小：KV 流入 20–100 GB/s 的步慢 0.25%–0.5%（第一轮 ≤ 0.2%），超过 100 GB/s 的 26 步慢 2.3%。
+  - 注入：写进 decode GPU 显存时 READ 和 WRITE 都在 ±1% 以内，EP 单次耗时不变；本 NUMA ≤ +3.3%；另一个 NUMA 背靠背 +20%～+32%；每张网卡 20 GB/s 时 READ +9%～+13%、WRITE +1%～+5%。
+- **更正：这一轮前面几次 AgentX 没跑完，不是"decode 死锁"**（第 5.3 节）：
+  - 之前写的"AgentX 一开始 decode 就死锁、六次都没跑成、和 MoE 输入上限无关"是我判断错了。AgentX 的预热请求都是 `max_tokens=1`，decode 在 40 多分钟的预热里本来就不跑解码步；我把"每步耗时的 probe 不涨、各 rank 停在不同的集合通信上"当成了死锁，其实是正常的空转。
+  - 两次正常的运行（其中一次带 MoE 输入上限）是被我自己停掉的。真正的问题是 prefill 两次 GPU 卡死，以及之后那个 decode 实例收不进 KV。
 
 READ 的正确性和单测：
 
@@ -161,6 +172,7 @@ PFC 解释不了这个差别：KV 形状的两场里 IO 来源都完全没被暂
 - decode：`SGLANG_ROCM_RUNTIME_RESERVE_GB=24 SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024 SGLANG_MORI_MOE_MAX_INPUT_TOKENS=2048`，MoRI EPv2 跨机，TC 104。
 - PD 传输：仍是 sglang MoRI 连接器的 RDMA WRITE（prefill 写 decode 的 GPU 显存）。它没有 READ 模式；而且 node02 上 READ 进 GPU 显存会丢数据（第 1 节），改成 READ 也没法在这里验证。
 - 试过但没有放进来的：`HSA_ALLOCATE_QUEUE_DEV_MEM=1`（命令队列放显存，对跨 NUMA 没有帮助，见第 6 节）。
+- 第 5 节的 AgentX 和 6.4 节的验证没有用这个配置，而是第一轮的 d1024 配置（不设 MoE 输入上限），原因见第 5 节开头。
 - 没有改的：UMBP 的 DRAM 层按默认分在两个 NUMA 上（`UMBP_DRAM_NUMA_NODE` 可以指定，但它只是平均分到各节点，不会按发起的 GPU 选近的那个）；UMBP 的实际流量每张网卡只有 0.2–0.7 GB/s，碰不到第 6 节的触发条件。
 
 ## 4. 端到端：READ 和 WRITE 注入（合成负载）
@@ -188,26 +200,90 @@ PFC 解释不了这个差别：KV 形状的两场里 IO 来源都完全没被暂
 | W4 | WRITE | 另一个 NUMA，限 20 GB/s | 20.9 | 93.9 / 93.9 | +6.9% | 72 / 103 |
 | R4 | READ | 另一个 NUMA，限 20 GB/s | 20.9 | 98.0 / 98.0 | +11.6% | 70 / 103 |
 
-## 5. 端到端：AgentX（这一轮没有拿到结果）
+## 5. 端到端：AgentX
 
-原计划在 3.2 节的配置上跑一次 AgentX（256 路）：前 30 分钟不注入，用来重做第一轮第 3 节的自然流量分析；后半段做和第 4 节一样的 8 个 READ / WRITE 注入时段。六次尝试都因为 3.3 节的问题没跑成，主要是 AgentX 一开始 decode 就死锁。所以：
+11-19 07:00 起，在第一轮的 d1024 配置上（dispatch 上限 1024，不设 MoE 输入上限，router 用默认健康检查）跑了一次 AgentX（256 路，`run/k31_r23_ctrl.sh`）。没有用 3.2 节带 MoE 输入上限的配置，是因为这一次同时要当对照：按第一轮原样跑，看前几次没跑完到底是机器的问题还是配置的问题（5.3 节）。预热 2648 s 完成、0 个错误（第一轮 2706 s、0 个错误），正式阶段 3600 s：前 1800 s 不注入，用作自然流量；之后 8 个 READ / WRITE 注入时段，落点和速率和第 4 节一样。MoE 输入上限在 AgentX 正式阶段下还没有跑过。
 
-- **自然流量**仍以第一轮第 3 节为准（那时 decode 没设 MoE 输入上限，每步约 217 ms）。这一轮 decode 每步快了约一半，同样的 KV 流量占每步的比例会更大，结论需要在 decode 死锁修好后重测。
-- **注入**用第 4 节合成负载的结果：它的落点和速率和 AgentX 方案一样，只是负载是合成的。
+### 5.1 自然流量（正式阶段 300–1780 s，和第一轮第 3 节同样的分析）
 
-### 3.3 这一轮端到端跑的时候遇到的问题
+| | 第一轮（无 dispatch 上限） | 这一次（dispatch 上限 1024） |
+|---|---|---|
+| QPS / 输出 tok/s | 2.84 / 2,321 | 3.07 / 2,705 |
+| ITL p50 / p90 / p99（ms） | 67.6 / 69.8 / 77.5 | 34.1 / 36.4 / 39.9 |
+| TTFT p50 / p90（s） | 34.4 / 106.7 | 45.9 / 112.7 |
+| decode 每步 p50 / p90 / p99（ms），每组平均 batch | 217.3 / 225.1 / 231.3，69 | 114.1 / 120.2 / 125.5，41 |
+| EP dispatch / combine 每次（µs，负载下的 trace） | 80 / 99 | 63–66 / 76–81 |
+| KV 流入每台 decode 均值（GB/s，02 / 04） | 2.25 / 1.89 | 2.53 / 1.98 |
+| KV 流入 node02，100 ms p99 / 最大（GB/s） | 56 / 243 | 62 / 199 |
+| EP 每台每方向（GB/s） | 2.37 | 2.95 |
+| 有 KV 流入（> 1 GB/s）的步 | 31% | 19% |
+| KV 突发（node02）次数，突发后 50 ms 流入的 EP 变化 | 855，−0.4% | 321，−0.6% |
+| decode 发 PFC（ms，02 / 04）；重传 | 141 / 61（全程 54 分钟）；0–43 包 | 39 / 30（这 25 分钟）；0 |
 
-这一轮的 AgentX 一次都没跑成（11-18 20:42 到 11-19 04:30，共六次），所以第 5 节没有 AgentX 的结果。原因依次是：
+按"这一步里流入的 KV"分档，decode 步相对同 batch 中位数的残差（DP0，均值 / 中位数）：
 
-1. **AgentX 的流量让 decode 死锁**（每次都发生，最主要的原因）：AgentX 一开始，decode 就一个 batch 都不跑了（每步耗时的 probe 不再增长，生成吞吐为 0），之后的请求等几百秒、只返回 prefill 给的第一个 token。py-spy 看到同一组的 rank 停在不同的集合通信上，例如 DP1 的 8 个 rank 里，TP8、9、11、14 在同步 KV 传输状态的 `all_reduce_flags`（`poll_and_all_reduce`），TP10、15 在 DP attention 每步的 `exchange_sync_rows`，TP12、13 在广播新请求的 `broadcast_pyobj`；gloo 按调用顺序配对，组内成员走了不同的分支，就互相等死。它和 `SGLANG_MORI_MOE_MAX_INPUT_TOKENS` 无关（不设也一样），和 router 的健康检查参数也无关；同样的服务用 `load_gen.py` 的合成请求（第 3.1、4 节，共约 2 小时）、或者 16 个并发的短请求都正常。sglang 代码和第一轮完全相同（第一轮的 AgentX 都跑完了），所以是一个和时序有关、AgentX 的流量（长上下文、多轮、几百个会话一起开始）能触发的 decode 调度 bug（PD 分离 + DCP8 + DP attention），需要单独查。
-2. **prefill 两次卡死**（node03 21:10、node01 22:12）：都在 AgentX 预热约 30 分钟、prefill 积压最重的时候（待处理约 1,100–1,200 万 token，等 decode 接收的请求 62–78 个），某个 rank 的 GPU 停在一个 [28672] × 256 的内核上不返回，CPU 在 indexer 的 `ks.cpu()` 同步处等，300 s 后被 watchdog 杀掉。上面 decode 死锁造成的积压可能是诱因；第一轮所有运行的日志里都没有这种卡死。
-3. **router 把忙碌的 decode 判为不健康**：decode 的 `/health` 要走一遍调度器，负载重时要等好几分钟；router 默认 5 s 超时、连续 3 次失败就摘掉 decode，之后所有请求返回 503。后面的运行改成 `--health-check-timeout-secs 120 --health-failure-threshold 10 --disable-circuit-breaker`。
-4. **AgentX 只要有一个根请求在预热里失败，就中止整次运行**（`Terminal warmup failure ... aborting run early`）。
-5. **崩溃后显存没有释放**：node03 的 prefill 崩溃后每张卡仍占着约 20 GB 显存（kfd 里已经没有进程），新起的 prefill 算不出 mamba 状态缓存（`max_mamba_cache_size=1`）起不来；删掉容器重建后恢复（这部分多半是注册给网卡的显存）。
+| 这一步里 KV 流入 | 第一轮：步数，残差 | 这一次：步数，残差 |
+|---|---|---|
+| < 0.5 GB/s | 9,814，+0.41% / −0.02% | 10,655，+0.71% / −0.02% |
+| 0.5–5 | 3,810，+0.42% / −0.03% | 1,426，+0.98% / +0.07% |
+| 5–20 | 848，+0.63% / +0.15% | 751，+0.77% / 0.00% |
+| 20–50 | 439，+0.69% / +0.19% | 309，+1.26% / +0.25% |
+| 50–100 | 68，+0.49% / +0.18% | 133，+1.50% / +0.50% |
+| > 100 | — | 26，+3.28% / +2.34% |
+
+- decode 每步快了将近一半，KV 流入的量和突发形态基本没变，所以同样的 KV 占每步的比例变大了：KV 流入 20–100 GB/s 的步中位数慢 0.25%–0.5%（第一轮 ≤ 0.2%），超过 100 GB/s 的 26 步慢 2.3%。这些步只占全部步的 3.5%，对平均每步的影响仍在 0.1% 量级。
+- 线路上同样看不到干扰：KV 突发开始后 50 ms 内，流入同一节点的 EP 流量只变化 −0.6%；全程没有重传。
+- TTFT 比第一轮高，是 decode 的 KV 池容量限制（decode 日志里 KV 占用 99%–100%）：吞吐上去以后同时在系统里的请求更多，等 decode 收的时间更长。和 KV 传输对 EP 的影响无关。
+
+### 5.2 READ / WRITE 注入
+
+60 s 一个时段，相邻时段隔 60 s；decode 步的变化按同 batch 中位数归一化（`tools/k31_inject_analyze.py`），EP 单次耗时取自时段中段 node04 上 TP8 的 trace（注入前 dispatch 64 µs、combine 81 µs）：
+
+| 时段 | 方式 | 落点 | 每卡实测 GB/s | decode 每步（node02 组 / node04 组） | TP8 dispatch / combine（µs） |
+|---|---|---|---|---|---|
+| W1 | WRITE，两台都注入 | 另一个 NUMA，背靠背 | 36.1 | +28.9% / +20.0% | 90 / 109 |
+| R1 | READ，只注入 node04 | 另一个 NUMA，背靠背 | 35.4 | +31.7% / +21.6% | 91 / 113 |
+| W2 | WRITE，两台 | 本 NUMA，背靠背 | 38.0 | +3.3% / +0.1% | 62 / 86 |
+| R2 | READ，只 node04 | 本 NUMA，背靠背 | 38.1 | +1.5% / +1.2% | 64 / 85 |
+| W3 | WRITE，只 node04 | node04 的 GPU 显存，背靠背 | 37.8 | −2.6% / −0.6% | 68 / 77 |
+| R3 | READ，只 node04 | node04 的 GPU 显存，背靠背 | 38.1 | +0.9% / +1.0% | 62 / 87 |
+| W4 | WRITE，两台 | 另一个 NUMA，20 GB/s | 20.9 | +4.9% / +1.2% | 61 / 87 |
+| R4 | READ，只 node04 | 另一个 NUMA，20 GB/s | 20.9 | +13.1% / +8.7% | 69 / 102 |
+
+- READ 时被读的一方在 prefill 上。node01 的 prefill 跑了一小时 AgentX 以后，GPU 上连 256 MiB 都分不出来（第一轮文档问题 3 的上限：已分配加注册给网卡的显存不能超过 308.9 GB），所以 R1 / R2 / R4 只有 node03 → node04 这一对，WRITE 时段两对都有。EP16 把两组绑在一起，一台变慢，另一台在 EP 上等它，所以只注入 node04 时两组也都变慢。
+- **写进 decode GPU 显存（KV 的正常路径）READ 和 WRITE 都没有影响**：每步在 ±1% 以内，EP 单次耗时和注入前一样。和第 4 节合成负载的结论一致。
+- **另一个 NUMA 仍然最重**：背靠背 +20%～+32%，被堵的 node04 本地计算每步 77 → 108–117 ms，node02 在 EP 上等（dispatch 360–396 µs）。原因见 6.4 节。
+- **每张网卡 20 GB/s 时 READ 明显比 WRITE 重**：READ 只注入一台就 +9%～+13%，WRITE 注入两台只有 +1%～+5%，和第 4 节（READ +12%、WRITE +7%）方向一致。限速后拥塞是开关式的（6.1 节），READ 进入拥塞状态的时间更多。
+
+### 5.3 前几次 AgentX 为什么没跑完（更正）
+
+这一轮最早写的是"AgentX 一开始 decode 就死锁、六次都没跑成、和 MoE 输入上限无关、同样的配置第一轮能跑这一轮不能跑"。这是我判断错了。
+
+- **误判在哪里**：AgentX 的预热请求都是 `max_tokens=1`（只填缓存），第一个 token 由 prefill 给，decode 在 40 多分钟的预热里本来就不跑解码步。所以"每步耗时的 probe 不涨、`num_running_reqs` 为 0、py-spy 看到各 rank 停在 DP 同步和 KV 传输状态的几个 gloo 集合通信上"都是正常的空转：5.1 节这次正常的运行里，预热期间看到的就是同样的栈，隔两秒再抓位置就变了。
+- **逐次复核**：
+
+| 开始 | decode | 实际情况 |
+|---|---|---|
+| 11-18 20:42 | 带 MoE 上限，新起 | 预热约 28 分钟时 node03 的 prefill GPU 卡死（下面第 1 条） |
+| 21:39 | 同一个 decode | 22:12 node01 的 prefill 也卡死；一个根请求失败，AgentX 中止 |
+| 22:50 | 同上 | 23:23 router 连续 3 次健康检查超时，把 decode 摘掉，AgentX 中止 |
+| 23:37 | 同上 | 这个 decode（20:41 起）在两次 prefill 卡死之后已经收不进 KV：110 多个请求在等 decode 接收 KV，504 次传输失败，一个普通请求 588 s 后返回 502。**这是唯一一次 decode 真的不工作** |
+| 11-19 02:05 | 重启后的 decode，带上限 | 5 分钟后被我自己的监视脚本误停（它数的日志每 40 步才打一行） |
+| 03:24 | 整套新起，带上限 | **正常**：预热到 04:11 一直 0 个错误、返回 2823 / 2845；我在 03:5x 误判为死锁，04:11 为换配置重启 decode，打断了最后 22 个请求（4 个在途、18 个还没发出，AgentX 记为错误） |
+| 04:17 | 第一轮 d1024，不带上限 | **正常**：预热第一阶段 1230 s 返回 280 / 285 个，和第一轮同一时刻（283 / 285）一样；04:37 被我误判后停掉 |
+
+真正的问题是这几条：
+
+1. **prefill 两次 GPU 卡死**（node03 21:10、node01 22:12）：都在 AgentX 预热约 30 分钟、prefill 积压最重的时候（待处理约 1,100–1,200 万 token），某个 rank 的 GPU 停在一个 [28672] × 256 的内核上不返回，CPU 在 indexer 的 `ks.cpu()` 同步处等，300 s 后被 watchdog 杀掉。第一轮和这次的对照里都没有出现，原因没查。
+2. **prefill 卡死之后，那个 decode 收不进 KV**：KV 分配平均要等 36.5 s，504 次传输失败。看起来是在途传输的对端死了以后，decode 一直没有释放它们，新请求排在后面；重启 decode 才恢复，具体原因没查。
+3. **router 默认健康检查会把忙碌的 decode 摘掉**：decode 的 `/health` 要走一遍调度器，负载重时要等好几分钟；router 默认 5 s 超时、连续 3 次失败就摘掉 decode，之后所有请求返回 503。可以改成 `--health-check-timeout-secs 120 --health-failure-threshold 10 --disable-circuit-breaker`（5.1 节那次用的是默认值，没有触发）。
+4. **AgentX 只要有一个根请求在预热里失败，就中止整次运行**。
+5. **崩溃后显存没有释放**：node03 的 prefill 崩溃后每张卡仍占着约 20 GB 显存（kfd 里已经没有进程），新起的 prefill 算不出 mamba 状态缓存起不来；删掉容器重建后恢复。
+6. **我留下的采样进程**：每次被中止的运行都留下一个 5 ms 的网卡计数采样进程（停的时候脚本路径写错了），到最后每台机器 6–7 个，每个进程每秒往每张网卡的管理队列发 200 个统计命令，合计 1,200–1,400 个；单次统计查询从约 2 ms 变成 11–15 ms，而 QP、内存注册走的也是这个队列。上面几次失败里没有哪一次能确定是它造成的，但这是机器上唯一不正常的状态。5.1 节那次之前已经全部停掉，bench 脚本加了中止时停掉它们的保护；对照没有重启机器。
 
 ## 6. 跨 NUMA 的补充
 
-第一轮第 10 节的结论是"网卡往另一个 NUMA 写，堵住和它共用根端口的 GPU 的 PCIe 路"。这一轮补了三件事。
+第一轮第 10 节的结论是"网卡往另一个 NUMA 写，堵住和它共用根端口的 GPU 的 PCIe 路"。这一轮补了四件事：什么条件下触发（6.1）、decode 在 READ 注入下（6.2）、排除了什么（6.3）、decode 为什么会被放大（6.4）。
 
 ### 6.1 要几张网卡一起写、多大速率才会触发
 
@@ -243,7 +319,51 @@ node02 上 8 张 GPU 各起一个小程序，不停地测"4 KB 显存→主机�
 - **不是 GPU 从主机内存取命令包**：`HSA_ALLOCATE_QUEUE_DEV_MEM=1` 把命令队列放进显存，注入时每步仍 +28%，被拖慢的小内核比例不变（61%）。
 - **CPU 下发内核也变慢**：被堵的 GPU 上，每次 `hipLaunchKernel` 的 CPU 耗时从 3.9 µs 变成 7.7 µs（没被堵的 GPU 3.6 → 4.1 µs），说明每次下发也要经过这段 PCIe 来回一次。
 - **也不是"拥塞时网卡同时往这张 GPU 写"**：decode 里网卡和 GPU 之间一直有点对点读写（KV 写进显存、EP 收发），之前的合成测试里没有。补测（`run/k31_r20_p2p.sh`）：网卡 4–7 跨 NUMA 写主机内存的同时，再让它们往 GPU 5–7 的显存各写 5 GB/s，GPU 4–7 的主机来回照样翻倍（22–25 µs），但合成 CUDA graph 的小内核仍然每个只多约 0.06 µs，没有 decode 里那种成段卡顿。顺带看到：往显存写改成背靠背、网卡带宽被一分为二后，跨 NUMA 那部分每张只剩约 24 GB/s，拥塞基本消失——又一次说明触发条件是跨插槽写的总量。
-- **所以 decode 特有的诱因还没找到**：decode 的小内核在拥塞期间成段地每个多十几 µs，合成测试（graph 或 eager、各种内核、各种参数位置、点对点流量、EP16 加本地内核）都复现不出来。
+- **也不是 GPU 往网卡的流量、系统范围的屏障或 peer access**（`bench/gpu_lat6.py`、`run/k31_r25_gputx.sh`，合成 graph 在同样的拥塞下）：让网卡 4–7 同时从 GPU 4–7 的显存读数据发出去（每张 5 GB/s 或背靠背），小内核不变；内核边界强制用系统范围的屏障（`AMD_OPT_FLUSH=0`），每个内核本身多约 2 µs，但拥塞时不再变慢；开 peer access（decode 为 aiter 的 all-reduce 开着）也不变。
+- decode 特有的诱因见 6.4 节。
+
+### 6.4 诱因：decode 每步都有一条 stream 在 GPU 上等另一条
+
+**现象再看一遍**（`results/pcie/dr_base`，只堵 node02 的 GPU 4–7；不开 profiler 时每步 114.0 → 139.7 ms）：
+
+- 拥塞时被拖慢的不是某一类内核，而像是每个内核多了一个最短耗时。小内核在 trace 里从约 5.5 µs 被抬到 22.7 µs 左右，`add3`、`rmsnorm`、`silu_and_mul`、EP 的 `copystaging` / `combineall` 都是这个数；本来就比它长的内核（45 µs 的 GEMM、200 µs 的 MoE GEMM）基本不变；内核之间的空隙没有变大。
+- 跟在大量写显存的内核（MoE GEMM、EP combine、各类 GEMM）后面的内核 80%–100% 被拖慢，跟在很小的内核后面的只有 7%–14%。
+- 同一张 GPU、同样的拥塞下，合成 graph 里的小内核一直是 1.5 µs。
+
+**decode 有、合成测试没有的：一条挂着的跨 stream 等待**。trace 里 decode 每步调用一次 `hipStreamWaitEvent`，另一条 stream 上每步有几个小内核（`alloc_extend_kernel` 等）。对应的代码是 `disaggregation/decode.py` 的 `get_new_prebuilt_batch()`：开着重叠调度（默认）、有新请求并入时（AgentX 和合成负载下几乎每步都有），先调用 `self.schedule_stream.wait_stream(self.forward_stream)`，调度 stream 要等正在跑的这一步前向结束，才能做并入时的 KV 位置分配。这条等待在 GPU 上是调度 stream 的硬件队列里一个等前向结束的包，前向跑多久它就挂多久。我们的理解是 GPU 的命令处理器在这段时间里反复去读它等的那个信号，而信号在主机内存里，所以每次读都要走被堵的那段 PCIe；这是从下面合成测试的表现推断的，没有直接看到命令处理器的访存。
+
+**合成复现**（`bench/gpu_lat7.py`、`run/k31_r27_pending.sh`）：和 6.1 节一样只让网卡 4–7 往另一个 NUMA 收数据；每张 GPU 回放同样的 graph，一部分 GPU 让第二条 stream 等一个"graph 回放完才记录"的事件（挂着等），其余不挂。graph 里每个内核的 GPU 时间（µs，60 s 中位数，不注入 → 拥塞时）：
+
+| GPU（哪一次） | 被堵 | 挂着等 | tiny 内核 | 写 16 MB 的 GEMM 后面的小内核 |
+|---|---|---|---|---|
+| 4（pw2） | 是 | 否 | 1.59 → 1.68 | 2.46 → 2.44 |
+| 6（pw2） | 是 | 否 | 1.57 → 1.62 | 2.76 → 2.73 |
+| 5（pw2） | 是 | 是 | 2.95 → 6.01 | 4.08 → 9.05 |
+| 7（pw2） | 是 | 是 | 2.92 → 4.88 | 3.87 → 7.20 |
+| 4（pw3） | 是 | 是 | 2.90 → 5.99 | 4.03 → 9.20 |
+| 6（pw3） | 是 | 是 | 2.88 → 4.75 | 4.28 → 7.83 |
+| 1（pw2） | 否 | 是 | 2.93 → 2.99 | 4.10 → 4.19 |
+| 2、3（pw2） | 否 | 否 | 1.58 → 1.58 | 2.83 → 2.82 |
+
+- 只有"被堵 + 挂着等"同时满足时内核才变慢，每个 +2–5 µs：同一张 GPU 4，不挂时拥塞也不变，挂上就变慢。`ROC_SYSTEM_SCOPE_SIGNAL=0` 去不掉（pw3 的 GPU 5、7 和 4、6 一样）。
+- 不拥塞时，挂着等本身也让每个内核多约 1.3 µs（tiny 内核：不挂的 GPU 1.58 µs，挂着的 GPU 1 是 2.93 µs）。
+- 量级对得上：decode 不开 profiler 时，被堵的那组每步多约 26 ms，按每步约 4,300 个内核算，平均每个多约 6 µs。trace 里看到的每个多十几 µs 更大，可能是开着 profiler 时每个内核还要多往主机内存写一次时间戳，没有单独验证。
+- 这也解释了之前排除不掉的几点：关掉 CUDA graph 没用（这条等待和 graph 无关）；命令队列放显存没用（等的信号仍在主机内存里）；合成 graph 复现不出来（它们只有一条 stream）。
+
+**在 decode 里验证**（`run/k31_r26_rtvars.sh`，同一套服务只重启 decode，和 6.2 节同样的注入：node02 的网卡 4–7 往另一个 NUMA，不开 profiler 的每步耗时 p50，ms，"墙钟"是相邻两步的下发间隔）：
+
+| decode | 注入 | 不注入：GPU / 墙钟 | 背靠背：GPU / 墙钟 | 每卡 25 GB/s：GPU |
+|---|---|---|---|---|
+| 默认（重叠调度） | READ | 113.9 / 114.0 | 139.9 / 140.0（+22.8%） | 119.3（+4.7%） |
+| `--disable-overlap-schedule` | READ | 111.1 / 114.0 | 121.1 / 124.1（+8.9%） | 112.3（+1.1%） |
+| 默认（重叠调度） | WRITE | 114.0 / 114.0 | 133.9 / 134.0（+17.5%） | 118.8（+4.2%） |
+| `--disable-overlap-schedule` | WRITE | 111.1 / 113.7 | 118.4 / 121.1（+6.5%） | 112.0（+0.8%） |
+
+- 关掉重叠调度后，trace 里每步的 `hipStreamWaitEvent` 从 1 次变成 0 次，所有内核都在一条 stream 上；拥塞造成的每步增量从 26.0 → 10.0 ms（READ）、19.9 → 7.3 ms（WRITE），两种注入都去掉了约 62%。
+- 不拥塞时两种都是每步 114 ms：关掉后 GPU 时间少了约 3 ms（和合成测试里"挂着等本身每个内核多约 1.3 µs"方向一致），正好抵掉不再和 GPU 重叠的 CPU 调度时间。
+- 剩下的约四成还没查：关掉重叠调度后，被堵 GPU 上的小内核在 trace 里仍从 4.5 µs 被抬到约 13 µs（开着时是 22.7 µs），被拖慢的比例 42%–51%。不是 READ 发起进程（node02 上只做被写的一方时剩下的也差不多），也不是 MoRI EP 的第二条 stream（只在开 two-batch overlap 时才有）。
+
+**对部署**：根本的办法仍是 RDMA 主机缓冲放在网卡所在的 NUMA 上，不触发拥塞。在这套配置（PD decode、DFLASH、DP attention）上，合成负载下 `--disable-overlap-schedule` 不拥塞时不损失、拥塞时少损失一半多，是一个现成的缓解；AgentX 负载下没有测过。sglang 侧更好的改法是让 decode 并入新请求时不在 GPU 上挂着等前向，例如由 CPU 等前向的事件后再下发，或者把 `_nonblocking_admit_in_scope()` 的非阻塞并入放开到 DFLASH；这样既保留重叠调度，又可能省掉每步约 3 ms 的等待开销。
 
 ## 附录：数据和脚本
 
@@ -256,5 +376,8 @@ node02 上 8 张 GPU 各起一个小程序，不停地测"4 KB 显存→主机�
 | decode 配置、正确性、排查 | `run/k31_r18_cfgs.sh`、`k31_r15_decprof2.sh`、`bench/k31_correctness.py`；分析 `tools/k31_decprof2_analyze.py` | `results/rw_cfgs/`、`results/pcie/dr_base`、`dr_cap`、`dr_qdev`、`dr_nog` |
 | 合成负载下的 READ / WRITE 注入 | `run/k31_r22_lg_rw.sh`、`bench/k31_inject.sh`（`OP=read`）；分析 `tools/k31_lgrw_analyze.py` | `results/pcie/lg_rw/` |
 | 跨 NUMA 触发条件 | `run/k31_r13_onenic.sh`、`k31_r14_xgmi.sh`、`k31_r17_rwnuma.sh`、`k31_r20_p2p.sh` | `results/pcie/o1`、`o2`、`o3`、`p2p1` |
+| AgentX（第 5 节） | `run/k31_r23_ctrl.sh`（调 `k31_up.sh`、`k31_r16_inj_rw.sh`、`k31_bench.sh`）；分析 `run/k31_r21_post.sh`（`RUN=k31_ctrl SUB=c256 TAIL=1850`：这次正式阶段跑了 3640 s）、`tools/k31_nat_cmp.py`、`k31_client_window.py` | `results/k31_ctrl/c256/` |
+| 小内核变慢的诱因（6.3、6.4 节） | `bench/gpu_lat6.py` + `run/k31_r25_gputx.sh`、`bench/gpu_lat7.py` + `run/k31_r27_pending.sh`；分析 `tools/k31_gputx_analyze.py` | `results/pcie/gt1`、`pw2`、`pw3`（`pw1_badtiming` 是计时写错的一次） |
+| decode 里关掉重叠调度（6.4 节） | `run/k31_r26_rtvars.sh`（`VARIANTS="noovl:ARGS=--disable-overlap-schedule base:"`，`OP=read` / `write`，调 `k31_r15_decprof2.sh`）；分析 `tools/k31_decprof2_analyze.py` | `results/pcie/rt_base`、`rt_noovl`、`rt_basew`、`rt_noovlw`，`results/rt_vars/` |
 | 注入工具（READ / WRITE） | `bench/io_inject.py`（`--op read`） | — |
 | 图 | `tools/k31_doc2_figs.py` | — |

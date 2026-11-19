@@ -489,6 +489,8 @@ EP 流量的明细（真实负载）：
 
 剩下的是 decode graph 本身（每步 4,000 多个来自 aiter、triton、MoRI 等库的内核）有什么特别之处，这次没有查下去。
 
+> **第二轮补充**：诱因找到了，不在 graph 本身。decode 有新请求并入时，调度 stream 在 GPU 上等这一步前向结束（`disaggregation/decode.py` 的 `schedule_stream.wait_stream(forward_stream)`），这条等待在整步前向期间挂着，GPU 的命令处理器反复去主机内存读它的信号，拥塞时每次读都变慢，前向的每个小内核跟着等。合成测试加上同样一条等待就复现，不加就不复现。详见第二轮文档 [6.4 节](k31_ep_kv_read_write_zh.md#64-诱因decode-每步都有一条-stream-在-gpu-上等另一条)。
+
 **怎么避免**：凡是 RDMA 写入 GPU 节点主机内存的缓冲（比如 UMBP 的远端池、KV 卸载），都放在网卡所在的 NUMA 上；同 NUMA 时没有影响。
 
 <details>
