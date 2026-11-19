@@ -521,6 +521,21 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 - 两台都跨 NUMA、每台一个来源（B2 / B3）：+14% / +15%，主要是两台的本地计算都变慢（160 → 183 ms），EP 只多了一点，网络上不拥塞。
 - 全程没有重传（TC 104 是无损类）。
 
+**IO 量多大开始碰到 EP**：同样的 2:1 incast 写 GPU 显存（TC 104），每对 IO 限不同的速率。一组是两台 prefill 打 node04（`k31_ep512_2pc`，第一段放了一个每卡 1 GB/s 的占位：load_gen 重启后的几分钟里 batch 会起伏）；一组是 node01 加另一台 decode node02 打 node03（7.6 节的三台，`k31_ep512_c`）。
+
+| 每对每张网卡限速（GB/s） | 两台 prefill → node04：入口每卡 GB/s（线速的比例） | 每步变化 | node01 + node02 → node03：入口每卡 GB/s | 每步变化 |
+|---|---|---|---|---|
+| 1（占位） | 2.6（5%） | +0.3% | — | — |
+| 10 | 22（45%） | +3.1% | 22（45%） | +5.6% |
+| 15 | 29（57%） | +4.6% | 33（66%） | +9.6% |
+| 20 | 40.5（81%） | +10.4% | — | — |
+| 30（跑到 23.5） | 48.6（97%） | +14.9% | 48.5（97%） | +16.4% |
+| 40，两台 decode 同时被 2:1 | 两台各 45 | +15.0% | 两台各 47 | +21.2% |
+| 只有另一台 decode 当来源（40） | 38（77%） | +3.5% | 38（76%） | +3.8% |
+
+- 入口到线速的一半左右就开始碰到 EP（+3%～+6%），80% 以上明显变陡（+10%～+16%）。来源之一是另一台 decode 时每档都更重一点：它的 IO 和它自己发出的 EP 在同一张网卡的出口抢带宽。
+- 两台 decode 同时被 incast（两个方向的 EP 都排队）和只堵一台差不多（+15%）；来源里有 decode 时更重（+21%）。
+
 ### 7.4 IO 换一个流量类（TC 0），EP 留在 TC 104
 
 **怎么测**：同一套栈（EP、KV 都还在 TC 104），只把注入流量改成 TC 0（DSCP 0，这套网络上的有损类，交换机里是另一个队列），重测 7.3 节影响最大的几种。
@@ -607,5 +622,5 @@ node04 在 11-19 19:27 UTC 失联（宿主机侧 GPU / 网卡的 VF 故障，见
 | EP 走被堵的网卡（6.4 节） | `microbench/run/mb_numa8.sh`（`RNUMA=remote` / `local`）；分析 `microbench/tools/mb_local_analyze.py --groups 0-3,4-7,8-15` | `microbench/results/c8_numa`、`c8_local` |
 | 跨插槽写的上限（6.1 节） | `bench/gpu_d2h_numa.py` | — |
 | 注入工具（READ / WRITE） | `bench/io_inject.py`（`--op read`） | — |
-| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`、`k31_ep512_2p_tc0_lgrw`（整套 TC 0）、`k31_ep512_b_lgrw`（decode 02 + 03，`run/k31_r33_3node_chain.sh`），网卡计数 `results/netmon_r29/`。node04 19:27 UTC 失联：上一次启动的内核日志里先是 GPU 0000:ab:00.0 `Doesn't get TRN_MSG_ACK from pf`，两分钟后同一个 PCIe 交换芯片下的网卡 0000:ac:00.0 `ionic_adminq_wait: context not initialized`，是 VF 和宿主机 PF 之间的通信断了；19:50 被重启，进了新装的 6.8.0-149 内核（没有 ionic RDMA 驱动），用 `grub-reboot` 回到 6.8.0-137 后恢复 |
+| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`、`k31_ep512_2p_tc0_lgrw`（整套 TC 0）、`k31_ep512_b_lgrw`（decode 02 + 03，`run/k31_r33_3node_chain.sh`）、速率扫描 `k31_ep512_2pc_lgrw`（`run/k31_r36_4node.sh`）和 `k31_ep512_c_lgrw`（`run/k31_r35_3node_b.sh`），网卡计数 `results/netmon_r29/`。node04 19:27 UTC 失联：上一次启动的内核日志里先是 GPU 0000:ab:00.0 `Doesn't get TRN_MSG_ACK from pf`，两分钟后同一个 PCIe 交换芯片下的网卡 0000:ac:00.0 `ionic_adminq_wait: context not initialized`，是 VF 和宿主机 PF 之间的通信断了；19:50 被重启，进了新装的 6.8.0-149 内核（没有 ionic RDMA 驱动），用 `grub-reboot` 回到 6.8.0-137 后恢复 |
 | 图 | `tools/k31_doc2_figs.py`、`tools/k31_doc3_figs.py`、`tools/k31_doc3_tcfig.py`（第 7 节） | — |
