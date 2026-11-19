@@ -5,8 +5,9 @@
 ## 要点
 
 - **8 台的软硬件配置完全一致，只有两处不同**：网卡固件（node01 / 03 / 04 / 07 是 `1.117.5-a-196`，node02 / 05 / 06 / 08 是 `1.117.5-a-147`）和 Docker 版本。
+- **QoS、PFC、DCQCN 的配置 8 台也一致**（第 6 节）：虚拟机里能看到的每一项，64 张网卡都相同；宿主机上的 QoS 看不到，但各台表现一致。
 - **这是 DigitalOcean 的 KVM 虚拟机**：GPU 和网卡都是 SR-IOV 的 VF 直通进来的。QoS、PFC、DCQCN 的 PF 侧配置在宿主机上，虚拟机里读不到（`dcb` 返回 Operation not supported，也没有 `nicctl`）。
-- **DCQCN 没有起作用**，原因有两层（第 7 节）：
+- **DCQCN 没有起作用**，原因有两层（第 8 节）：
   - 交换机不打 ECN 标记：64 张网卡开机以来收到的 ECN 标记、收发的 CNP 全是 0；加压到接收端一半时间都在发 PFC，也还是 0。
   - QP 默认没有绑定 DCQCN profile（`match_default` 为 0）。
   - 网卡这一侧没有问题：RoCE 包都带 ECT(0)，从虚拟机里也能把 QP 绑到 profile 上。所以要让 DCQCN 生效，关键在交换机打开 ECN 标记。
@@ -24,7 +25,7 @@
 | node07 | 1.117.5-a-196 | 29.1.3 | 10.201.\<rail\>.7 | 10.15.20.8 |
 | node08 | 1.117.5-a-147 | 29.1.3 | 10.201.\<rail\>.8 | 10.15.20.9 |
 
-采集时 node04 已运行约 6 天，其余约 1 周；第 6 节的计数都是从开机（驱动加载）开始累计的。
+采集时 node04 已运行约 6 天，其余约 1 周；第 6、7 节的计数都是从开机（驱动加载）开始累计的。
 
 ## 2. 虚拟机和主机
 
@@ -119,7 +120,26 @@ vm_size=-1 vm_update_mode=-1 vramlimit=-1 wbrf=-1
 - **eth0**：公网地址加一个 DO 内网地址，默认路由在这里。
 - 没有策略路由（`ip rule` 只有默认三条）。sysctl：`rp_filter=2`，`arp_ignore=2`，`arp_announce=1`，`ip_forward=1`，`net.core.rmem/wmem_max = 212992`。
 
-## 6. QoS 和 PFC
+## 6. 8 台的 QoS、PFC、DCQCN 配置对比
+
+虚拟机里能看到的 QoS、PFC、DCQCN 配置，**8 台（64 张网卡）完全一致**，唯一的差别是网卡固件。宿主机 PF 上的 QoS 配置看不到，从行为看各台也一致。2026-11-19 14:50 UTC 用 [do_cluster/do_qos_dump.sh](do_cluster/do_qos_dump.sh) 又在 8 台上采了一遍，结果如下。
+
+| 项 | 怎么看 | 64 张网卡的情况 |
+|---|---|---|
+| DCB：PFC、ETS、DSCP 映射、缓冲、限速、DCBX | `dcb pfc / ets / app / buffer / maxrate / dcbx show` | 都返回 Operation not supported：VF 上读不到，配置在宿主机的 PF 上 |
+| 链路 pause 设置 | `ethtool -a` | 相同：Autonegotiate off，RX on，TX on |
+| 私有开关 | `ethtool --show-priv-flags` | 相同：`rdma-sniffer` off，`cmb-rings` off |
+| MTU | `/sys/class/net/*/mtu`、`ibv_devinfo` | 相同：4200；RoCE 4096 |
+| FEC | `ethtool --show-fec` | 相同：RS |
+| DCQCN 8 个 profile 的参数 | `/sys/class/infiniband/ionic_*/dcqcn/profiles/*/roce_{rp,np}/*` | 相同：全部参数拼起来的 md5 都是 `2a08bc7db987`；8 个 profile 之间也相同，取值见 8.1 |
+| DCQCN 绑定 | `dcqcn/match_default`、`dcqcn/match_rules` | 相同：0、空，QP 都不做 DCQCN |
+| 暂停帧的优先级 | `ethtool -S` 的 `tx_pripause_<p>_1us_count`、`rx_pripause_<p>_1us_count` | 相同：发出的暂停只在优先级 0；收到过暂停的 48 张网卡，都是优先级 0 和 3 同时、累计时长完全相等；另外 16 张开机以来没收到过暂停 |
+| ECN 标记、CNP | `hw_counters` 的 `rx_rdma_ecn_pkts`、`rx_rdma_cnp_pkts`、`tx_rdma_cnp_pkts` | 开机以来都是 0 |
+| RoCE 包的 ECN 位 | debugfs 里每个 QP 的 `hdr_ip4_tos` | 两种固件都置 ECT(0)：node05 / 06（a-147）上用 TC 104 建的 QP 是 TOS 106；采集时 node05–08 上正在跑的 2,304 个 QP（TC 0）都是 TOS 2，其中 node07 是 a-196 |
+| 网卡固件 | `ethtool -i` | 两种：`1.117.5-a-196`（node01 / 03 / 04 / 07）、`1.117.5-a-147`（node02 / 05 / 06 / 08） |
+| 宿主机侧：DSCP → 优先级、PFC 优先级、无损队列、DCQCN 开关 | 要在宿主机上用 `nicctl` | 看不到。从行为看：DSCP 26 是无损类，在 node01–04（K3.1 端到端，有 PFC、几乎不重传）和 node05 / 06（8.3 的测试，PFC 很重、0 重传）上验证过；DSCP 0 是有损类，在 node01–04（K3.1 的 TC 0 对照，2% 重传）上验证过；node07 / 08 没有单独验证 |
+
+## 7. QoS 和 PFC
 
 **虚拟机里看不到 QoS 配置**：VF 上 `dcb pfc / ets / app / buffer` 都返回 Operation not supported，也没有 `nicctl`。下面是从计数和测试推出来的：
 
@@ -143,9 +163,11 @@ vm_size=-1 vm_update_mode=-1 vramlimit=-1 wbrf=-1
 
 计数来源：暂停帧和暂停时长来自 `ethtool -S`（`frames_tx_pripause`、`tx_pripause_<p>_1us_count` 等，单位 1 µs），RDMA 相关的来自 `/sys/class/infiniband/ionic_*/ports/1/hw_counters/`。
 
-## 7. DCQCN
+## 8. DCQCN 的问题
 
-### 7.1 网卡上的配置
+**问题**：这套集群上 DCQCN 从来没有工作过，无损类（DSCP 26）只靠 PFC 做流控。接收端一跟不上就发 PFC，交换机再暂停发送端；交换机发出的暂停帧同时置了优先级 0 和 3，还会连带暂停 DSCP 0 的流量。所以 incast 或者接收端变慢时，会出现大面积、长时间的暂停（8.3 的测试里，接收端一半以上的时间在暂停），发送端却从来不会主动降速。
+
+### 8.1 网卡上的配置
 
 驱动在 `/sys/class/infiniband/ionic_*/dcqcn/` 下给出 8 个 profile（`profiles/1`–`profiles/8`），每个分发送端（reaction point，`roce_rp`）和接收端（notification point，`roce_np`）两组参数。**64 张网卡、8 个 profile 的参数完全一样**：
 
@@ -164,16 +186,16 @@ vm_size=-1 vm_update_mode=-1 vramlimit=-1 wbrf=-1
 
 **QP 默认不绑定任何 profile**：`match_default` 是 0，`match_rules` 为空，所以新建的 QP 都用 profile 0，即不做 DCQCN。每个 QP 实际用的 profile 可以在 debugfs 里看：`/sys/kernel/debug/ionic/<bdf>/lif0/rdma/qp/<qpn>/info` 的 `dcqcn_profile`。
 
-### 7.2 为什么没生效
+### 8.2 为什么没生效
 
 DCQCN 的链路是：交换机队列堆起来时给包打 ECN 标记，接收端网卡收到标记后给发送端回 CNP，发送端收到 CNP 才降速。这里卡在了第一步：
 
-1. **交换机不打 ECN 标记**：64 张网卡开机以来收到的 ECN 标记（`rx_rdma_ecn_pkts`）全是 0，收发的 CNP 也全是 0；同期每台都有几百万到上亿个暂停帧，队列显然堆起来过。7.3 的测试里专门造了拥塞，也是 0。
-   - 不是包不带 ECT 的问题：网卡发出的 RoCE 包都带 ECT(0)（第 6 节）。
+1. **交换机不打 ECN 标记**：64 张网卡开机以来收到的 ECN 标记（`rx_rdma_ecn_pkts`）全是 0，收发的 CNP 也全是 0；同期每台都有几百万到上亿个暂停帧，队列显然堆起来过。8.3 的测试里专门造了拥塞，也是 0。
+   - 不是包不带 ECT 的问题：网卡发出的 RoCE 包都带 ECT(0)，两种固件都是（第 6、7 节）。
    - 剩下的可能是交换机的无损队列没开 ECN 标记，或者 ECN 的门限比 PFC 的门限还高、PFC 总是先触发。这只能在交换机上查。
-2. **QP 没绑定 DCQCN profile**（7.1）：就算有 CNP，发送端也不会降速。这一层在虚拟机里就能改。
+2. **QP 没绑定 DCQCN profile**（8.1）：就算有 CNP，发送端也不会降速。这一层在虚拟机里就能改。
 
-### 7.3 测试
+### 8.3 测试
 
 在 node05 → node06 上测（另外 6 台在跑别的任务，没用）。
 
@@ -191,9 +213,9 @@ DCQCN 的链路是：交换机队列堆起来时给包打 ECN 标记，接收端
 - traffic class 104 和 106 发出去的 IP TOS 都是 106（debugfs `hdr_ip4_tos`），说明 ECT(0) 是网卡自己加的，不是 ECN 位的问题。
 - `match_default` 改成 1 以后，新建的 QP 都变成 `dcqcn_profile 1`，绑定在虚拟机里就能生效；但没有 CNP，降速无从触发，带宽和暂停没有变化（第 3 行只有 3 条 rail 在跑，跨 NUMA 的总带宽由 3 张卡分，所以每条更高）。
 
-### 7.4 怎么让 DCQCN 生效
+### 8.4 怎么让 DCQCN 生效
 
-1. **交换机（必须，需要 DO 的网络侧）**：在无损队列（DSCP 26 所在的优先级）上打开 ECN 标记（WRED + ECN），门限设在 PFC 的 Xoff 之下，让 ECN 先于 PFC 触发；CNP 用 DSCP 46、802.1p 优先级 6，交换机要给它一个高优先级队列。顺便确认第 6 节的暂停优先级：网卡发的暂停在优先级 0、交换机发的暂停同时置 0 和 3。
+1. **交换机（必须，需要 DO 的网络侧）**：在无损队列（DSCP 26 所在的优先级）上打开 ECN 标记（WRED + ECN），门限设在 PFC 的 Xoff 之下，让 ECN 先于 PFC 触发；CNP 用 DSCP 46、802.1p 优先级 6，交换机要给它一个高优先级队列。顺便确认第 7 节的暂停优先级：网卡发的暂停在优先级 0、交换机发的暂停同时置 0 和 3。
 2. **宿主机 PF（需要宿主机权限）**：用 `nicctl show qos`、`nicctl show dcqcn` 确认 DSCP → 优先级映射、PFC 优先级、DCQCN profile 是否启用；虚拟机看不到这些。
 3. **虚拟机**：在应用建 QP 之前把 QP 绑到一个 profile。
    - 全部绑：`for d in /sys/class/infiniband/ionic_*; do echo 1 > $d/dcqcn/match_default; done`
@@ -203,8 +225,9 @@ DCQCN 的链路是：交换机队列堆起来时给包打 ECN 标记，接收端
 4. **验证**：拥塞时接收端 `rx_rdma_ecn_pkts`、`tx_rdma_cnp_pkts` 和发送端 `rx_rdma_cnp_pkts` 都要增长，PFC 暂停时长应该明显下降；每个 QP 的 DCQCN 状态（当前限速）要在宿主机上用 `nicctl show rdma queue-pair --detail` 看。
 5. **还要确认固件真的会降速**：另一套裸机集群（smci355，固件 1.117.5-a-45 / a-77）上，交换机打了 ECN、发送端也收到了 CNP、QP 也绑了 profile，但 QP 的 DCQCN 状态一直是 0，没有降速。这里的 a-147 / a-196 因为没有 ECN 标记，还没法验证。
 
-## 8. 采集方法和原始数据
+## 9. 采集方法和原始数据
 
+- QoS / DCQCN 对比脚本 [do_cluster/do_qos_dump.sh](do_cluster/do_qos_dump.sh)：只读，每张网卡每项一行，方便逐台对比（第 6 节）。
 - 采集脚本 [do_cluster/do_cluster_dump.sh](do_cluster/do_cluster_dump.sh)：只读，在每台机器上以 root 运行，输出约 1.6 万行；内容包括系统、DMI、CPU / NUMA / 内存、`lspci -vvv`、`amd-smi static / firmware / partition / topology / xgmi / metric`、`rocm-smi`、KFD 拓扑、amdgpu / ionic 的 modinfo 和模块参数、软件包版本、`ibv_devinfo -v`、路由、每张网卡的 sysfs / debugfs / DCQCN 全部参数 / `ethtool`（`-i -a -m -g -l -c -k -S` 等）。
 - DCQCN 测试脚本 [do_cluster/dcqcn_test.sh](do_cluster/dcqcn_test.sh)：用 `NODES_SH=` 指定一个定义了 `PUB`（ssh 地址）、`SUF`（rail IP 的末位）、`SSH_OPTS` 的文件；测完把 `match_default` 改回 0。
 - 8 台的完整原始输出（未脱敏）和 DCQCN 测试的原始计数在我们本地的任务目录 `k31-agentx-pd-ep-io-umbp-20261117/cluster_config/`。
