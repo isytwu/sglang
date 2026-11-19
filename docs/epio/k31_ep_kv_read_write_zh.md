@@ -17,11 +17,13 @@
 - **KV 的正常路径（写进 decode GPU 显存）用 READ 还是 WRITE，对 decode 都几乎没有影响**：每张网卡 38 GB/s 背靠背注入，decode 每步只慢约 1%；写进本 NUMA 的主机内存也一样（第 4 节）。
 - **写进另一个 NUMA 的主机内存仍然最伤，而且 READ 比 WRITE 更重**：背靠背 +54%（WRITE +39%），每张网卡 20 GB/s 时 +12%（WRITE +7%）；多出来的集中在 node02（READ 的发起方、a-147 固件）（第 4 节）。
 - **跨 NUMA 为什么让 decode 变慢，找到了**（第 6 节）：
-  - 触发条件是同一颗 CPU 下的 4 张网卡一起往另一颗 CPU 写（合计约 145 GB/s），1–3 张不触发；READ 和 WRITE 一样；限速后是"开关式"的。这时和这些网卡共用根端口的 GPU 往主机方向的读写要多等 10–15 µs。
+  - 触发条件是同一颗 CPU 下的 4 张网卡一起往另一颗 CPU 写（合计约 145 GB/s），1–3 张不触发；READ 和 WRITE 一样；限速后是"开关式"的。这是这台机器上"PCIe 设备往另一颗 CPU 的内存写"每个方向约 150 GB/s 的上限，GPU 的 D2H 拷贝也一样被卡在约 153 GB/s；需求超过它，多出来的写就堵在这些设备的根端口里，和它们共用根端口的 GPU 往主机方向的读写要多等 10–15 µs。
   - decode 会被放大，是因为它每一步都有一条 stream 在 GPU 上等另一条 stream：有新请求并入时，调度 stream 要等这一步前向跑完（`disaggregation/decode.py` 里的 `schedule_stream.wait_stream(forward_stream)`）。我们的理解是：整步前向期间，GPU 的命令处理器要反复去主机内存读这条等待的信号，每次读都被拥塞拖慢，前向 stream 上的每个小内核也跟着等（从合成测试推断，见 6.4 节）。
   - 合成测试加上同样一条等待就复现出来（只在被堵的 GPU 上，小内核每个 +2–5 µs），去掉就没有。之前怀疑的 CUDA graph、命令队列位置、系统范围的屏障、peer access、GPU 往网卡的流量都不是原因。
-  - 在真实 decode 里关掉重叠调度（`--disable-overlap-schedule`，这条等待随之消失），背靠背拥塞时每步的变慢从 +22.8% 降到 +8.9%（READ 注入）、+17.5% 降到 +6.5%（WRITE 注入），约去掉六成；不拥塞时每步仍是 114 ms，没有损失。剩下约四成另有原因，还没查。
-  - 避开的办法：RDMA 主机缓冲放在网卡所在的 NUMA 上（不触发拥塞）；在这套配置上，合成负载下 `--disable-overlap-schedule` 不花代价（AgentX 下没测）；sglang 侧可以让 decode 并入新请求时不在 GPU 上挂着等前向。
+  - 在真实 decode 里关掉重叠调度（`--disable-overlap-schedule`，这条等待随之消失），背靠背拥塞时每步的变慢从 +22.8% 降到 +8.9%（READ 注入）、+17.5% 降到 +6.5%（WRITE 注入），约去掉六成；不拥塞时每步仍是 114 ms，没有损失。
+  - 剩下约四成是 EP 本身：被堵 GPU 的 EP 数据走的正是被堵的那几张网卡，不开 profiler 的单测里每轮 EP 多约 80 µs（其中约八成是跨插槽造成的，同样速率写本 NUMA 只多 19 µs），按每步 92 轮约 7.9 ms，decode 实测 7.3 ms。小内核本身在没有跨 stream 等待时不变慢。
+  - 合起来：WRITE 注入时每步 +19.9 ms ≈ 跨 stream 等待 12.6 ms + EP 7.3 ms；READ 注入 +26.0 ms ≈ 16.0 + 10.0 ms。trace 里"每个小内核多十几 µs"偏大，是 profiler 放大的。
+  - 避开的办法：RDMA 主机缓冲放在网卡所在的 NUMA 上（不触发拥塞），GPU 往主机卸载数据的锁页缓冲也一样；在这套配置上，合成负载下 `--disable-overlap-schedule` 不花代价（AgentX 下没测）；sglang 侧可以让 decode 并入新请求时不在 GPU 上挂着等前向。
 - **AgentX 上的结果**（第 5 节，第一轮的 d1024 配置，不设 MoE 输入上限）：
   - decode 每步 p50 从第一轮的 217 ms 降到 114 ms，输出 2,705 tok/s（第一轮同一窗口 2,321），ITL p50 34 ms（第一轮 68 ms）。
   - KV 流入的量和突发形态和第一轮一样（每台均值 2.0–2.5 GB/s，100 ms p99 62 GB/s），对 decode 步的影响仍然很小：KV 流入 20–100 GB/s 的步慢 0.25%–0.5%（第一轮 ≤ 0.2%），超过 100 GB/s 的 26 步慢 2.3%。
@@ -37,6 +39,7 @@ READ 的正确性和单测：
 3. **原因是 WRITE 推、READ 拉**：WRITE 由发送方按线速推，接收方网卡来不及把数据写进显存就发 PFC，交换机里朝接收方的队列一直很深；READ 由接收方（请求方）发读请求，同时在途的数据有上限，不会把自己灌满，8 对 rail 的 READ 场景里一次 PFC 都没有。
 4. **2 机和 3 机不同，是因为 IO 和 EP 在不同的地方相遇**：2 机时 IO 和 EP 从同一张网卡发出，接收方一暂停，交换机就把这张网卡整个停下；3 机接收侧时 IO 从第三台来、EP 从另一台 EP 节点来，两路在交换机朝接收方的出口汇合，EP 包排在 IO 后面（按多出来的时间估算，前面排着约 4–7 MB）。
 5. **接收侧 WRITE 的结果因机器而异，原因没查清**：同样的脚本和参数，第一轮在 06/07/08 上 1 对 rail 只慢 9%、KV 形状慢 6%，这一轮在 01/03/04 上是 132%、24%；发送侧和 2 机两轮一致。PFC 计数解释不了这个差别（2.5 节）。而端到端里同样的 KV 形状写入（每张网卡 38 GB/s 写进 node04 显存，第 4 节 W3），decode 的 EP 单次耗时没有变化。
+6. **单测的影响比端到端大得多，是因为单测里 EP 背靠背地跑**（2.7 节）：换成端到端的机器（02 + 04 跑 EP、IO 从 01 进来），单测结果不变；让 EP 按 decode 的节奏跑（每轮之间插约 1.1 ms 的计算），KV 形状的 IO 让 B 侧 dispatch 的变化从 +34% 变成 −6%～+1%，combine +11%～+16%，和端到端一致。背靠背时 EP 自己一直占着链路，加上 IO 以后交换机朝接收方的队列一直很深；decode 里 EP 只是偶尔来一阵，队列来得及排空。
 
 ## 1. RDMA READ 在这套网络上读回来的数据对不对
 
@@ -137,8 +140,30 @@ PFC 解释不了这个差别：KV 形状的两场里 IO 来源都完全没被暂
 
 ### 2.6 对 PD 意味着什么
 
-- PD 的 KV 传输是"3 机接收侧"：prefill 往 decode 送 KV，decode 之间跑 EP。单测里 WRITE（sglang 现在的做法）在 KV 持续接近线速时最伤 EP；READ（Moonshot 的做法）在同样的速率下轻得多，前提是 decode 同时在途的读请求不要太多。但单测是 EP 背靠背连续跑的最坏情况：端到端里 KV 形状的 WRITE 以每张网卡 38 GB/s 写进 decode 显存，decode 只慢 1%，EP 单次耗时没变（第 4 节 W3）。
+- PD 的 KV 传输是"3 机接收侧"：prefill 往 decode 送 KV，decode 之间跑 EP。单测里 WRITE（sglang 现在的做法）在 KV 持续接近线速时最伤 EP；READ（Moonshot 的做法）在同样的速率下轻得多，前提是 decode 同时在途的读请求不要太多。但单测是 EP 背靠背连续跑的最坏情况：端到端里 KV 形状的 WRITE 以每张网卡 38 GB/s 写进 decode 显存，decode 只慢 1%，EP 单次耗时没变（第 4 节 W3）；单测里让 EP 按 decode 的节奏跑，同样的 IO 对 dispatch 也就看不出来了（2.7 节）。
 - 端到端里 KV 平均每张网卡只有 0.2–0.7 GB/s，大部分时间远低于线速，所以第一轮端到端看到的影响很小；但 KV 是按 16 MB 左右一批、线速发的，每一批持续的那几百微秒里，朝 decode 的队列会像单测一样涨起来，正好碰上的那几次 EP 会变慢。
+
+### 2.7 补测：为什么单测里接收侧影响很大，端到端却看不出来
+
+端到端里（第 4、5 节）KV 形状的 IO 以每张网卡 38 GB/s 写进 node04 的显存，decode 每步只变化 ±1%，node04 上 EP 的单次耗时也几乎不变（dispatch 64 → 68 µs）；而 2.2 节的单测里，同样形状、差不多速率的 IO 从第三台流进 EP 节点，接收 IO 那一侧（B 侧）的 dispatch 慢 33%。两边有两处不同：机器不一样（单测的 EP 在 03 + 04，端到端的 decode 是 02 + 04）；单测里 EP 一轮接一轮背靠背地跑，decode 里每层只有一次 dispatch + combine，其余约九成时间在算。分两步去掉（`microbench/run/mb_e2e7.sh`）：
+
+1. **换成端到端的机器**（c7_e2e：EP16 在 02 + 04，IO 从 prefill 节点 01 流进 04，其余和 2.2 节相同）：结果和 2.2 节几乎一样，KV 形状的 WRITE / READ 时 B 侧 dispatch 都 +34%（2.2 节 +33%），1 对 WRITE +133%（+132%），8 对 WRITE +223%（+218%），作参照的 2 机、发送侧 1 对是 +48%、+47%（+46%、+43%）。所以和机器无关。
+2. **再让 EP 按 decode 的节奏跑**（c7_duty）：每次 combine 之后插 20 个各写 16 MB 的 GEMM（约 1.1 ms，不计入 EP 的计时），EP 只占约十分之一的时间。
+
+| 从 01 流进 04 的 IO | B 侧 dispatch：背靠背 → 按 decode 节奏 | 按 decode 节奏的 combine（A 侧 / B 侧） |
+|---|---|---|
+| KV 形状 WRITE（每卡约 40 GB/s） | +34% → −6% | +16% / +11% |
+| KV 形状 READ | +34% → +1% | +16% / +11% |
+| 1 对 WRITE（44 GB/s） | +149% → +7% | +26% / +9% |
+| 8 对 WRITE（每卡约 44 GB/s，接近线速） | +229% → +13% | +50% / +40% |
+
+两次无 IO 基线之间相差约 ±8%。
+
+- **按 decode 的节奏，KV 形状的 IO 对 dispatch 已经看不出来，combine 多 11%–16%**，和端到端（EP 单次耗时 ±6%，decode 每步 ±1%）是同一个量级。
+- **原因是背靠背时 EP 自己把链路也占着**：EP 一直在往接收方送数据（每张网卡几 GB/s），加上 IO 以后，交换机朝接收方的出口一直接近满载、队列一直很深，每个 EP 包都排在后面。按 decode 的节奏，EP 只是偶尔来一阵，两阵之间队列来得及排空；IO 本身（每卡约 40 GB/s）不到线速，EP 只碰到一个浅队列。IO 接近线速时（8 对 WRITE）队列排不空，按 decode 节奏也还有 +13% / +40%–50%。
+- 按 decode 节奏时 dispatch 比 combine 受影响小：各 rank 做完本地计算的时间相差约 100 µs，dispatch 要等最慢的 rank，网络多出来的十几 µs 被这段等待盖住；combine 开始时各 rank 已经对齐，网络延迟直接显出来。
+- **所以 2.2 节的单测（以及第一轮的单测）测的是"EP 一直在跑"的最坏情况**：适合比较不同摆法之间的相对轻重，不能直接拿来估 decode 慢多少。估 decode 要看端到端，或者按 decode 节奏的单测。
+- 另外两组最后一个基线（都紧跟在 node04 发起的 KV 形状 READ 之后）各出现过一次单轮的长时间卡顿（一次 combine 卡了约 80 s，一次 dispatch 74 ms），其余轮正常；上表没有用这两个基线，原因没查。
 
 ## 3. 端到端：decode 配置
 
@@ -304,6 +329,19 @@ node02 上 8 张 GPU 各起一个小程序，不停地测"4 KB 显存→主机�
 
 - **触发条件是这颗 CPU 往另一颗 CPU 写的总量**：1–3 张网卡满速跨 NUMA（合计 41–124 GB/s）任何 GPU 都不受影响；4 张一起写时每张只能跑到 35–39 GB/s（合计约 145 GB/s，被两颗 CPU 之间的路限住），这时和它们共用根端口的 GPU 4–7 来回翻倍。
 - **READ 和 WRITE 一样**：decode 当请求方、把数据 READ 进另一个 NUMA 的主机内存，GPU 4–7 同样翻倍；READ 进本 NUMA 没有影响。起作用的是"网卡往另一颗 CPU 的内存做 DMA 写"，和 RDMA 由谁发起无关。
+- **上限是这台机器"PCIe 设备往另一颗 CPU 写"这条路，不是网卡的**（`bench/gpu_d2h_numa.py`，node02 上让 GPU 做 D2H 拷贝，写进绑在指定 NUMA 上、注册过的主机内存，合计 GB/s）：
+
+| 写进另一个 NUMA 的 GPU | 合计 | 每张 |
+|---|---|---|
+| GPU 4 | 53.7 | 53.7（PCIe 本身的速度） |
+| GPU 4–5 | 114.2 | 57.1 |
+| GPU 4–6 | 153.1 | 48–56 |
+| GPU 4–7 | 153.5 | 37–40 |
+| GPU 0–3（反方向） | 154.2 | 37–40 |
+| GPU 0–7（两个方向同时） | 307.8 | 37–40 |
+| 对照：GPU 4–7 / 0–7 写本 NUMA | 226.9 / 454.4 | 56–57 |
+
+  每个方向合计封顶在约 150 GB/s（网卡 RDMA 写测出来约 145 GB/s，GPU 拷贝约 153 GB/s），两个方向互不影响；写本 NUMA 没有这个上限。4 张网卡各约 40 GB/s 加起来超过它，多出来的写就堵在这些网卡的根端口里。GPU 往错 NUMA 的锁页内存卸载数据（KV 卸载、UMBP 之类）走的也是这条路，会触发同样的拥塞。
 - **是"开关式"的**：限速后单张 GPU 会在约 14 µs 和约 30 µs 两种状态之间切换，一个状态持续十几到几十秒（WRITE 各限 25 GB/s 时 GPU 4、6、7 大部分时间在拥塞状态，GPU 5 基本不进；各限 32 GB/s 时只在开头 5 s 四张都翻倍）。所以"限速到多少就安全"给不出一个干净的阈值，避开的办法仍然是把缓冲放在网卡所在的 NUMA 上。
 
 ### 6.2 decode 在 READ 注入下
@@ -317,7 +355,7 @@ node02 上 8 张 GPU 各起一个小程序，不停地测"4 KB 显存→主机�
 - **逐位置对齐 decode 的 4,515 个内核**（同一个 graph，注入前 9 步、注入时 4 步）：被拖慢不是固定某些内核——同一个位置的内核，这一步慢、下一步不慢；一旦慢，后面几个也慢（前一个慢时下一个慢的概率 70%，前一个不慢时 28%），一段中位数约 240 µs；长内核（200 µs 的 MoE GEMM）很少被拖慢。TP4 和 TP5 挂在不同的 PCIe 交换芯片下，但它们按 200 µs 分段的"被拖慢比例"相关系数 0.88。
 - **不是 CUDA graph 的问题**：`--disable-cuda-graph` 时 decode 变成 CPU 下发内核决定速度（每步 239 ms），被堵的 TP4 / TP5 上仍有 43%–46% 的小内核被拖慢，本地计算 56 → 74 ms；这时每步 +16 ms（+7%）。
 - **不是 GPU 从主机内存取命令包**：`HSA_ALLOCATE_QUEUE_DEV_MEM=1` 把命令队列放进显存，注入时每步仍 +28%，被拖慢的小内核比例不变（61%）。
-- **CPU 下发内核也变慢**：被堵的 GPU 上，每次 `hipLaunchKernel` 的 CPU 耗时从 3.9 µs 变成 7.7 µs（没被堵的 GPU 3.6 → 4.1 µs），说明每次下发也要经过这段 PCIe 来回一次。
+- **CPU 下发内核也变慢**：开着 profiler 的 trace 里，被堵的 GPU 上每次 `hipLaunchKernel` 的 CPU 耗时从 3.9 µs 变成 7.7 µs（没被堵的 GPU 3.6 → 4.1 µs）。不开 profiler 的单测里（6.4 节，每轮约 125 次下发）没有看到相应的变慢，可能是 profiler 自己每次下发要和 GPU 交互一次。
 - **也不是"拥塞时网卡同时往这张 GPU 写"**：decode 里网卡和 GPU 之间一直有点对点读写（KV 写进显存、EP 收发），之前的合成测试里没有。补测（`run/k31_r20_p2p.sh`）：网卡 4–7 跨 NUMA 写主机内存的同时，再让它们往 GPU 5–7 的显存各写 5 GB/s，GPU 4–7 的主机来回照样翻倍（22–25 µs），但合成 CUDA graph 的小内核仍然每个只多约 0.06 µs，没有 decode 里那种成段卡顿。顺带看到：往显存写改成背靠背、网卡带宽被一分为二后，跨 NUMA 那部分每张只剩约 24 GB/s，拥塞基本消失——又一次说明触发条件是跨插槽写的总量。
 - **也不是 GPU 往网卡的流量、系统范围的屏障或 peer access**（`bench/gpu_lat6.py`、`run/k31_r25_gputx.sh`，合成 graph 在同样的拥塞下）：让网卡 4–7 同时从 GPU 4–7 的显存读数据发出去（每张 5 GB/s 或背靠背），小内核不变；内核边界强制用系统范围的屏障（`AMD_OPT_FLUSH=0`），每个内核本身多约 2 µs，但拥塞时不再变慢；开 peer access（decode 为 aiter 的 all-reduce 开着）也不变。
 - decode 特有的诱因见 6.4 节。
@@ -361,7 +399,23 @@ node02 上 8 张 GPU 各起一个小程序，不停地测"4 KB 显存→主机�
 
 - 关掉重叠调度后，trace 里每步的 `hipStreamWaitEvent` 从 1 次变成 0 次，所有内核都在一条 stream 上；拥塞造成的每步增量从 26.0 → 10.0 ms（READ）、19.9 → 7.3 ms（WRITE），两种注入都去掉了约 62%。
 - 不拥塞时两种都是每步 114 ms：关掉后 GPU 时间少了约 3 ms（和合成测试里"挂着等本身每个内核多约 1.3 µs"方向一致），正好抵掉不再和 GPU 重叠的 CPU 调度时间。
-- 剩下的约四成还没查：关掉重叠调度后，被堵 GPU 上的小内核在 trace 里仍从 4.5 µs 被抬到约 13 µs（开着时是 22.7 µs），被拖慢的比例 42%–51%。不是 READ 发起进程（node02 上只做被写的一方时剩下的也差不多），也不是 MoRI EP 的第二条 stream（只在开 two-batch overlap 时才有）。
+- 剩下的约四成是 EP 本身变慢，见下面。
+
+**剩下的四成：EP 走的正是被堵的那几张网卡**（`microbench/run/mb_numa8.sh`，不开 profiler，只用事件计时）：EP16 在 02 + 04 上，node01 往 node02 另一个 NUMA 的主机内存写（网卡 4–7 背靠背，每卡 37–44 GB/s），只堵 node02 的 GPU 4–7；EP 每轮之间插 100 个 tiny 内核、1 个小 GEMM 和 20 个写 16 MB 的 GEMM（约 1.2 ms，按 decode 的节奏）。各组 rank 的平均（µs，不注入 → 注入）：
+
+| | node02 GPU 0–3 | node02 GPU 4–7（被堵） | node04 |
+|---|---|---|---|
+| dispatch | 120 → 101 | 137 → 171（+34） | 170 → 232（+62） |
+| combine（不含本地计算） | 71 → 71 | 73 → 81（+8） | 46 → 63（+18） |
+| 两次 EP 之间的 121 个本地内核 | 1280 → 1288 | 1242 → 1249（+7） | 1248 → 1244 |
+| 每轮墙钟（整个 EP16） | 2150 → 2236（+86） | | |
+
+- **小内核本身不变慢**：没有挂着的跨 stream 等待时，被堵 GPU 上 121 个本地内核总共只多约 7 µs（像是 combine 之后的第一个内核多等一次），不是每个内核都等。内核边界强制用系统范围的屏障（`AMD_OPT_FLUSH=0`）也一样：每轮 +77 µs，本地内核不变。
+- **EP 每轮慢约 80 µs**：被堵 GPU 的 EP 数据要经过网卡 4–7，这几张网卡和 GPU 之间的 PCIe 正被跨插槽的写堵着，node04 在 EP 上等它们。每轮墙钟 +86 µs，按 decode 每步 92 轮算约 7.9 ms；decode 里关掉重叠调度后实测每步 +7.3 ms（WRITE 注入），对得上。
+- **其中约八成是跨插槽造成的**：同样速率写进 node02 本 NUMA 的主机内存时，每轮只多 19 µs（背靠背时 +27 µs，跨 NUMA +133 µs），被堵 GPU 上 combine 之后的那次多等也没有了；按每步 92 轮约 1.7 ms，和端到端 W2（写本 NUMA，+3.3% / +0.1%）一致。剩下的那点是网卡同时在收注入流量。
+- 关掉重叠调度后 trace 里小内核仍被抬到约 13 µs（开着时 22.7 µs），只在开 profiler 时出现：不开 profiler 的单测里同样是单 stream 加 EP，没有这个现象；decode 不开 profiler 的每步增量也已经被上面两部分解释完。
+
+**合起来**（node02 的网卡 4–7 背靠背跨 NUMA，decode 默认配置，不开 profiler 的每步 GPU 时间）：WRITE 注入 +19.9 ms = 挂着的跨 stream 等待约 12.6 ms + EP 走被堵的网卡约 7.3 ms；READ 注入 +26.0 ms = 约 16.0 + 10.0 ms。
 
 **对部署**：根本的办法仍是 RDMA 主机缓冲放在网卡所在的 NUMA 上，不触发拥塞。在这套配置（PD decode、DFLASH、DP attention）上，合成负载下 `--disable-overlap-schedule` 不拥塞时不损失、拥塞时少损失一半多，是一个现成的缓解；AgentX 负载下没有测过。sglang 侧更好的改法是让 decode 并入新请求时不在 GPU 上挂着等前向，例如由 CPU 等前向的事件后再下发，或者把 `_nonblocking_admit_in_scope()` 的非阻塞并入放开到 DFLASH；这样既保留重叠调度，又可能省掉每步约 3 ms 的等待开销。
 
@@ -379,5 +433,8 @@ node02 上 8 张 GPU 各起一个小程序，不停地测"4 KB 显存→主机�
 | AgentX（第 5 节） | `run/k31_r23_ctrl.sh`（调 `k31_up.sh`、`k31_r16_inj_rw.sh`、`k31_bench.sh`）；分析 `run/k31_r21_post.sh`（`RUN=k31_ctrl SUB=c256 TAIL=1850`：这次正式阶段跑了 3640 s）、`tools/k31_nat_cmp.py`、`k31_client_window.py` | `results/k31_ctrl/c256/` |
 | 小内核变慢的诱因（6.3、6.4 节） | `bench/gpu_lat6.py` + `run/k31_r25_gputx.sh`、`bench/gpu_lat7.py` + `run/k31_r27_pending.sh`；分析 `tools/k31_gputx_analyze.py` | `results/pcie/gt1`、`pw2`、`pw3`（`pw1_badtiming` 是计时写错的一次） |
 | decode 里关掉重叠调度（6.4 节） | `run/k31_r26_rtvars.sh`（`VARIANTS="noovl:ARGS=--disable-overlap-schedule base:"`，`OP=read` / `write`，调 `k31_r15_decprof2.sh`）；分析 `tools/k31_decprof2_analyze.py` | `results/pcie/rt_base`、`rt_noovl`、`rt_basew`、`rt_noovlw`，`results/rt_vars/` |
+| 单测和端到端为什么对不上（2.7 节） | `microbench/run/mb_e2e7.sh`（`mb_campaign5.sh`，A=02 B=04 C=01；`ep_local/` 变体加 `EP_LOCAL_BIG_N`）；分析 `microbench/tools/mb_analyze5.py`（`02 04 01`）、`mb_local_analyze.py` | `microbench/results/c7_e2e`、`c7_duty`（`zz_base2_80s_stall` 是那次 80 s 卡顿的基线） |
+| EP 走被堵的网卡（6.4 节） | `microbench/run/mb_numa8.sh`（`RNUMA=remote` / `local`）；分析 `microbench/tools/mb_local_analyze.py --groups 0-3,4-7,8-15` | `microbench/results/c8_numa`、`c8_local` |
+| 跨插槽写的上限（6.1 节） | `bench/gpu_d2h_numa.py` | — |
 | 注入工具（READ / WRITE） | `bench/io_inject.py`（`--op read`） | — |
 | 图 | `tools/k31_doc2_figs.py` | — |
