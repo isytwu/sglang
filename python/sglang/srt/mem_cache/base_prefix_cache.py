@@ -76,6 +76,9 @@ class MatchPrefixParams:
     # Hit the deepest FULL-KV prefix even past the last cached Mamba state, for
     # a caller that receives the request's Mamba state elsewhere (PD decode).
     full_kv_only: bool = False
+    # The match only orders the waiting queue and no load follows it, so an
+    # external store may answer from the request's last lookup.
+    probe: bool = False
 
 
 @dataclasses.dataclass

@@ -694,7 +694,9 @@ class UnifiedRadixCache(BasePrefixCache):
             and params.req is not None
             and get_disagg().disaggregation_mode != "decode"
         ):
-            result = self.linker.match(params.key, params.req, result)
+            result = self.linker.match(
+                params.key, params.req, result, probe=params.probe
+            )
         return result
 
     def supports_full_kv_only_match(self) -> bool:

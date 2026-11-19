@@ -251,6 +251,15 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+class _StoreHit(NamedTuple):
+    """What a lookup found in the external store past the device prefix."""
+
+    tokens: int
+    swa_tokens: int
+    mamba_slots: int
+    marker: ExternalCacheHitMarker
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -287,6 +296,10 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # rid -> ((key length, device hit), store hit) of the request's last
+        # lookup, which a probe reuses while both are unchanged. A lookup is a
+        # collective, so whether to reuse depends only on state all ranks share.
+        self._last_lookups: dict[str, tuple[tuple[int, int], Optional[_StoreHit]]] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -321,30 +334,59 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
-    def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+    def match(
+        self, key: RadixKey, req: Req, result: MatchResult, *, probe: bool = False
+    ) -> MatchResult:
+        """``probe``: the match only orders the waiting queue. It reuses the
+        request's last lookup while the key and the device hit are unchanged,
+        and leaves no hit marker. Any other match can be followed by a load, so
+        it looks the store up again."""
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
-        page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if not probe:
+            # The next init_load_back loads what this match finds, or nothing.
+            self.hit_markers.pop(req.rid, None)
         if device_hit_len >= len(key):
             return result
 
+        shape = (len(key), device_hit_len)
+        last = self._last_lookups.get(req.rid)
+        if probe and last is not None and last[0] == shape:
+            hit = last[1]
+        else:
+            hit = self._lookup(key, req, result, device_hit_len)
+            self._last_lookups[req.rid] = (shape, hit)
+        if hit is None:
+            return result
+        if not probe:
+            self.hit_markers[req.rid] = hit.marker
+        return result._replace(
+            last_host_node=result.best_match_node,
+            host_hit_length=hit.tokens,
+            swa_host_hit_length=max(result.swa_host_hit_length, hit.swa_tokens),
+            mamba_host_hit_length=max(result.mamba_host_hit_length, hit.mamba_slots),
+        )
+
+    def _lookup(
+        self, key: RadixKey, req: Req, result: MatchResult, device_hit_len: int
+    ) -> Optional[_StoreHit]:
+        page = self.cache.page_size
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
-            return result
+            return None
 
         lookup_transfers = self._lookup_transfers(tail_hashes)
         if not lookup_transfers:
-            return result
+            return None
         hit_pages = self._sync_restorable_prefix(
             self.cache_linker.lookup(req.rid, lookup_transfers),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
         if hit_pages == 0:
-            return result
+            return None
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
-        hit_tokens = hit_pages * page
 
         swa_transfer = by_pool.get(PoolName.SWA)
         swa_host_hit_length = (
@@ -355,16 +397,13 @@ class UnifiedCacheLinkerWrapper:
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
 
-        self.hit_markers[req.rid] = ExternalCacheHitMarker(
-            tail_hashes=list(tail_hashes[:hit_pages]),
-            device_hit_len=device_hit_len,
-        )
-        return result._replace(
-            last_host_node=result.best_match_node,
-            host_hit_length=hit_tokens,
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
-            mamba_host_hit_length=max(
-                result.mamba_host_hit_length, mamba_host_hit_length
+        return _StoreHit(
+            tokens=hit_pages * page,
+            swa_tokens=swa_host_hit_length,
+            mamba_slots=mamba_host_hit_length,
+            marker=ExternalCacheHitMarker(
+                tail_hashes=list(tail_hashes[:hit_pages]),
+                device_hit_len=device_hit_len,
             ),
         )
 
@@ -665,6 +704,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self._last_lookups.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -680,6 +720,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self._last_lookups.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
