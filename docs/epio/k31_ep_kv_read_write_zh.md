@@ -15,9 +15,9 @@
 先说端到端（第 3–7 节），再说 READ 的正确性和单测（第 1–2 节）。
 
 - **高 EP 流量下，IO 让 EP 明显变慢的情况复现出来了**（第 7 节；EP16、512 路在途、qlen 8，每步过 MoE 的 token 是第 4 节的 6.4 倍）：
-  - 条件是 IO 和 EP 在同一个无损类（TC 104），而且 IO 在某台 decode 的入口形成 incast。两台 prefill 同时往一台 decode 写 GPU 显存（KV 的正常落点），decode 每步 +14.7%，EP 单次耗时翻倍多；READ、写本 NUMA 也一样；再加上另一台 decode 一起打（3:1），+38.7%，交换机开始暂停发送方。
-  - 只有一个来源时（1P，或两台 decode 各一个来源）只有 1%～3%。
-  - IO 改走另一个流量类（TC 0）后，同样的 incast 只有 +0.1%～+2.5%，代价是 IO 自己丢包重传。跨 NUMA 那部分（第 6 节）和流量类无关，仍有 +12%。
+  - 要两个条件：IO 在某台 decode 的入口形成 incast（例如两台 prefill 同时往一台 decode 写 KV），而且 EP 没有和 IO 分开。EP 和 IO 同在无损类（TC 104）时，decode 每步 +15%（2:1）～+39%（3:1），EP 单次耗时 2–5 倍；EP 在有损类（TC 0，也是 MoRI 不设 TC 时的默认）时 +125%～+268%，EP 的包被丢、等重传。
+  - 只有一个来源时（1P，或两台 decode 各一个来源），不论哪个流量类都只有 1%～3%。
+  - EP 留在无损类、IO 改走另一个类（TC 0）后，同样的 incast 只有 +0.1%～+2.5%，代价是 IO 自己丢包重传。跨 NUMA 那部分（第 6 节）和流量类无关，仍有 +12%～+14%。
 - **`SGLANG_MORI_MOE_MAX_INPUT_TOKENS=2048` 值得加**：decode 每步 114 → 88 ms（−23%），MoE 专家 GEMM / 排序 44 → 25 ms；输出质量没有变化（第 3.1 节）。第 4 节的合成负载注入在"dispatch 上限 1024 + MoE 输入上限 2048"上跑；第 5 节的 AgentX 和 6.4 节的 decode 验证用第一轮的 d1024 配置（不设 MoE 输入上限）。
 - **KV 的正常路径（写进 decode GPU 显存）用 READ 还是 WRITE，对 decode 都几乎没有影响**：每张网卡 38 GB/s 背靠背注入，decode 每步只慢约 1%；写进本 NUMA 的主机内存也一样（第 4 节）。
 - **写进另一个 NUMA 的主机内存仍然最伤，而且 READ 比 WRITE 更重**：背靠背 +54%（WRITE +39%），每张网卡 20 GB/s 时 +12%（WRITE +7%）；多出来的集中在 node02（READ 的发起方、a-147 固件）（第 4 节）。
@@ -537,11 +537,33 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 - **代价在 IO 自己**：TC 0 不发 PFC，交换机直接丢包。2:1 时两个来源各重传约 18 GB/s（约一成）；3:1 时丢得更多，node04 入口只剩 169 GB/s。READ 在途量有上限，不丢包。
 - **跨 NUMA 那部分不受影响**（J3，+11.7%）：那是主机上 PCIe 往另一颗 CPU 内存写的上限，和网络里的队列无关。
 
-### 7.5 和 Moonshot 测到的掉速
+### 7.5 EP 也放进有损类（整套栈 TC 0）
 
-- 在 EP16 上，"IO 让 EP 慢很多"复现出来的条件是：**IO 和 EP 在同一个无损类里，而且 IO 在某台 decode 的入口形成 incast**（多个来源同时打进来，或者接收方排不出去）。这时 EP 单次耗时变成 2–5 倍，decode 每步慢 15%～39%。只有一个来源时，即使 IO 跑满、EP 流量大了 3 倍，也只有 1%～3%。
-- EP32 下每台 decode 要同时收另外 3 台的 EP（EP16 时只有 1 台），EP 本身就在入口形成 incast，多台 prefill 再往同一台 decode 推 KV，更容易碰到这种情况。这是推测，没有在 EP32 上测过。
-- **对部署**：把 KV 等 IO 和 EP 分到不同的流量类（交换机里不同的队列）。只有一个无损类时，把 IO 放到另一个类（哪怕是有损的）也能保护 EP，代价是 IO 在 incast 时丢包重传。
+**怎么测**：整套栈重启，EP、KV、NCCL 都用 TC 0（`TCMODE=0`），其余同 7.3；注入的 IO 用 TC 0，最后一段（K6）IO 改回 TC 104。注入前每步 236.0 ms：没有 IO 时，EP 放在有损类不吃亏。
+
+| 时段 | 方式 | IO 来源 → 落点 | IO 的 TC | 每步变化 | dispatch / combine（µs，node03 TP0） | 同样的 IO，EP 在 TC 104 |
+|---|---|---|---|---|---|---|
+| 注入前 | — | — | — | 236.0 ms | 132 / 159 | — |
+| K5 | WRITE | 01 → 03、02 → 04，GPU 显存 | 0 | +3.0% | 146 / 216 | +2.6%（B1） |
+| K1 | WRITE | 01、02 → node04 GPU 显存 | 0 | **+125%** | 508 / 367 | +14.7%（I1）；IO 在 TC 0 时 +0.1%（J1） |
+| K4 | READ | node04 从 01、02 的 GPU 显存读 | 0 | **+159%** | 566 / 352 | +15.6%（I2）；+0.1%（J4） |
+| K2 | WRITE | 01、02、03 → node04 GPU 显存 | 0 | **+268%** | 3,970 / 588 | +38.7%（I4）；+2.5%（J2） |
+| K6 | WRITE | 01、02 → node04 GPU 显存 | 104 | **+261%** | 5,226 / 318 | — |
+| K3 | WRITE | 01 → 03、02 → 04，另一个 NUMA 主机内存 | 0 | +14.1% | 204 / 263 | +14.2%（B2） |
+
+![EP 和 IO 放在哪个流量类](img/figR5_tc.png)
+
+**说明了什么**：
+- **EP 在有损类时，incast 让 decode 慢一倍以上**：2:1 写 GPU 显存 +125%，READ +159%，3:1 +268%。EP 的包和 IO 一起在 node04 入口的队列里被丢，要靠重传（node03 每秒重传约 0.6 GB，基线为 0），dispatch 从 132 µs 涨到 0.5–4 ms。
+- **最坏的是 EP 有损、IO 无损（K6，+261%）**：IO 不丢包、一直占着交换机的缓冲，EP 没有地方排队，单次 dispatch 5 ms 以上。
+- 只有一个来源（K5）、或者只是跨 NUMA（K3），和 EP 在 TC 104 时一样（+3%、+14%）：网络不拥塞时，有损类不吃亏。
+
+### 7.6 和 Moonshot 测到的掉速
+
+- 在 EP16 上，"IO 让 EP 慢很多"要两个条件同时满足：**IO 在某台 decode 的入口形成 incast**（多个来源同时打进来，或者接收方排不出去），**而且 EP 没有和 IO 分开**。EP 和 IO 同在无损类时 decode 每步慢 15%～39%；EP 在有损类时慢 1.3–3.7 倍。只有一个来源时，即使 IO 跑满、EP 流量大了 3 倍，也只有 1%～3%。
+- MoRI 默认不设 traffic class（`MORI_RDMA_TC`、`MORI_IO_TC` 都不设时是 0）。如果 EP 和 KV 都用默认值，而网络上 0 是有损类（这套集群就是），多台 prefill 往同一台 decode 推 KV 时就是 K1 / K4 那种情况。值得确认 Moonshot 那边 EP 和 KV 用的 TC，以及那个 TC 在交换机上是不是无损。
+- EP32 下每台 decode 要同时收另外 3 台的 EP（EP16 时只有 1 台），EP 本身就在入口形成 incast，更容易碰到这种情况。这是推测，没有在 EP32 上测过。
+- **对部署**：EP 放在无损类（这套集群是 DSCP 26 / TC 104），KV 等 IO 放到另一个类。这里只有一个无损类，IO 放 TC 0 也能保护 EP，代价是 IO 在 incast 时丢包重传。
 
 ## 附录：数据和脚本
 
@@ -562,5 +584,5 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 | EP 走被堵的网卡（6.4 节） | `microbench/run/mb_numa8.sh`（`RNUMA=remote` / `local`）；分析 `microbench/tools/mb_local_analyze.py --groups 0-3,4-7,8-15` | `microbench/results/c8_numa`、`c8_local` |
 | 跨插槽写的上限（6.1 节） | `bench/gpu_d2h_numa.py` | — |
 | 注入工具（READ / WRITE） | `bench/io_inject.py`（`--op read`） | — |
-| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`，网卡计数 `results/netmon_r29/` |
-| 图 | `tools/k31_doc2_figs.py`、`tools/k31_doc3_figs.py`（第 7 节） | — |
+| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`、`k31_ep512_2p_tc0_lgrw`（整套 TC 0），网卡计数 `results/netmon_r29/` |
+| 图 | `tools/k31_doc2_figs.py`、`tools/k31_doc3_figs.py`、`tools/k31_doc3_tcfig.py`（第 7 节） | — |
