@@ -15,9 +15,9 @@
 先说端到端（第 3–7 节），再说 READ 的正确性和单测（第 1–2 节）。
 
 - **高 EP 流量下，IO 让 EP 明显变慢的情况复现出来了**（第 7 节；EP16、512 路在途、qlen 8，每步过 MoE 的 token 是第 4 节的 6.4 倍）：
-  - 要两个条件：IO 在某台 decode 的入口形成 incast（例如两台 prefill 同时往一台 decode 写 KV），而且 EP 没有和 IO 分开。EP 和 IO 同在无损类（TC 104）时，decode 每步 +15%（2:1）～+39%（3:1），EP 单次耗时 2–5 倍；EP 在有损类（TC 0，也是 MoRI 不设 TC 时的默认）时 +125%～+268%，EP 的包被丢、等重传。
-  - 只有一个来源时（1P，或两台 decode 各一个来源），不论哪个流量类都只有 1%～3%。
-  - EP 留在无损类、IO 改走另一个类（TC 0）后，同样的 incast 只有 +0.1%～+2.5%，代价是 IO 自己丢包重传。跨 NUMA 那部分（第 6 节）和流量类无关，仍有 +12%～+14%。
+  - 要两个条件：IO 在某台 decode 的入口形成 incast（例如两台 prefill 同时往一台 decode 写 KV），而且 EP 没有和 IO 分开。EP 和 IO 同在无损类（TC 104）时，decode 每步 +15%（2:1）～+39%（3:1），EP 单次耗时 2–5 倍；EP 在有损类（TC 0，也是 MoRI 不设 TC 时的默认）时 +125%～+268%，EP 的包被丢、等重传。换一组节点（decode 02 + 03）复测一致（7.6 节）。
+  - 只有一个来源时（1P，两台 decode 各一个来源，或者只有另一台 decode 当来源），不论哪个流量类都只有 1%～4%。
+  - EP 留在无损类、IO 改走另一个类（TC 0）后，同样的 incast 只有 +0.1%～+2.5%，代价是 IO 自己丢包重传；来源之一是另一台 decode 时只降到 +6%～+9%（它的 IO 和 EP 在同一张网卡的出口抢带宽，7.6 节）。跨 NUMA 那部分（第 6 节）和流量类无关，仍有 +12%～+14%。
 - **`SGLANG_MORI_MOE_MAX_INPUT_TOKENS=2048` 值得加**：decode 每步 114 → 88 ms（−23%），MoE 专家 GEMM / 排序 44 → 25 ms；输出质量没有变化（第 3.1 节）。第 4 节的合成负载注入在"dispatch 上限 1024 + MoE 输入上限 2048"上跑；第 5 节的 AgentX 和 6.4 节的 decode 验证用第一轮的 d1024 配置（不设 MoE 输入上限）。
 - **KV 的正常路径（写进 decode GPU 显存）用 READ 还是 WRITE，对 decode 都几乎没有影响**：每张网卡 38 GB/s 背靠背注入，decode 每步只慢约 1%；写进本 NUMA 的主机内存也一样（第 4 节）。
 - **写进另一个 NUMA 的主机内存仍然最伤，而且 READ 比 WRITE 更重**：背靠背 +54%（WRITE +39%），每张网卡 20 GB/s 时 +12%（WRITE +7%）；多出来的集中在 node02（READ 的发起方、a-147 固件）（第 4 节）。
@@ -479,7 +479,7 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 | 时段 | 方式 | 落点 | 每张网卡 GB/s | 每步变化 | 第 4 节（128 路，两台 decode 都打） |
 |---|---|---|---|---|---|
 | 注入前 | — | — | — | 236.3 / 236.2 ms | 87.8 / 87.9 ms |
-| W1 | WRITE | 另一个 NUMA 的主机内存 | 35.5 | −0.6% | +38.5% |
+| W1 | WRITE | 另一个 NUMA 的主机内存 | 35.5 | −0.6%（这一段 batch 掉到 198，按 batch 折算约 +12%） | +38.5% |
 | R1 | READ | 另一个 NUMA 的主机内存 | 35.1 | +11.1% | +54.4% |
 | W2 | WRITE | 本 NUMA 的主机内存 | 37.6 | +1.0% | +0.9% |
 | R2 | READ | 本 NUMA 的主机内存 | 38.4 | +0.8% | +1.4% |
@@ -490,7 +490,7 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 
 **说明了什么**：
 - **写进 GPU 显存、本 NUMA 主机内存，和第 4 节一样只慢约 1%**：EP 流量大了约 3 倍，只有一个来源的 IO 仍然碰不到 EP。
-- **跨 NUMA 反而轻了**：一是这里只堵了 node04 一台（第 4 节两台都堵）；二是每步的内核变长了（bs 256 × 8），第 6.4 节那条跨 stream 等待给每次内核下发多加的几微秒被摊薄。下一节两台都跨 NUMA（B2 / B3）也只有 +14% / +15%。
+- **跨 NUMA 比第 4 节轻**：R1 +11.1%。W1 这一段 decode 每个 DP 组的 batch 从 255 掉到 198（node01 是唯一的 prefill，又在往外打 IO，送进 decode 的请求变少了），每步 235 ms 看起来没变；按同样的 batch 折算约 +12%（7.6 节 P1 的 batch 是 195，每步 209 ms）。比第 4 节两台都打的 +38.5% / +54.4% 轻：一是这里只堵了 node04 一台；二是每步的内核变长了（bs 256 × 8），第 6.4 节那条跨 stream 等待给每次内核下发多加的几微秒被摊薄。下一节两台都跨 NUMA（B2 / B3）是 +14% / +15%。
 
 ### 7.3 多个 IO 来源进同一台 decode（2P，IO 和 EP 同在 TC 104）
 
@@ -558,7 +558,30 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 - **最坏的是 EP 有损、IO 无损（K6，+261%）**：IO 不丢包、一直占着交换机的缓冲，EP 没有地方排队，单次 dispatch 5 ms 以上。
 - 只有一个来源（K5）、或者只是跨 NUMA（K3），和 EP 在 TC 104 时一样（+3%、+14%）：网络不拥塞时，有损类不吃亏。
 
-### 7.6 和 Moonshot 测到的掉速
+### 7.6 换一组节点复测（prefill 01、decode 02 + 03）
+
+node04 在 11-19 19:27 UTC 失联（宿主机侧 GPU / 网卡的 VF 故障，见附录），这段时间在另外三台上复测：prefill 只有 node01，decode 是 node02 + node03，其余同 7.1。注入前每步 236.8 ms，batch 255，和 decode 在 03 + 04 时一样。两个来源时，另一个来源只能用另一台 decode（node02），它同时也在给 node03 发 EP。
+
+| 时段 | 方式 | IO 来源 → 落点 | IO 的 TC | 每对每张网卡 GB/s | node03 收（8 卡合计） | 每步变化 | dispatch / combine（µs，node02 TP0） | 对应的 7.3 / 7.4 节 |
+|---|---|---|---|---|---|---|---|---|
+| 注入前 | — | — | — | — | 12.1 GB/s | 236.8 ms | 147 / 184 | — |
+| P1 | WRITE | 01 → node03 GPU 显存 | 104 | 37.4 | 311 GB/s | −11.6%（batch 掉到 195，不可比） | 132 / 160 | — |
+| P2 | WRITE | 02（另一台 decode）→ node03 GPU 显存 | 104 | 36.5 | 305 GB/s | +3.8% | 231 / 185 | — |
+| P3 | WRITE | 01、02 → node03 GPU 显存 | 104 | 23.5 | 388 GB/s | **+16.8%** | 390 / 368 | I1 +14.7% |
+| P4 | READ | node03 从 01、02 的 GPU 显存读 | 104 | 23.5 | 387 GB/s | **+14.7%** | 350 / 355 | I2 +15.6% |
+| P5 | WRITE | 01、02 → node03 另一个 NUMA 主机内存 | 104 | 20.7 | 320 GB/s | **+35.3%** | 512 / 723 | I5 +34.8% |
+| P8 | WRITE | 01、02 → node03 GPU 显存，每对限 20 GB/s | 104 | 20.9 | 346 GB/s | **+13.3%** | 367 / 306 | — |
+| P6 | WRITE | 01、02 → node03 GPU 显存 | 0 | 20.0 | 335 GB/s | +6.0% | 279 / 198 | J1 +0.1% |
+| P7 | READ | node03 从 01、02 的 GPU 显存读 | 0 | 20.1 | 358 GB/s | +8.6% | 337 / 203 | J4 +0.1% |
+
+**说明了什么**：
+- **2:1 incast 在另一组节点上复现了，大小也一样**：写 GPU 显存 +16.8%、READ +14.7%、写另一个 NUMA +35.3%（7.3 节 +14.7% / +15.6% / +34.8%）。
+- **入口到线速的约 86% 就开始排队**：每对限 20 GB/s 时 node03 入口合计 346 GB/s（8 × 50 GB/s 的 86%），仍有 +13.3%。
+- 只有另一台 decode 当来源（P2）：+3.8%。
+- **IO 改走 TC 0 只能救回一部分**（+6.0% / +8.6%，7.4 节两个来源都是 prefill 时是 +0.1%）：node02 的 IO 和它自己发给 node03 的 EP 从同一张网卡出去，换了流量类，在网卡出口还是抢带宽（node02 TP0 的 dispatch 279–337 µs，基线 147 µs）。
+- P1 这一段 decode 的 batch 从 255 掉到 195（node01 是唯一的 prefill，又在往外打 IO），每步变快只是因为 batch 小了，不说明问题。
+
+### 7.7 和 Moonshot 测到的掉速
 
 - 在 EP16 上，"IO 让 EP 慢很多"要两个条件同时满足：**IO 在某台 decode 的入口形成 incast**（多个来源同时打进来，或者接收方排不出去），**而且 EP 没有和 IO 分开**。EP 和 IO 同在无损类时 decode 每步慢 15%～39%；EP 在有损类时慢 1.3–3.7 倍。只有一个来源时，即使 IO 跑满、EP 流量大了 3 倍，也只有 1%～3%。
 - MoRI 默认不设 traffic class（`MORI_RDMA_TC`、`MORI_IO_TC` 都不设时是 0）。如果 EP 和 KV 都用默认值，而网络上 0 是有损类（这套集群就是），多台 prefill 往同一台 decode 推 KV 时就是 K1 / K4 那种情况。值得确认 Moonshot 那边 EP 和 KV 用的 TC，以及那个 TC 在交换机上是不是无损。
@@ -584,5 +607,5 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 | EP 走被堵的网卡（6.4 节） | `microbench/run/mb_numa8.sh`（`RNUMA=remote` / `local`）；分析 `microbench/tools/mb_local_analyze.py --groups 0-3,4-7,8-15` | `microbench/results/c8_numa`、`c8_local` |
 | 跨插槽写的上限（6.1 节） | `bench/gpu_d2h_numa.py` | — |
 | 注入工具（READ / WRITE） | `bench/io_inject.py`（`--op read`） | — |
-| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`、`k31_ep512_2p_tc0_lgrw`（整套 TC 0），网卡计数 `results/netmon_r29/` |
+| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`、`k31_ep512_2p_tc0_lgrw`（整套 TC 0）、`k31_ep512_b_lgrw`（decode 02 + 03，`run/k31_r33_3node_chain.sh`），网卡计数 `results/netmon_r29/`。node04 19:27 UTC 失联：上一次启动的内核日志里先是 GPU 0000:ab:00.0 `Doesn't get TRN_MSG_ACK from pf`，两分钟后同一个 PCIe 交换芯片下的网卡 0000:ac:00.0 `ionic_adminq_wait: context not initialized`，是 VF 和宿主机 PF 之间的通信断了；19:50 被重启，进了新装的 6.8.0-149 内核（没有 ionic RDMA 驱动），用 `grub-reboot` 回到 6.8.0-137 后恢复 |
 | 图 | `tools/k31_doc2_figs.py`、`tools/k31_doc3_figs.py`、`tools/k31_doc3_tcfig.py`（第 7 节） | — |
