@@ -38,7 +38,7 @@ READ 的正确性和单测：
 2. **单测：READ 对 EP 的影响比 WRITE 小，而且越是"第三台往 EP 节点送数据"，差得越多**：IO 跑满 8 条 rail 时，K3.1 decode 形状的 dispatch 平均变慢——2 机（IO 在两台 EP 节点之间）：WRITE +56%、READ +26%；IO 数据从 EP 节点流向第三台（EP 节点发送；WRITE 是 EP 节点写第三台，READ 是第三台读 EP 节点）：WRITE +51%、READ +15%；IO 数据从第三台流进 EP 节点（EP 节点接收，就是 prefill 往 decode 送 KV 的摆法）：WRITE +218%、READ +40%。
 3. **原因是 WRITE 推、READ 拉**：WRITE 由发送方按线速推，接收方网卡来不及把数据写进显存就发 PFC，交换机里朝接收方的队列一直很深；READ 由接收方（请求方）发读请求，同时在途的数据有上限，不会把自己灌满，8 对 rail 的 READ 场景里一次 PFC 都没有。
 4. **2 机和 3 机不同，是因为 IO 和 EP 在不同的地方相遇**：2 机时 IO 和 EP 从同一张网卡发出，接收方一暂停，交换机就把这张网卡整个停下；3 机接收侧时 IO 从第三台来、EP 从另一台 EP 节点来，两路在交换机朝接收方的出口汇合，EP 包排在 IO 后面（按多出来的时间估算，前面排着约 4–7 MB）。
-5. **接收侧 WRITE 的结果因机器而异，原因没查清**：同样的脚本和参数，第一轮在 06/07/08 上 1 对 rail 只慢 9%、KV 形状慢 6%，这一轮在 01/03/04 上是 132%、24%；发送侧和 2 机两轮一致。PFC 计数解释不了这个差别（2.5 节）。而端到端里同样的 KV 形状写入（每张网卡 38 GB/s 写进 node04 显存，第 4 节 W3），decode 的 EP 单次耗时没有变化。
+5. **接收侧 WRITE 的结果随节点组合变化，原因还没查清**：同样的测试，第一轮在 06/07/08 上 1 对 rail 只慢 9%、KV 形状慢 6%，这一轮在 01/03/04 上是 132%、24%；发送侧和 2 机两轮一致。在 01–04 上换角色重跑，A=04、B=03、C=01 这一组也只有 +8% / +6%，其余五种组合都是 +128%～+145%，所以不是两组机器的差别，也和 IO 来源的网卡固件、node04 无关（2.5 节）。而端到端里同样的 KV 形状写入（每张网卡 38 GB/s 写进 node04 显存，第 4 节 W3），decode 的 EP 单次耗时没有变化。
 6. **单测的影响比端到端大得多，是因为单测里 EP 背靠背地跑**（2.7 节）：换成端到端的机器（02 + 04 跑 EP、IO 从 01 进来），单测结果不变；让 EP 按 decode 的节奏跑（每轮之间插约 1.1 ms 的计算），KV 形状的 IO 让 B 侧 dispatch 的变化从 +34% 变成 −6%～+1%，combine +11%～+16%，和端到端一致。背靠背时 EP 自己一直占着链路，加上 IO 以后交换机朝接收方的队列一直很深；decode 里 EP 只是偶尔来一阵，队列来得及排空。
 
 ## 1. RDMA READ 在这套网络上读回来的数据对不对
@@ -134,7 +134,24 @@ K3.1 decode 形状的完整数字（µs，括号里是相对无 IO 的变化；"
 | 这一轮 KV 形状，8 条 rail（01 写 04） | 82 s | 19 ms | 0 | +24% |
 | 这一轮 8 对（01 写 04） | 117 s | 93 ms | 671 ms（8 条链路合计，0.57%） | +218% |
 
-PFC 解释不了这个差别：KV 形状的两场里 IO 来源都完全没被暂停，EP 却分别慢 6% 和 24%；这一轮 8 对时 IO 来源被暂停得比第一轮还多，EP 慢得最多。差别在哪一层（交换机端口的缓冲、接收方网卡把数据写进显存的速度、还是别的）还没查清。要确认是哪台机器或哪个端口带来的，可以在 01 / 03 / 04 上轮换 A、B、C 的角色重跑接收侧，或者回到 06 / 07 / 08 上重跑。
+PFC 解释不了这个差别：KV 形状的两场里 IO 来源都完全没被暂停，EP 却分别慢 6% 和 24%；这一轮 8 对时 IO 来源被暂停得比第一轮还多，EP 慢得最多。
+
+**补测：两轮跑的是同一个测试，差别跟节点组合有关，不是"两组机器不同"**。逐项核对过：EP 和 IO 的参数逐字相同，mori 都是 3a869d5f，IO 实测速率一样（1 对 44 GB/s，KV 形状约 326 GB/s），不加 IO 时 EP 的基线也一样（dispatch 62.8 / 62.6 µs）。在 01–04 上换角色重跑接收侧（`microbench/run/mb_rot6.sh`、`mb_src9.sh`，A、B 跑 EP，C 往 B 写），1 对 WRITE 时 dispatch 的变化：
+
+| A（EP 另一端） | B（接收 IO） | C（IO 来源，网卡固件） | 1 对 WRITE | KV 形状 |
+|---|---|---|---|---|
+| 03 | 04 | 01（a-196） | +132% | +24% |
+| 02 | 04 | 01（a-196） | +133% | +26% |
+| 03 | 04 | 02（a-147） | +145% | +37% |
+| 03 | 01 | 02（a-147） | +128% | +29% |
+| 01 | 02 | 03（a-196） | +131% | +25% |
+| **04** | **03** | **01（a-196）** | **+8%** | **+6%** |
+| 第一轮：06 | 07 | 08（a-147） | +9% | +6% |
+
+- 在 01–04 里也有一种组合（A=04、B=03、C=01）和第一轮一样轻，其余五种都很重，所以不是 01–04 和 05–08 两组机器的差别。
+- 和 IO 来源的网卡固件无关（a-147 和 a-196 当来源都很重），也不是 node04 一台的问题（接收方是 01、02、04 时都很重）。
+- 轻的那组里，接收方 node03 自己的 rank 反而没变慢（−10%），变慢的是另一端 node04 的 rank（+29%）；KV 形状那格的 IO 速率也偏低（约 280 GB/s，其余约 325 GB/s）。到底是"接收方是 03"还是"另一端是 04"带来的，还要重复这组并分开这两个角色（04 / 03 / 01 再跑一次，加 01 / 03 / 02 和 04 / 01 / 02）；做到这一步时 01、02 被别的作业占用，没有跑。
+- 不管原因是什么，这说明同一个接收侧单测换一组节点，结果可以差十几倍；它适合在同一组节点上比较摆法，不适合单独拿来下结论。
 
 对 PD 来说更要紧的是端到端：第 4 节 W3 用同样的 KV 形状、每张网卡 38 GB/s 背靠背写进 node04 的 GPU 显存，decode 每步只慢 1.0%，profile 里 EP 单次耗时也没变（TP8 dispatch 79 µs、combine 89 µs，注入前 78 / 89 µs）。单测里 EP 是一轮接一轮背靠背地跑，真实 decode 里 EP 夹在计算之间、每步只占约 19%，这一轮的机器上接收侧 WRITE 对真实 decode 的影响仍然很小。
 
@@ -433,6 +450,7 @@ node02 上 8 张 GPU 各起一个小程序，不停地测"4 KB 显存→主机�
 | AgentX（第 5 节） | `run/k31_r23_ctrl.sh`（调 `k31_up.sh`、`k31_r16_inj_rw.sh`、`k31_bench.sh`）；分析 `run/k31_r21_post.sh`（`RUN=k31_ctrl SUB=c256 TAIL=1850`：这次正式阶段跑了 3640 s）、`tools/k31_nat_cmp.py`、`k31_client_window.py` | `results/k31_ctrl/c256/` |
 | 小内核变慢的诱因（6.3、6.4 节） | `bench/gpu_lat6.py` + `run/k31_r25_gputx.sh`、`bench/gpu_lat7.py` + `run/k31_r27_pending.sh`；分析 `tools/k31_gputx_analyze.py` | `results/pcie/gt1`、`pw2`、`pw3`（`pw1_badtiming` 是计时写错的一次） |
 | decode 里关掉重叠调度（6.4 节） | `run/k31_r26_rtvars.sh`（`VARIANTS="noovl:ARGS=--disable-overlap-schedule base:"`，`OP=read` / `write`，调 `k31_r15_decprof2.sh`）；分析 `tools/k31_decprof2_analyze.py` | `results/pcie/rt_base`、`rt_noovl`、`rt_basew`、`rt_noovlw`，`results/rt_vars/` |
+| 接收侧换节点组合（2.5 节） | `microbench/run/mb_rot6.sh`（`ROTS="A:B:C ..."`）、`mb_src9.sh`；分析 `microbench/tools/mb_analyze5.py <dir> A B C` | `microbench/results/c6_B03`（A=04 B=03 C=01）、`c6_B01`（03 / 01 / 02）、`c6_B02`（01 / 02 / 03）、`c9_C02`、`c9_C01`（03 / 04 / 02、01；`c9_C01` 的 IW1 没有起 IO，`c9_C02` 的 base1 有重传，都没用） |
 | 单测和端到端为什么对不上（2.7 节） | `microbench/run/mb_e2e7.sh`（`mb_campaign5.sh`，A=02 B=04 C=01；`ep_local/` 变体加 `EP_LOCAL_BIG_N`）；分析 `microbench/tools/mb_analyze5.py`（`02 04 01`）、`mb_local_analyze.py` | `microbench/results/c7_e2e`、`c7_duty`（`zz_base2_80s_stall` 是那次 80 s 卡顿的基线） |
 | EP 走被堵的网卡（6.4 节） | `microbench/run/mb_numa8.sh`（`RNUMA=remote` / `local`）；分析 `microbench/tools/mb_local_analyze.py --groups 0-3,4-7,8-15` | `microbench/results/c8_numa`、`c8_local` |
 | 跨插槽写的上限（6.1 节） | `bench/gpu_d2h_numa.py` | — |
