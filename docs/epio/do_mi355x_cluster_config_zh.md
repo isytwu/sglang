@@ -9,8 +9,8 @@
 - **这是 DigitalOcean 的 KVM 虚拟机**：GPU 和网卡都是 SR-IOV 的 VF 直通进来的。AINIC 固件里的 QoS、PFC、DCQCN 配置在宿主机的 PF 上，虚拟机里读不到：`dcb` 返回 Operation not supported；`nicctl` 只认 PF，拷进虚拟机运行报 `No AMD NICs detected`。
 - **DCQCN 没有起作用**（第 8 节）：
   - 交换机从来没给我们的包打过 ECN 标记：64 张网卡开机以来收到的 ECN 标记、收发的 CNP 全是 0；加压到接收端一半时间都在发 PFC，也还是 0。包本身带 ECT(0)，不是 ECN 位的问题。
-  - 很可能是因为流量没进交换机配了 ECN 的那个队列：DO 的网卡发出的 PFC 记在优先级 0 上；而 AINIC 的参考配置（smci355，`nicctl` 能看到）是 DSCP 26 → 优先级 3、只在优先级 3 上开 PFC，那边的 PFC 就记在优先级 3 上，ECN 和 CNP 都有几十亿（7.1 节）。
-  - AINIC 上不是没配 QoS：DSCP 26 拥塞时发 PFC、不丢包，DSCP 0 丢包、不发 PFC，网卡确实按 DSCP 分了无损类和有损类，只是无损类看起来在优先级 0 上。
+  - **不是“流量没进无损队列”，而是交换机的无损队列不打 ECN**：在 node01 + node03 → node02 的 2:1 汇聚下扫了 10 个 DSCP（0、8、16、24、26、32、40、46、48、56）。只有 DSCP 26 不丢包，交换机靠 PFC 暂停两台发送端，15 秒里暂停了 8–9 秒；其余都丢包重传，DSCP 48 几乎跑不动。没有一个 DSCP 被打过 ECN 标记（8.5 节）。所以 DSCP 26 已经在交换机唯一的无损队列里，是这个队列没开 ECN，或者 ECN 的门限比 PFC 还高。
+  - AINIC 上也不是没配 QoS：DSCP 26 不丢包、其余 DSCP 丢包，说明网卡和交换机都按 DSCP 区分了无损类和有损类。不过 DO 的网卡发出的 PFC 记在优先级 0 上，而 AINIC 的参考配置（smci355，`nicctl` 能看到）是 DSCP 26 → 优先级 3，那边的 PFC 记在优先级 3 上（7.1 节）；这个差别要请 DO 确认，但它没有破坏无损。
   - 驱动 sysfs 里的 DCQCN 参数是驱动的默认值，不代表固件的配置；固件里 DCQCN 有没有启用，虚拟机里证明不了。QP 默认也没绑定 DCQCN profile（`match_default` 为 0）。
   - 要直接确认，得请 DO 在宿主机上跑 `nicctl show qos` / `nicctl show dcqcn`，并查交换机的队列和 ECN 配置（8.4 节）。
 
@@ -185,7 +185,7 @@ smci355 是我们另一套 MI355X + AINIC 的裸机集群，能用 `nicctl` 直�
 说明了什么：
 - **计数器是可信的**：smci355 配的是优先级 3，PFC 就记在 `tx_pripause_3`。DO 记在优先级 0，说明 DO 的 AINIC 把 DSCP 26 的无损类放在了优先级 0 上，和参考配置不同（前提是 VF 上的计数和 PF 含义一样）。
 - **AINIC 上不是没配**：DO 上 DSCP 26 不丢包、DSCP 0 丢包，网卡确实按 DSCP 分了无损类和有损类，只是无损类的优先级不一样。
-- **交换机侧**：DO 的交换机发来的暂停同时带优先级 0 和 3，我们的流量在交换机上也被当成能暂停的流量，没有丢包。如果交换机只在优先级 3 的队列上开了 ECN，而我们的流量按优先级 0 处理，就进不了那个队列，这和 ECN 一直是 0 对得上。
+- **交换机侧**：DO 的交换机发来的暂停同时带优先级 0 和 3，我们的流量在交换机上也被当成能暂停的流量，没有丢包。8.5 节的 DSCP 扫描进一步表明，DSCP 26 是交换机上唯一的无损类，这个队列在严重拥塞时也不打 ECN，所以“流量进错了队列”的解释站不住。
 - **驱动 sysfs 里的 DCQCN 参数不代表固件配置**：两边的 sysfs 一样，但 smci355 的固件里 CNP 用的是 DSCP 48，sysfs 里写的却是 46。
 
 ## 8. DCQCN 的问题
@@ -219,7 +219,8 @@ DCQCN 的链路是：交换机队列堆起来时给包打 ECN 标记，接收端
 
 1. **交换机不打 ECN 标记**：64 张网卡开机以来收到的 ECN 标记（`rx_rdma_ecn_pkts`）全是 0，收发的 CNP 也全是 0；同期每台都有几百万到上亿个暂停帧，队列显然堆起来过。8.3 的测试里专门造了拥塞，也是 0。
    - 不是包不带 ECT 的问题：网卡发出的 RoCE 包都带 ECT(0)，两种固件都是（第 6、7 节）。
-   - 剩下三种可能，只能在交换机上确认：交换机根本没开 ECN；ECN 只开在优先级 3 的队列上，而我们的流量按优先级 0 处理，进不了那个队列（7.1 节的对比支持这一种）；ECN 的门限比 PFC 的门限还高，PFC 总是先触发。
+   - 也不是流量没进无损队列：8.5 节的扫描里，DSCP 26 就是交换机唯一的无损类，交换机靠 PFC 暂停了发送端一半以上的时间，仍然一个 ECN 标记都没有。
+   - 剩下两种可能，只能在交换机上确认：这个无损队列没开 ECN；或者 ECN 的门限比 PFC 的门限还高，PFC 总是先触发。（ECN 只配给了我们没扫到的 DSCP，也有可能，但扫过的其他 DSCP 全是有损的，可能性不大。）
 2. **QP 没绑定 DCQCN profile**（8.1）：就算有 CNP，发送端也不会降速。这一层在虚拟机里就能改。
 
 ### 8.3 测试
@@ -254,7 +255,27 @@ DCQCN 的链路是：交换机队列堆起来时给包打 ECN 标记，接收端
 4. **验证**：拥塞时接收端 `rx_rdma_ecn_pkts`、`tx_rdma_cnp_pkts` 和发送端 `rx_rdma_cnp_pkts` 都要增长，PFC 暂停时长应该明显下降；每个 QP 的 DCQCN 状态（当前限速）要在宿主机上用 `nicctl show rdma queue-pair --detail` 看。
 5. **还要确认固件真的会降速**：另一套裸机集群（smci355，固件 1.117.5-a-45 / a-77）上，交换机打了 ECN、发送端也收到了 CNP、QP 也绑了 profile，但 QP 的 DCQCN 状态一直是 0，没有降速。这里的 a-147 / a-196 因为没有 ECN 标记，还没法验证。
 
+### 8.5 DSCP 扫描：哪个 DSCP 是无损的，哪个会被打 ECN
+
+2026-11-20 08:54–09:02 UTC，在 node01 + node03 → node02 的 rail 0 上测，三台当时都空闲。
+- **怎么造拥塞**：两台同时用 `ib_write_bw`（1 MiB 消息，每台 4 个 QP，15 s）写进 node02 网卡所在 NUMA 的主机内存。接收端网卡收得动，拥塞全在交换机发往 node02 的那个出口上（2:1 汇聚）。
+- **怎么换 DSCP**：traffic class 取 DSCP × 4，网卡自动加上 ECT(0)，debugfs 里 QP 的 IP TOS 都和预期一致；`match_default` 保持 0。脚本是 [do_cluster/dscp_scan.sh](do_cluster/dscp_scan.sh)。
+
+| DSCP | QP 的 IP TOS | 两台发送端的带宽 | 发送端被交换机暂停（15 s 内） | 每台发送端重传的包 | 接收端收到的 ECN 标记 | CNP |
+|---|---|---|---|---|---|---|
+| 26 | 106 | 各 192 Gb/s，合计接近线速 | 8.2–8.7 s，优先级 0 和 3 同时 | 0 | 0 | 0 |
+| 0、8、16、24、32、40、46、56 | DSCP × 4 + 2 | 各 5.6–8.8 Gb/s | 0 | 约 2.9 亿–3.0 亿（ACK 超时约 3,600–4,400 次） | 0 | 0 |
+| 48 | 194 | 各 0.02 Gb/s | 0 | 约 890 万（ACK 超时约 2,500 次） | 0 | 0 |
+
+- **DSCP 26 是唯一的无损类**：交换机靠 PFC 暂停两台发送端一半以上的时间，一个包都没丢；接收端网卡收得动，没发 PFC，拥塞完全在交换机里。
+- **但这个队列在这么重的拥塞下也一个 ECN 标记都没打**：问题在交换机的无损队列，要么没开 ECN，要么 ECN 的门限比 PFC 还高。
+- **其余 DSCP 都是有损的**：交换机直接丢包，每台发送端 15 秒重传约 3 亿个包，有效带宽只剩几 Gb/s，同样没有 ECN。
+- **DSCP 48 几乎跑不动**：像是被放进了严格优先级、带限速的类。参考配置里，DSCP 48 是给 CNP 用的优先级 6，严格优先级、限速 10 Gbps。数据流量不要放在 DSCP 48 上。
+- DSCP 56 第一次只起来了一路，重跑了一次，表里是重跑的结果；DSCP 26 也重跑了一次，结果一致。
+
 ## 9. 采集方法和原始数据
+
+- DSCP 扫描脚本 [do_cluster/dscp_scan.sh](do_cluster/dscp_scan.sh)：两台发、一台收，单条 rail，按 DSCP 依次跑，记录三台网卡的计数和接收端 QP 的 TOS（8.5 节）。
 
 - QoS / DCQCN 对比脚本 [do_cluster/do_qos_dump.sh](do_cluster/do_qos_dump.sh)：只读，每张网卡每项一行，方便逐台对比（第 6 节）。
 - 采集脚本 [do_cluster/do_cluster_dump.sh](do_cluster/do_cluster_dump.sh)：只读，在每台机器上以 root 运行，输出约 1.6 万行；内容包括系统、DMI、CPU / NUMA / 内存、`lspci -vvv`、`amd-smi static / firmware / partition / topology / xgmi / metric`、`rocm-smi`、KFD 拓扑、amdgpu / ionic 的 modinfo 和模块参数、软件包版本、`ibv_devinfo -v`、路由、每张网卡的 sysfs / debugfs / DCQCN 全部参数 / `ethtool`（`-i -a -m -g -l -c -k -S` 等）。
