@@ -6,11 +6,13 @@
 
 - **8 台的软硬件配置完全一致，只有两处不同**：网卡固件（node01 / 03 / 04 / 07 是 `1.117.5-a-196`，node02 / 05 / 06 / 08 是 `1.117.5-a-147`）和 Docker 版本。
 - **QoS、PFC、DCQCN 的配置 8 台也一致**（第 6 节）：虚拟机里能看到的每一项，64 张网卡都相同；宿主机上的 QoS 看不到，但各台表现一致。
-- **这是 DigitalOcean 的 KVM 虚拟机**：GPU 和网卡都是 SR-IOV 的 VF 直通进来的。QoS、PFC、DCQCN 的 PF 侧配置在宿主机上，虚拟机里读不到（`dcb` 返回 Operation not supported，也没有 `nicctl`）。
-- **DCQCN 没有起作用**，原因有两层（第 8 节）：
-  - 交换机不打 ECN 标记：64 张网卡开机以来收到的 ECN 标记、收发的 CNP 全是 0；加压到接收端一半时间都在发 PFC，也还是 0。
-  - QP 默认没有绑定 DCQCN profile（`match_default` 为 0）。
-  - 网卡这一侧没有问题：RoCE 包都带 ECT(0)，从虚拟机里也能把 QP 绑到 profile 上。所以要让 DCQCN 生效，关键在交换机打开 ECN 标记。
+- **这是 DigitalOcean 的 KVM 虚拟机**：GPU 和网卡都是 SR-IOV 的 VF 直通进来的。AINIC 固件里的 QoS、PFC、DCQCN 配置在宿主机的 PF 上，虚拟机里读不到：`dcb` 返回 Operation not supported；`nicctl` 只认 PF，拷进虚拟机运行报 `No AMD NICs detected`。
+- **DCQCN 没有起作用**（第 8 节）：
+  - 交换机从来没给我们的包打过 ECN 标记：64 张网卡开机以来收到的 ECN 标记、收发的 CNP 全是 0；加压到接收端一半时间都在发 PFC，也还是 0。包本身带 ECT(0)，不是 ECN 位的问题。
+  - 很可能是因为流量没进交换机配了 ECN 的那个队列：DO 的网卡发出的 PFC 记在优先级 0 上；而 AINIC 的参考配置（smci355，`nicctl` 能看到）是 DSCP 26 → 优先级 3、只在优先级 3 上开 PFC，那边的 PFC 就记在优先级 3 上，ECN 和 CNP 都有几十亿（7.1 节）。
+  - AINIC 上不是没配 QoS：DSCP 26 拥塞时发 PFC、不丢包，DSCP 0 丢包、不发 PFC，网卡确实按 DSCP 分了无损类和有损类，只是无损类看起来在优先级 0 上。
+  - 驱动 sysfs 里的 DCQCN 参数是驱动的默认值，不代表固件的配置；固件里 DCQCN 有没有启用，虚拟机里证明不了。QP 默认也没绑定 DCQCN profile（`match_default` 为 0）。
+  - 要直接确认，得请 DO 在宿主机上跑 `nicctl show qos` / `nicctl show dcqcn`，并查交换机的队列和 ECN 配置（8.4 节）。
 
 ## 1. 机器
 
@@ -133,15 +135,16 @@ vm_size=-1 vm_update_mode=-1 vramlimit=-1 wbrf=-1
 | FEC | `ethtool --show-fec` | 相同：RS |
 | DCQCN 8 个 profile 的参数 | `/sys/class/infiniband/ionic_*/dcqcn/profiles/*/roce_{rp,np}/*` | 相同：全部参数拼起来的 md5 都是 `2a08bc7db987`；8 个 profile 之间也相同，取值见 8.1 |
 | DCQCN 绑定 | `dcqcn/match_default`、`dcqcn/match_rules` | 相同：0、空，QP 都不做 DCQCN |
-| 暂停帧的优先级 | `ethtool -S` 的 `tx_pripause_<p>_1us_count`、`rx_pripause_<p>_1us_count` | 相同：发出的暂停只在优先级 0；收到过暂停的 48 张网卡，都是优先级 0 和 3 同时、累计时长完全相等；另外 16 张开机以来没收到过暂停 |
+| 暂停帧的优先级 | `ethtool -S` 的 `tx_pripause_<p>_1us_count`、`rx_pripause_<p>_1us_count` | 相同：发出的暂停只在优先级 0；收到过暂停的 48 张网卡，都是优先级 0 和 3 同时、累计时长完全相等；另外 16 张开机以来没收到过暂停。配置已知的 smci355 上，网卡发出的暂停记在优先级 3（7.1 节） |
 | ECN 标记、CNP | `hw_counters` 的 `rx_rdma_ecn_pkts`、`rx_rdma_cnp_pkts`、`tx_rdma_cnp_pkts` | 开机以来都是 0 |
 | RoCE 包的 ECN 位 | debugfs 里每个 QP 的 `hdr_ip4_tos` | 两种固件都置 ECT(0)：node05 / 06（a-147）上用 TC 104 建的 QP 是 TOS 106；采集时 node05–08 上正在跑的 2,304 个 QP（TC 0）都是 TOS 2，其中 node07 是 a-196 |
 | 网卡固件 | `ethtool -i` | 两种：`1.117.5-a-196`（node01 / 03 / 04 / 07）、`1.117.5-a-147`（node02 / 05 / 06 / 08） |
+| 固件里的 QoS、DCQCN | `nicctl show qos`、`nicctl show dcqcn` | 虚拟机里没装；把 `nicctl` 拷进 node05 试过（2026-11-20），每条命令都报 `No AMD NICs detected`：它只认 PF，VF 上用不了 |
 | 宿主机侧：DSCP → 优先级、PFC 优先级、无损队列、DCQCN 开关 | 要在宿主机上用 `nicctl` | 看不到。从行为看：DSCP 26 是无损类，在 node01–04（K3.1 端到端，有 PFC、几乎不重传）和 node05 / 06（8.3 的测试，PFC 很重、0 重传）上验证过；DSCP 0 是有损类，在 node01–04（K3.1 的 TC 0 对照，2% 重传）上验证过；node07 / 08 没有单独验证 |
 
 ## 7. QoS 和 PFC
 
-**虚拟机里看不到 QoS 配置**：VF 上 `dcb pfc / ets / app / buffer` 都返回 Operation not supported，也没有 `nicctl`。下面是从计数和测试推出来的：
+**虚拟机里看不到 QoS 配置**：VF 上 `dcb pfc / ets / app / buffer` 都返回 Operation not supported；`nicctl` 没装，拷进来运行报 `No AMD NICs detected`。下面是从计数和测试推出来的：
 
 - **DSCP 26（traffic class 104）是无损类**：接收端一跟不上就发 PFC，全程不丢包。**DSCP 0（traffic class 0）是有损类**：接收端跟不上时直接丢包，靠重传。mori 的参考配置是 DSCP 26 / 优先级 3。
 - **暂停帧的优先级**：
@@ -162,6 +165,28 @@ vm_size=-1 vm_update_mode=-1 vramlimit=-1 wbrf=-1
 | node08 | 46,929,909 | 50 s | 175,202 | 1 / 1 s | 111,946,021 | 104,779 | 0 | 0 / 0 |
 
 计数来源：暂停帧和暂停时长来自 `ethtool -S`（`frames_tx_pripause`、`tx_pripause_<p>_1us_count` 等，单位 1 µs），RDMA 相关的来自 `/sys/class/infiniband/ionic_*/ports/1/hw_counters/`。
+
+### 7.1 和配置已知的 AINIC 对比（smci355）
+
+smci355 是我们另一套 MI355X + AINIC 的裸机集群，能用 `nicctl` 直接看网卡固件里的配置（2026-11-20 在其中一台上看的，7 张正常的卡配置相同）。同样的计数放在一起比：
+
+| 项 | smci355（裸机 PF，固件 1.117.5-a-77） | DO（VF，固件 a-147 / a-196） |
+|---|---|---|
+| 分类方式（`nicctl show qos`） | DSCP | 看不到 |
+| DSCP → 优先级 | 26 → 3，48 → 6，其余 → 0 | 看不到 |
+| PFC 不丢包的优先级 | 3（PFC priority bitmap 0x8） | 看不到 |
+| 调度 | 优先级 0 DWRR 10%，3 DWRR 90%，6 严格优先级、限速 10 Gbps | 看不到 |
+| 固件的 DCQCN（`nicctl show dcqcn`） | profile 1 Enabled；CNP 用 DSCP 48 | 看不到 |
+| 网卡发出的 PFC 记在 | `tx_pripause_3`（和配置一致） | `tx_pripause_0` |
+| 每张卡开机以来收到的 ECN 标记 | 约 82 亿–84 亿 | 0 |
+| 每张卡发出 / 收到的 CNP | 约 38 亿–40 亿 / 0.4 亿–0.7 亿 | 0 / 0 |
+| 驱动 sysfs 的 DCQCN | `match_default` 0，profile 1 的 `cnp_dscp` 46 | 一样 |
+
+说明了什么：
+- **计数器是可信的**：smci355 配的是优先级 3，PFC 就记在 `tx_pripause_3`。DO 记在优先级 0，说明 DO 的 AINIC 把 DSCP 26 的无损类放在了优先级 0 上，和参考配置不同（前提是 VF 上的计数和 PF 含义一样）。
+- **AINIC 上不是没配**：DO 上 DSCP 26 不丢包、DSCP 0 丢包，网卡确实按 DSCP 分了无损类和有损类，只是无损类的优先级不一样。
+- **交换机侧**：DO 的交换机发来的暂停同时带优先级 0 和 3，我们的流量在交换机上也被当成能暂停的流量，没有丢包。如果交换机只在优先级 3 的队列上开了 ECN，而我们的流量按优先级 0 处理，就进不了那个队列，这和 ECN 一直是 0 对得上。
+- **驱动 sysfs 里的 DCQCN 参数不代表固件配置**：两边的 sysfs 一样，但 smci355 的固件里 CNP 用的是 DSCP 48，sysfs 里写的却是 46。
 
 ## 8. DCQCN 的问题
 
@@ -184,6 +209,8 @@ vm_size=-1 vm_update_mode=-1 vramlimit=-1 wbrf=-1
 | `roce_rp/dce_tcp_rtt` | 1 | | |
 | `roce_np/cnp_dscp` | 46 | `roce_np/icnp_802p_prio` | 6 |
 
+**这些是驱动里的值，不代表固件的配置**：虚拟机里能看到的只有驱动 sysfs 里的这 8 个 profile。固件里 DCQCN 有没有启用、用哪个 profile、CNP 用哪个 DSCP，要在宿主机上用 `nicctl show dcqcn` 看，VF 上 `nicctl` 用不了。对照：smci355 上 `nicctl show dcqcn` 显示 profile 1 Enabled，参数和上表一样（AI 160、HAI 300、byte count 431068、G 512、初始 alpha 64、token bucket 800000 等），但 CNP 用的是 DSCP 48，它的驱动 sysfs 里也写着 46。
+
 **QP 默认不绑定任何 profile**：`match_default` 是 0，`match_rules` 为空，所以新建的 QP 都用 profile 0，即不做 DCQCN。每个 QP 实际用的 profile 可以在 debugfs 里看：`/sys/kernel/debug/ionic/<bdf>/lif0/rdma/qp/<qpn>/info` 的 `dcqcn_profile`。
 
 ### 8.2 为什么没生效
@@ -192,7 +219,7 @@ DCQCN 的链路是：交换机队列堆起来时给包打 ECN 标记，接收端
 
 1. **交换机不打 ECN 标记**：64 张网卡开机以来收到的 ECN 标记（`rx_rdma_ecn_pkts`）全是 0，收发的 CNP 也全是 0；同期每台都有几百万到上亿个暂停帧，队列显然堆起来过。8.3 的测试里专门造了拥塞，也是 0。
    - 不是包不带 ECT 的问题：网卡发出的 RoCE 包都带 ECT(0)，两种固件都是（第 6、7 节）。
-   - 剩下的可能是交换机的无损队列没开 ECN 标记，或者 ECN 的门限比 PFC 的门限还高、PFC 总是先触发。这只能在交换机上查。
+   - 剩下三种可能，只能在交换机上确认：交换机根本没开 ECN；ECN 只开在优先级 3 的队列上，而我们的流量按优先级 0 处理，进不了那个队列（7.1 节的对比支持这一种）；ECN 的门限比 PFC 的门限还高，PFC 总是先触发。
 2. **QP 没绑定 DCQCN profile**（8.1）：就算有 CNP，发送端也不会降速。这一层在虚拟机里就能改。
 
 ### 8.3 测试
@@ -215,8 +242,10 @@ DCQCN 的链路是：交换机队列堆起来时给包打 ECN 标记，接收端
 
 ### 8.4 怎么让 DCQCN 生效
 
-1. **交换机（必须，需要 DO 的网络侧）**：在无损队列（DSCP 26 所在的优先级）上打开 ECN 标记（WRED + ECN），门限设在 PFC 的 Xoff 之下，让 ECN 先于 PFC 触发；CNP 用 DSCP 46、802.1p 优先级 6，交换机要给它一个高优先级队列。顺便确认第 7 节的暂停优先级：网卡发的暂停在优先级 0、交换机发的暂停同时置 0 和 3。
-2. **宿主机 PF（需要宿主机权限）**：用 `nicctl show qos`、`nicctl show dcqcn` 确认 DSCP → 优先级映射、PFC 优先级、DCQCN profile 是否启用；虚拟机看不到这些。
+1. **先确认配置（需要 DO 的宿主机和网络侧）**：
+   - 宿主机，每张 AINIC 的 PF 上：`nicctl show qos`，看 Classification type、DSCP-to-priority、PFC no-drop priorities、Scheduling；`nicctl show dcqcn`，看 Status 和 CNP 用的 DSCP。参考配置（smci355，7.1 节）：按 DSCP 分类，DSCP 26 → 优先级 3、DSCP 48 → 优先级 6，PFC 不丢包的优先级是 3，DCQCN profile 1 Enabled、CNP 用 DSCP 48。如果 DO 的无损类确实在优先级 0，要么改成和参考配置一致，要么让交换机按同样的优先级处理。
+   - 交换机：DSCP → 队列的映射、PFC 开在哪些优先级、每个队列的 WRED / ECN 配置；拥塞时看每个队列的 ECN 标记和 PFC 计数，确认 DSCP 26 的流量进了哪个队列。另外查一下为什么交换机发出的暂停同时置了优先级 0 和 3。
+2. **交换机打开 ECN**：在承载 DSCP 26 的无损队列上打开 ECN 标记（WRED + ECN），门限设在 PFC 的 Xoff 之下，让 ECN 先于 PFC 触发；CNP 的 DSCP（参考配置是 48，对应优先级 6）要进一个高优先级队列。
 3. **虚拟机**：在应用建 QP 之前把 QP 绑到一个 profile。
    - 全部绑：`for d in /sys/class/infiniband/ionic_*; do echo 1 > $d/dcqcn/match_default; done`
    - 按优先级绑：写 `match_rules`，例如 `prio 0x8 1`（优先级掩码 0x8 即优先级 3 → profile 1）。
