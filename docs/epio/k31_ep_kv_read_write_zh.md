@@ -553,6 +553,18 @@ EP 在每步里的占比没有变大（内核也一起变长了），但每步�
 - **代价在 IO 自己**：TC 0 不发 PFC，交换机直接丢包。2:1 时两个来源各重传约 18 GB/s（约一成）；3:1 时丢得更多，node04 入口只剩 169 GB/s。READ 在途量有上限，不丢包。
 - **跨 NUMA 那部分不受影响**（J3，+11.7%）：那是主机上 PCIe 往另一颗 CPU 内存写的上限，和网络里的队列无关。
 
+**按这个方式部署的验证**（`TCMODE=io0`：真实的 KV 传输和 UMBP 走 TC 0，EP 和 NCCL 留在 TC 104；decode 不开 radix cache，`k31_ep512_2p_io0nrc`）：
+
+| | io0 | 全部 TC 104 |
+|---|---|---|
+| 注入前每步 | 236.5 ms | 236.6 ms |
+| 7.7 节的真实 KV（短请求 → 加上 32k 前缀的长请求） | 216.1 → 224.5 ms，没有重传，8,569 个长请求没有出错 | 216.3 → 224.0 ms |
+| 2:1 incast 写 GPU 显存（IO 在 TC 0） | +0.2% | +14.7%（I1） |
+| 3:1（含 node03，IO 在 TC 0） | +2.7% | +38.7%（I4） |
+| 同样的 2:1，IO 放回 TC 104 | +14.7% | — |
+
+平时不吃亏，真实的 KV 走有损类也不丢包、不出错；有 incast 时 EP 不受影响；IO 一回到 EP 的类，影响原样回来。
+
 ### 7.5 EP 也放进有损类（整套栈 TC 0）
 
 **怎么测**：整套栈重启，EP、KV、NCCL 都用 TC 0（`TCMODE=0`），其余同 7.3；注入的 IO 用 TC 0，最后一段（K6）IO 改回 TC 104。注入前每步 236.0 ms：没有 IO 时，EP 放在有损类不吃亏。
@@ -611,7 +623,7 @@ node04 在 11-19 19:27 UTC 失联（宿主机侧 GPU / 网卡的 VF 故障，见
 - 在 EP16 上，"IO 让 EP 慢很多"要两个条件同时满足：**IO 在某台 decode 的入口形成 incast**（多个来源同时打进来，或者接收方排不出去），**而且 EP 没有和 IO 分开**。EP 和 IO 同在无损类时 decode 每步慢 15%～39%；EP 在有损类时慢 1.3–3.7 倍。只有一个来源时，即使 IO 跑满、EP 流量大了 3 倍，也只有 1%～3%。
 - MoRI 默认不设 traffic class（`MORI_RDMA_TC`、`MORI_IO_TC` 都不设时是 0）。如果 EP 和 IO 都用默认值，而网络上 0 是有损类（这套集群就是），一旦有 IO 在 decode 的入口形成 incast，就是 K1 / K4 那种情况。值得确认 Moonshot 那边：EP 和 KV / 其他 IO 用的 TC、那个 TC 在交换机上是不是无损，以及掉速时 decode 入口有多大的 IO（我们这里 KV 本身每台只有几 GB/s，见 7.7 节）。
 - EP32 下每台 decode 要同时收另外 3 台的 EP（EP16 时只有 1 台），EP 本身就在入口形成 incast，更容易碰到这种情况。这是推测，没有在 EP32 上测过。
-- **对部署**：EP 放在无损类（这套集群是 DSCP 26 / TC 104），KV 等 IO 放到另一个类。这里只有一个无损类，IO 放 TC 0 也能保护 EP，代价是 IO 在 incast 时丢包重传。
+- **对部署**：EP 放在无损类（这套集群是 DSCP 26 / TC 104），KV 等 IO 放到另一个类（MoRI 里 EP 读 `MORI_RDMA_TC`，MoRI IO 先读 `MORI_IO_TC`）。这里只有一个无损类，IO 放 TC 0 也能保护 EP，代价是 IO 在 incast 时丢包重传；按这个方式整套跑过（7.4 节最后），平时没有代价。另一台 decode 发出的 IO 仍会和它自己的 EP 在网卡出口抢带宽（7.6 节），decode 节点最好不要当大流量 IO 的来源。
 
 ## 附录：数据和脚本
 
@@ -632,5 +644,5 @@ node04 在 11-19 19:27 UTC 失联（宿主机侧 GPU / 网卡的 VF 故障，见
 | EP 走被堵的网卡（6.4 节） | `microbench/run/mb_numa8.sh`（`RNUMA=remote` / `local`）；分析 `microbench/tools/mb_local_analyze.py --groups 0-3,4-7,8-15` | `microbench/results/c8_numa`、`c8_local` |
 | 跨插槽写的上限（6.1 节） | `bench/gpu_d2h_numa.py` | — |
 | 注入工具（READ / WRITE） | `bench/io_inject.py`（`--op read`） | — |
-| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`、`k31_ep512_2p_tc0_lgrw`（整套 TC 0）、`k31_ep512_b_lgrw`（decode 02 + 03，`run/k31_r33_3node_chain.sh`）、速率扫描 `k31_ep512_2pc_lgrw`（`run/k31_r36_4node.sh`）和 `k31_ep512_c_lgrw`（`run/k31_r35_3node_b.sh`），真实 KV `results/mix/k31_ep512_2p_nrc_p32000`、`k31_ep512_b`、`k31_ep512_c_p32000`（`run/k31_r31_mix.sh`，分析 `tools/k31_mix_analyze.py`），网卡计数 `results/netmon_r29/`。node04 19:27 UTC 失联：上一次启动的内核日志里先是 GPU 0000:ab:00.0 `Doesn't get TRN_MSG_ACK from pf`，两分钟后同一个 PCIe 交换芯片下的网卡 0000:ac:00.0 `ionic_adminq_wait: context not initialized`，是 VF 和宿主机 PF 之间的通信断了；19:50 被重启，进了新装的 6.8.0-149 内核（没有 ionic RDMA 驱动），用 `grub-reboot` 回到 6.8.0-137 后恢复 |
+| 高 EP 流量（第 7 节） | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC）、`run/k31_r29_2p_chain.sh`、`run/k31_netsample.sh`；分析 `tools/k31_lgrw_analyze.py <dir> 03,04`、`tools/k31_netwin.py <dir> results/netmon_r29` | `results/pcie/k31_ep512_1p_lgrw`、`k31_ep512_2p_lgrw`、`k31_ep512_2p_lgrw_ioTC0`、`k31_ep512_2p_tc0_lgrw`（整套 TC 0）、`k31_ep512_2p_io0nrc_lgrw`（io0，`run/k31_r36_4node.sh`）、`k31_ep512_b_lgrw`（decode 02 + 03，`run/k31_r33_3node_chain.sh`）、速率扫描 `k31_ep512_2pc_lgrw`（`run/k31_r36_4node.sh`）和 `k31_ep512_c_lgrw`（`run/k31_r35_3node_b.sh`），真实 KV `results/mix/k31_ep512_2p_nrc_p32000`、`k31_ep512_2p_io0nrc_p32000`（io0）、`k31_ep512_b`、`k31_ep512_c_p32000`（`run/k31_r31_mix.sh`，分析 `tools/k31_mix_analyze.py`），网卡计数 `results/netmon_r29/`。node04 19:27 UTC 失联：上一次启动的内核日志里先是 GPU 0000:ab:00.0 `Doesn't get TRN_MSG_ACK from pf`，两分钟后同一个 PCIe 交换芯片下的网卡 0000:ac:00.0 `ionic_adminq_wait: context not initialized`，是 VF 和宿主机 PF 之间的通信断了；19:50 被重启，进了新装的 6.8.0-149 内核（没有 ionic RDMA 驱动），用 `grub-reboot` 回到 6.8.0-137 后恢复 |
 | 图 | `tools/k31_doc2_figs.py`、`tools/k31_doc3_figs.py`、`tools/k31_doc3_tcfig.py`（第 7 节） | — |
