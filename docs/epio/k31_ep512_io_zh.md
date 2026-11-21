@@ -118,6 +118,9 @@ load_gen 重启后的头几分钟 batch 会起伏，有几组的第一段 batch 
 
   来源里有另一台 decode 时每档都更重一点（第 7 节的原因）。两台 decode 同时被 2:1 打（两个方向的 EP 都排队），和只打一台差不多（+15.0%）；来源里有另一台 decode 时 +21.2%。
 
+  在网卡都正常的另一组节点上复测（11-21，prefill node04，decode node01 + node02，`k31_ep512_e8`）：node04 加另一台 decode node01 打 node02，入口每卡 21 / 38 / 48.5 GB/s（线速的 42% / 76% / 97%）时每步 +3.8% / +12.0% / +15.9%；一个来源（node04 → node02）+1.2%，只有另一台 decode 当来源 +3.4%，和上面一致。
+- **EP 再翻倍（qlen 16）没测成**：在同一组节点上把每个请求每步验证的 token 加到 16（EP 流量约翻倍），这个版本跑几分钟后有内核启动失败（`too many resources requested for launch`），decode 退出，注入的几段没有数据（`k31_ep512_e16`；之前在 node03 + node04 上那次是 `no kernel image is available`）。只拿到了基线：每步 400 ms，单次 dispatch / combine 202 / 389 µs，每步 EP 加集合通信 152 ms（qlen 8 时 237 ms、135 / 171 µs、77 ms）。
+
 ## 6. 写进另一个 NUMA 的主机内存：一个来源就慢
 
 **结论**：IO 写进 decode 另一个 NUMA 的主机内存时，不需要 incast，一个来源就让每步慢 11%～15%。这是主机上的问题，大头是 GPU 本地计算变慢，EP 单次只多 40%～60%，换流量类也没用。
@@ -145,7 +148,7 @@ load_gen 重启后的头几分钟 batch 会起伏，有几组的第一段 batch 
 - **同一次里两个来源打 node02**（网卡都是 x16）：+12.6%，node02 几乎不发 PFC，和第 5 节一样。
 - **为什么**：x4 的网卡收进来的数据写不进 GPU 显存，只能发 PFC 让交换机停发；经过这两张网卡的 EP（GPU 4、6 那两条 rail）也被一起停住，而 EP16 每一步都要等最慢的 rank。这和第 6 节写另一个 NUMA 是同一类：接收端排不出去。
 - 归结起来，网络上让 EP 明显变慢的条件是"decode 的入口满了"：要么多个来源一起打进来（第 5 节），要么接收端排不出去（第 6 节和这一节）。
-- 链路宽度在虚拟机里改不了，要宿主机侧处理；这之后的测试没有再用 node03 当 decode。
+- 链路宽度在虚拟机里改不了，要宿主机侧处理；这之后的测试没有再用 node03 当 decode。换到网卡都正常的 node01 + node02 当 decode 后，基线每步回到 237 ms（第 5 节的复测），说明那 6% 也是这两张网卡造成的。
 
 ## 9. 流量类：决定 incast 有多伤
 
@@ -273,6 +276,7 @@ load_gen 重启后的头几分钟 batch 会起伏，有几组的第一段 batch 
 |---|---|---|
 | 起环境 + 预跑 + 注入时段 | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16` / `1p_ep16b`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC；`D_EXTRA_ARGS` 只给 decode 加参数）；编排 `run/k31_r29_2p_chain.sh`、`k31_r33_3node_chain.sh`、`k31_r35_3node_b.sh`、`k31_r36_4node.sh`；分析 `tools/k31_lgrw_analyze.py <dir> D0,D1`（标出 batch 掉了 10% 以上的时段） | `results/pcie/` 下：`k31_ep512_1p_lgrw`（一个来源，1P）、`k31_ep512_2p_lgrw`（2P，TC 104）、`k31_ep512_2pc_lgrw` 和 `k31_ep512_c_lgrw`（速率扫描）、`k31_ep512_2p_lgrw_ioTC0` 和 `k31_ep512_2p_io0nrc_lgrw`（IO 走 TC 0、io0）、`k31_ep512_2p_tc0_lgrw`（整套 TC 0）、`k31_ep512_b_lgrw`（decode 02 + 03） |
 | 网卡计数（PFC 暂停时间、RDMA 收发 / 重传字节，每 2 s） | `run/k31_netsample.sh`；按时段切 `tools/k31_netwin.py <dir> results/netmon_r29`（暂停时间是 8 张卡合计，表里除以 8） | `results/netmon_r29/` |
+| 网卡都正常的节点上复测、qlen 16（第 5 节） | `run/k31_r41_q8q16.sh`（`TOPO=1p_ep16e`：prefill node04，decode node01 + node02） | `results/pcie/k31_ep512_e8_lgrw`，`results/k31_ep512_e16/`（qlen 16 只有基线） |
 | 发送方组合、接收端排不出去（第 5、8 节） | `run/k31_r39_chain.sh` stage C（`TOPO=2p_ep16d`） | `results/pcie/k31_ep512_2pd_lgrw`，网卡计数 `results/netmon_r39/` |
 | 自然流量（第 2 节） | `bench/load_gen.py --prefix --seed-base`、`run/k31_r31_mix.sh`（`PROF=1` 两段各抓一份 trace）、`run/k31_r38_nat.sh`；分析 `tools/k31_mix_analyze.py`、`tools/k31_prof_cmp.py` | `results/mix/k31_ep512_nat1p_p32000`、`k31_ep512_2p_nat_p32000`（含 `traces/`，网卡计数 `results/netmon_r39/`，`run/k31_r39_chain.sh` stage A）、`k31_ep512_2p_nrc_p32000`、`k31_ep512_2p_io0nrc_p32000`、`k31_ep512_c_p32000`、`k31_ep512_b` |
 | 流量类 | `run/k31_env.sh` 的 `TCMODE=104 / 0 / io0`（io0：`MORI_IO_TC=0`，`MORI_RDMA_TC=104`，`NCCL_IB_TC=104`），`run/k31_umbp.sh` | — |
