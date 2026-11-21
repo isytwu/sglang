@@ -13,7 +13,7 @@ Moonshot 看了前两轮，认为我们的 EP 流量太小：他们在 EP32、�
 
 ### 自然流量：没有观察到 KV 让 EP 变慢
 
-- 只用真实的 PD 流量（不注入），换成最能让 KV 变多的多轮长上下文请求（32k 前缀反复发、decode 不开 radix cache），前后对比：EP 单次 dispatch / combine 有涨有跌、都在 ±10% 以内，每步的 EP 时间不变（约 40 ms），decode 每步只差 0.3%（第 2 节）。
+- 只用真实的 PD 流量（不注入），换成最能让 KV 变多的多轮长上下文请求（32k 前缀反复发、decode 不开 radix cache），1P 和 2P 各测一次：EP 单次 dispatch / combine 有涨有跌、都在 ±10% 以内，每步的 EP 时间不变（35–40 ms）。2P 时同样的 batch 下每步慢 3.5%～5.6%，但 EP 和 GPU 内核时间都没变，不是 EP 变慢（第 2 节）。
 - 原因是 KV 的量太小：decode 每台收到的 KV 只有约 1 GB/s（短请求）到约 5 GB/s（2P、多轮长上下文），而注入测试里 IO 要到每台约 180 GB/s 才开始有可见的影响。K3.1 每个 token 的 KV 很小，KV 的量又被请求速率限住。
 
 ### 注入：什么情况下 IO 会让 EP 变慢
@@ -48,25 +48,28 @@ decode 在 node03 + node04（node04 失联时换成 node02 + node03），EP16：
 
 ## 2. 自然流量：KV 传输有没有让 EP 变慢
 
-**结论：没有观察到。** 只有真实的 PD 流量时，把 KV 加到最多的情况下，EP 单次耗时和每步的 EP 时间都没有变化，decode 每步只差 0.3%。
+**结论：没有观察到。** 只有真实的 PD 流量时，把 KV 加到最多的情况下，1P 和 2P 的 EP 单次耗时、每步的 EP 时间都没有变化。
 
 **怎么测**：不注入，只用真实的 PD 流量。先跑 448 路短请求（输入 3,000、输出 1,500），300 s 后加 64 路"多轮长上下文"的请求：每一路固定一段 32,000 token 的前缀，每次只换后面 512 个 token、输出 16 个 token。prefill 命中前缀缓存、只算 512 个新 token，decode 却要收整段 32,512 token 的 KV，是能让 KV 变多的最坏情况。decode 不开 radix cache：开着时 decode 自己也命中前缀，只补传新增的部分，KV 几乎不变（实测每台 12.5 → 13.1 GB/s）。两段各抓一次 10 步的 decode trace，比较 EP 单次耗时，同时采网卡计数。
 
 **结果**：
 
-- **EP 没有变化**（1P，decode node02 + node03，`k31_ep512_nat1p`；两段各一份 10 步 trace，取 node02 TP0 和 node03 TP8）：
+- **EP 没有变化**。1P（prefill node01，decode node02 + node03，`k31_ep512_nat1p`）和 2P（prefill node01 + node02，decode node03 + node04，`k31_ep512_2p_nat`）各跑一次，两段各抓一份 10 步 trace，取两台 decode 各一个 rank：
 
-| | 只有短请求 | 加上长上下文请求 |
+| | 1P：只有短请求 → 加上长上下文 | 2P：只有短请求 → 加上长上下文 |
 |---|---|---|
-| 单次 dispatch（µs，TP0 / TP8） | 179 / 199 | 172 / 210 |
-| 单次 combine（µs，TP0 / TP8） | 177 / 172 | 181 / 151 |
-| 每步 EP 时间（dispatch + combine + 其他，ms，TP0 / TP8） | 39.6 / 40.8 | 39.6 / 37.7 |
-| 每步内核时间（ms） | 237 | 238 |
-| 每步 GPU 时间（step probe 中位数 / p90，ms） | 230.6 / 237.1 | 231.3 / 245.4 |
+| 长请求每秒完成 | 约 4.9 个 | 约 15 个 |
+| decode 每台入口流量 | 没采 | 11.6 → 15.3 GB/s（KV 多约 3.7 GB/s，线速的 1%） |
+| 单次 dispatch（µs，两个 rank） | 179 → 172，199 → 210 | 194 → 189，186 → 189 |
+| 单次 combine（µs，两个 rank） | 177 → 181，172 → 151 | 167 → 159，179 → 175 |
+| 每步 EP 时间（ms，两个 rank） | 39.6 → 39.6，40.8 → 37.7 | 35.1 → 34.5，35.2 → 36.3 |
+| 每步 GPU 内核时间（ms） | 237 → 238 | 232 → 229 |
+| 每步耗时（step probe 中位数） | 230.6 → 231.3 ms | 230.2 → 243.4 ms（batch 224 → 230） |
 
-  变化都在 ±10% 以内、有涨有跌，没有方向性；每步多出的不到 1 ms 来自注意力和其他内核（batch 里多了几十个带 32k 上下文的请求），不是 EP。
-- **KV 的量**：2P 时（`k31_ep512_2p_nrc`，长请求每秒完成 14 个）decode 每台收到的流量从 12.2 涨到 16.1 GB/s，多出约 4 GB/s，是线速的 1%；只有短请求时这 12.2 GB/s 里 EP（另一台 decode 发来的）约 11.4 GB/s，KV 约 1 GB/s。2P 那次每步 216 → 224 ms（+3.6%），没有抓 trace，同样有长上下文让注意力变重的部分。这次 1P 长请求每秒完成约 5 个，KV 按比例每台多约 1.3 GB/s（这次没有采网卡计数）。
-- 2P 那次的网卡计数里没有 PFC、没有重传。1P 这次长请求完成 2,933 个、超时 13 个（prefill 只有一台，排队）。
+  EP 的数字变化都在 ±10% 以内，有涨有跌；GPU 内核时间也没变。
+- **2P 每步慢的那部分不在 EP 上**：同样 batch 224 时每步 230 → 238–243 ms（+3.5%～+5.6%），但 trace 里 EP 和 GPU 内核时间都没变；多出来的不在 GPU 上，像是 CPU 侧为 32k 上下文的请求做调度的开销（没有细查）。
+- **网络上**：2P 时 decode 发出的 PFC 从每张网卡约 1.6 ms/s 涨到约 8 ms/s（两台 prefill 的 KV 偶尔同时到），没有重传。只有短请求时，decode 入口的 11.6 GB/s 里 EP（另一台 decode 发来的）约 10.7 GB/s，KV 约 1 GB/s。
+- 1P 那次长请求完成 2,933 个、超时 13 个（prefill 只有一台，排队）；2P 全部完成（8,988 个）。
 
 **为什么 KV 这么少**：每个 32k 的长请求给 decode 带来约 0.55 GB，K3.1 每个 token 的 KV 很小；KV 的量由请求速率决定，而请求速率又被 decode 自己的吞吐限住（每个请求都要在 decode 上跑完它的输出）。第二轮的 AgentX 自然流量里，KV 流入每台的 100 ms p99 也只有 62 GB/s，流入 20–100 GB/s 的步只慢 0.25%～0.5%（第二轮第 5 节）。注入测试里，IO 要到每台约 180 GB/s（入口线速的四成多）才开始有可见的影响（第 5 节），比自然流量高一个数量级以上。
 
@@ -242,7 +245,7 @@ load_gen 重启后的头几分钟 batch 会起伏，有几组的第一段 batch 
 |---|---|---|
 | 起环境 + 预跑 + 注入时段 | `run/k31_r28_ep512.sh`（`TOPO=1p_ep16` / `2p_ep16` / `1p_ep16b`，调 `k31_up.sh`、`k31_r22_lg_rw.sh`；`WINSPEC` 自定义时段，第 8 个字段是 IO 的 TC；`D_EXTRA_ARGS` 只给 decode 加参数）；编排 `run/k31_r29_2p_chain.sh`、`k31_r33_3node_chain.sh`、`k31_r35_3node_b.sh`、`k31_r36_4node.sh`；分析 `tools/k31_lgrw_analyze.py <dir> D0,D1`（标出 batch 掉了 10% 以上的时段） | `results/pcie/` 下：`k31_ep512_1p_lgrw`（一个来源，1P）、`k31_ep512_2p_lgrw`（2P，TC 104）、`k31_ep512_2pc_lgrw` 和 `k31_ep512_c_lgrw`（速率扫描）、`k31_ep512_2p_lgrw_ioTC0` 和 `k31_ep512_2p_io0nrc_lgrw`（IO 走 TC 0、io0）、`k31_ep512_2p_tc0_lgrw`（整套 TC 0）、`k31_ep512_b_lgrw`（decode 02 + 03） |
 | 网卡计数（PFC 暂停时间、RDMA 收发 / 重传字节，每 2 s） | `run/k31_netsample.sh`；按时段切 `tools/k31_netwin.py <dir> results/netmon_r29`（暂停时间是 8 张卡合计，表里除以 8） | `results/netmon_r29/` |
-| 自然流量（第 2 节） | `bench/load_gen.py --prefix --seed-base`、`run/k31_r31_mix.sh`（`PROF=1` 两段各抓一份 trace）、`run/k31_r38_nat.sh`；分析 `tools/k31_mix_analyze.py`、`tools/k31_prof_cmp.py` | `results/mix/k31_ep512_nat1p_p32000`（含 `traces/`）、`k31_ep512_2p_nrc_p32000`、`k31_ep512_2p_io0nrc_p32000`、`k31_ep512_c_p32000`、`k31_ep512_b` |
+| 自然流量（第 2 节） | `bench/load_gen.py --prefix --seed-base`、`run/k31_r31_mix.sh`（`PROF=1` 两段各抓一份 trace）、`run/k31_r38_nat.sh`；分析 `tools/k31_mix_analyze.py`、`tools/k31_prof_cmp.py` | `results/mix/k31_ep512_nat1p_p32000`、`k31_ep512_2p_nat_p32000`（含 `traces/`，网卡计数 `results/netmon_r39/`，`run/k31_r39_chain.sh` stage A）、`k31_ep512_2p_nrc_p32000`、`k31_ep512_2p_io0nrc_p32000`、`k31_ep512_c_p32000`、`k31_ep512_b` |
 | 流量类 | `run/k31_env.sh` 的 `TCMODE=104 / 0 / io0`（io0：`MORI_IO_TC=0`，`MORI_RDMA_TC=104`，`NCCL_IB_TC=104`），`run/k31_umbp.sh` | — |
 | 图 | `tools/k31_doc3_figs.py`、`tools/k31_doc3_tcfig.py` | — |
 
