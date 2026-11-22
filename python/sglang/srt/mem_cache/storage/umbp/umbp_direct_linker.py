@@ -5,7 +5,7 @@ import os
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any, Callable
 
 import numpy as np
@@ -42,6 +42,8 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+# Pending removals beyond this are dropped: the store has stopped answering.
+_REMOVE_QUEUE_LIMIT = 1024
 
 
 def _storage_suffix(
@@ -198,6 +200,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
+        # Set once the client turns out to have batch_remove.
+        self.supports_remove = False
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -299,6 +303,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     "(both scratch arenas must be non-zero), and note that a "
                     "read-only SharedSSDFollower is whole-object by design."
                 )
+            self.supports_remove = callable(getattr(client, "batch_remove", None))
             get_backend_mode = getattr(client, "get_backend_mode", None)
             self.backend_mode = (
                 get_backend_mode() if callable(get_backend_mode) else None
@@ -352,7 +357,20 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
+            # removed / remove_keys is how many objects asked to go were stored.
+            "remove_keys": 0,
+            "removed": 0,
+            "remove_failures": 0,
+            "remove_dropped": 0,
         }
+        self._remove_queue: Queue[list[PoolTransfer] | None] = Queue(
+            maxsize=_REMOVE_QUEUE_LIMIT
+        )
+        self._remove_thread = threading.Thread(
+            target=self._remove_thread_func,
+            daemon=True,
+            name=f"umbp-remove-tp{tp_rank}",
+        )
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -366,6 +384,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
+        if self.supports_remove:
+            self._remove_thread.start()
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -982,6 +1002,46 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self._offload_results.get_nowait()
 
+    def remove(self, transfers: list[PoolTransfer]) -> None:
+        try:
+            self._remove_queue.put_nowait(transfers)
+        except Full:
+            self._stats["remove_dropped"] += 1
+
+    def _remove_thread_func(self) -> None:
+        while True:
+            batch = [self._remove_queue.get()]
+            while True:
+                try:
+                    batch.append(self._remove_queue.get_nowait())
+                except Empty:
+                    break
+            try:
+                keys = []
+                for transfers in batch:
+                    if transfers is None:
+                        continue
+                    # A state-only removal names no KV pages.
+                    for transfer in self.pool_group.resolve_transfers(
+                        transfers, allow_partial=True, allow_missing_kv=True
+                    ):
+                        object_keys, _ = self._object_keys_for_pages(
+                            list(transfer.keys), transfer
+                        )
+                        keys.extend(object_keys)
+                if keys:
+                    self._stats["removed"] += self.storage.client.batch_remove(keys)
+                    self._stats["remove_keys"] += len(keys)
+            except Exception:
+                self._stats["remove_failures"] += 1
+                failures = self._stats["remove_failures"]
+                if failures == 1 or failures % 1000 == 0:
+                    logger.warning(
+                        "UMBP remove failed (%d so far)", failures, exc_info=True
+                    )
+            if None in batch:
+                return
+
     def reset(self) -> None:
         self._pending.clear()
         self._load_queue.join()
@@ -998,6 +1058,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return
         self.reset()
         for thread, queue in (
+            (self._remove_thread, self._remove_queue),
             (self._offload_thread, self._offload_queue),
             (self._load_thread, self._load_queue),
         ):
