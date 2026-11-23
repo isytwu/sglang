@@ -120,19 +120,44 @@ iob_stop() {
 # workers are pinned to, and ConstrainCores=no lets them move). Every call gets its own port block.
 INJ_PIDS=()
 INJ_SEQ=$((RANDOM % 20))
+# inj_prerecv <outdir> <IOTC> <nodes...>: io_inject receivers started once (before the decode) on port block 33400 and
+# kept for the run; inj_start then starts only the senders towards those nodes, so no process allocates or registers
+# GPU memory on them mid-run (the EP32 decode e1m_7005 hung the moment a window's receivers came up, before any IO).
+# INJ_NOPRE=1 makes an inj_start bring up fresh receivers anyway.
+declare -A INJ_PRE=()
+INJ_PRE_PIDS=()
+inj_prerecv() {
+    local od=$1 iotc=$2 n; shift 2
+    for n in "$@"; do
+        mkdir -p "$od/$n"
+        INJ_PRE_PIDS+=("$(cxbg "$n" "$od/$n/recv.log" "MB_MORI=pr996 IOTC=$iotc bash $W/mb/py.sh $W/mb/io_inject.py recv --devs 0-7 --port-base 33400 ${INJ_PMEM:---mem gpu} --buf-gb ${INJ_BUF_GB:-1} --serve-forever --accept-timeout 36000 --out $od/$n")")
+        INJ_PRE[$n]=33400
+    done
+}
 inj_start() {
     local od=$1 iotc=$2 op=$3 ini=$4 pas=$5; shift 5
     local pb=$((32000 + (INJ_SEQ % 40) * 20)) sargs="$*"
     INJ_SEQ=$((INJ_SEQ + 1))
     mkdir -p "$od/inj"
-    INJ_PIDS+=("$(cxbg "$pas" "$od/inj/recv.log" "MB_MORI=pr996 IOTC=$iotc ${INJ_PTASK:-} bash $W/mb/py.sh $W/mb/io_inject.py recv --devs 0-7 --port-base $pb ${INJ_PMEM:---mem gpu} --buf-gb ${INJ_BUF_GB:-1} --serve-forever --accept-timeout 3600 --out $od/inj/recv")")
-    sleep 20
+    if [ -n "${INJ_PRE[$pas]:-}" ] && [ -z "${INJ_NOPRE:-}" ] && [ "$op" = write ]; then
+        pb=${INJ_PRE[$pas]}
+    else
+        INJ_PIDS+=("$(cxbg "$pas" "$od/inj/recv.log" "MB_MORI=pr996 IOTC=$iotc ${INJ_PTASK:-} bash $W/mb/py.sh $W/mb/io_inject.py recv --devs 0-7 --port-base $pb ${INJ_PMEM:---mem gpu} --buf-gb ${INJ_BUF_GB:-1} --serve-forever --accept-timeout 3600 --out $od/inj/recv")")
+        sleep 20
+    fi
     INJ_PIDS+=("$(cxbg "$ini" "$od/inj/send.log" "MB_MORI=pr996 IOTC=$iotc bash $W/mb/py.sh $W/mb/io_inject.py send --op $op --peer ${CTL[$pas]} --devs 0-7 --port-base $pb ${INJ_IMEM:---mem gpu} --buf-gb ${INJ_BUF_GB:-1} $sargs --out $od/inj/send")")
 }
+# inj_stop <nodes...>: io_inject on those nodes, except the receivers inj_prerecv started
 inj_stop() {
-    for n in "$@"; do hx "$n" "pkill -INT -u \$(id -u) -f '[i]o_inject.py'; true"; done
-    sleep 3
-    for n in "$@"; do hx "$n" "pkill -9 -u \$(id -u) -f '[i]o_inject.py'; true"; done
+    local n sig pat
+    for sig in INT 9; do
+        for n in "$@"; do
+            pat='[i]o_inject.py'
+            [ -n "${INJ_PRE[$n]:-}" ] && pat='[i]o_inject.py (send|recv .*--port-base 3[0-2])'
+            hx "$n" "pkill -$sig -u \$(id -u) -f '$pat'; true"
+        done
+        [ $sig = INT ] && sleep 3
+    done
     for p in "${INJ_PIDS[@]}"; do kill "$p" 2> /dev/null; done
     INJ_PIDS=()
 }

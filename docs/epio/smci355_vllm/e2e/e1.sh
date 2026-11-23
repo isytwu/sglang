@@ -28,14 +28,20 @@ PROF_URLS=$(for n in "${DN[@]}"; do printf '%s:8000 ' "$n"; done)
 PIDS=()
 cleanup() {
     inj_stop "${DN[@]}" "$C"
-    for p in "${PIDS[@]}"; do kill "$p" 2> /dev/null; done
+    for p in "${PIDS[@]}" "${INJ_PRE_PIDS[@]}"; do kill "$p" 2> /dev/null; done
     sleep 10
-    for n in "${DN[@]}" "$C"; do hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[l]oadgen.py|[V]LLM::'; true"; done
+    for n in "${DN[@]}" "$C"; do hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[l]oadgen.py|[V]LLM::|[i]o_inject.py'; true"; done
     fab_stop "$OUT" "${DN[@]}" "$C"
 }
 trap cleanup EXIT
 wait_idle 180 "${DN[@]}" "$C" || exit 1
 fab_start "$OUT" "${DN[@]}" "$C"
+# PRE_RECV=1: the IO windows' write receivers come up on the targets before the decode does (mb/lib.sh inj_prerecv)
+if [ -n "${PRE_RECV:-}" ]; then
+    inj_prerecv "$OUT/prerecv" "$IOTC" ${TARGETS:-$DECODE}
+    sleep 40
+    ev prerecv "${TARGETS:-$DECODE}"
+fi
 
 SX="SPEC_K=$SPEC_K DP_SIZE=${#DN[@]} PROFILE_DIR=$OUT/prof PROFILE_ITERS=${PROFILE_ITERS:-20} RAIL_ALIGN=${RAIL_ALIGN:-0} ${SERVE_ENV:-}"
 # a server that exits before every rank is ready (the EP32 e1m_6867: one TP worker of DP0 gone with exit code 255 a
@@ -64,7 +70,8 @@ for try in $(seq 1 "${SERVE_TRIES:-2}"); do
     for p in "${SPIDS[@]}"; do kill "$p" 2> /dev/null; done
     sleep 10
     for n in "${DN[@]}"; do hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[V]LLM::'; true"; mv "$OUT/serve_$n.log" "$OUT/serve_$n.try$try.log"; done
-    wait_idle 300 "${DN[@]}" || exit 1
+    # the pre-started receivers hold the GPUs too, so wait_idle (no KFD process) would never pass
+    if [ -n "${PRE_RECV:-}" ]; then sleep 60; else wait_idle 300 "${DN[@]}" || exit 1; fi
 done
 ev serve_ready "$(( $(date +%s) - t0 ))s"
 

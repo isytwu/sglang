@@ -11,11 +11,13 @@
 | B | **真实 PD**（MoRIIO READ）加高批量合成负载，再加注入 | 4（1P）或 5（2P） | 每段 30–50 分钟 | **注入部分能**；自然 KV 部分不能 | 注入：16 MB 一批慢 62–70%，TC 0 或 1 MB 一批没有影响，和 A 一样。自然 KV：TC 104 对 TC 0 差 ±0.6% |
 | C | 真实 PD 加 AgentX（并发 128） | 5 | 60–80 分钟 | **不能** | decode 每个 rank 只有 10–40 条在解码，EP 占比太小，自然 KV 和注入的影响都在约 14% 的噪声以内 |
 | D | 单测：只跑 mori EP 内核，加 IO | 3 | 20–50 分钟 | **能，但只在内核层面** | 大批量 READ 让 EP 内核慢 10–40 倍；KV 形状的 IO 只慢 5–20%，会低估端到端的影响 |
-| E | EP32（Moonshot 那个 case） | 5 或 6 | — | 进行中 | 结果出来后补 |
+| E | **EP32（Moonshot 那个 case），只有 decode，加注入**（每个 rank 128 条，全局 512，qlen 8） | 5 | 60–90 分钟 | **能** | 1 台 decode 线速读 +28%，4 台各收每股 5–10 GB/s 的突发 +25–27%，线速写进 1 台 +18%；TC 0 没有影响，拆成 1–2 MB 一批还剩 +1–7% |
+| E2 | EP32 真实 PD（AgentX；合成负载加注入） | 6 | — | 进行中 | 结果出来后补 |
 
 **推荐顺序：**
 1. **先跑 A。** 它能确认环境和复现都正常，之后试缓解配置也主要用它：信号大（+66%），每个窗口 3 分钟，一次作业能比较十来种配置。
 2. **有效的办法再到 B 上验证。** B 走的是真实 PD 的 KV 路径，能确认这个配置对 KV 传输本身没有副作用，比如 TTFT 和吞吐。
+   要确认在 Moonshot 的配置上也有效，再到 E 上跑一次（5 台，信号是 +18–28%，比 A 小）。
 3. **D 用来分析内核层面的原因。** 比如 READ 的在途量、主机内存这类端到端不好单独控制的因素。
 4. **C 不能用来复现。** 它只能说明在真实的 AgentX 负载下影响很小，不适合拿来调配置。
 
@@ -225,14 +227,72 @@ cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J
 
 结果在 `results/mb/<campaign>/summary.md`。注意单测会**低估**端到端的影响：KV 形状的写入，单测里 v1 只慢 5–11%，端到端慢 66%。所以调缓解配置时，最后要回到 case A 或 B 验证。
 
-## E. EP32（Moonshot 那个 case）
+## E. EP32（Moonshot 那个 case）：只有 decode，加注入
 
-- **阶段：**
-  - `e1m` / `e1m2`（5 台）：EP32 decode，DP4 × TP8，每个 rank 128 条，全局 512，qlen 8，加注入；窗口写在 `logs/windows_e1m_<J>.txt`；
-  - `pd32a`（6 台）：EP32 真实 PD 加 AgentX，自然流量。2 台 prefill，代理和客户端放在第一台 prefill 上；
-  - `pd32` / `pd32t0`（6 台）：EP32 真实 PD 加合成负载 512 条，先看自然流量再注入；`pd32t0` 是 TC 0 对照。
-- **现状：** 唯一一次 EP32 端到端（e1m_6867）启动时，DP0 的一个 TP worker 刚派生就以 255 退出，没有日志。现在 `e1.sh` 和 `pd.sh` 遇到这种情况会整组重启一次（`SERVE_TRIES`）。
-- 作业 7005 和 7006 在跑，结果出来后补到这里。
+**用途：** 在 Moonshot 的配置上复现 IO 拖慢 EP，并在 EP32 上验证缓解办法。
+
+- **节点：** 5 台。前 4 台是 decode（DP4 × TP8 = EP32，每台一个 DP rank），最后一台 C 跑负载和注入。
+  每个 rank 128 条，全局 batch 512，qlen 8。负载和注入的方式同 case A。
+- **三个一定要设的：**
+  - `RAIL_ALIGN=1`：见“坑”第 1 条。
+  - `PRE_RECV=1`：注入的写入接收进程在 decode 启动前就起好，整轮不关；窗口里只在 C 上起停发送端。见“坑”第 11 条。
+  - `OSL=64000`：输出 64k，整轮没有请求结束，batch 一直是 512。默认的 8k，开始 13 分钟后就有请求结束，新请求在 decode 上做 prefill，会把一部分步拉到约 720 ms，混进比较。
+- **阶段：** `e1m`；同一个作业里要再跑一轮就用 `e1m2`，它有自己的 env 和 windows 文件。
+  每个窗口约 3.6 分钟，加上启动和加压约 11 分钟。
+
+```bash
+J=$(sbatch --parsable --nodes=5 --time=04:00:00 tools/holder.sbatch)
+echo "setup e1m" > logs/phases_$J.txt
+printf 'export RAIL_ALIGN=1\nexport PRE_RECV=1\nexport OSL=64000\n' > logs/env_e1m_$J.txt
+echo "base IRk1 IWk1 IWk1p10 IWk10 IWk5 IWk1g IWk IWkS IWk1S IWk10c4 IWk10c2 IWk1T0 IWkT0" > logs/windows_e1m_$J.txt
+cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J.sh $J >> logs/nohup_launch_$J.out 2>&1 < /dev/null &
+```
+
+**EP32 多加的窗口**（其余见 case A 的窗口一览）：
+
+| 名字 | IO |
+|---|---|
+| `IWk1p20` `IWk1p10` `IWk1p5` `IWk1p2` | 只写第一台 decode，16 MB 一批，每股 20 / 10 / 5 / 2 GB/s |
+| `IWk1S` | 只写第一台，1 MB 一批，连续 |
+| `IWk1T0` | 同 `IWk1`，IO 在 TC 0 |
+| `IWk0` | 运行中新起接收进程，每台只来一批 16 MB，用来检查起进程会不会让 decode 挂死 |
+
+注意，4 台 decode 时 `IWk`、`IRk` 这类“满速”窗口里，C 的每张网卡同时带 4 股流，每股的瞬时速率只有线速的 1/4 左右，影响反而比每股 5–10 GB/s 的突发小。要打出线速，用只打一台的 `IWk1`、`IRk1`。
+
+**预期**（e1m2_7005，base 528 ms）：
+
+| 窗口 | 步时变化 | decode 收到的 CNP（每秒，每台） |
+|---|---|---|
+| base | — | 4–6 千（EP32 没有 IO 时就有） |
+| IRk1 | +28%（同一轮两次 27.8% / 27.9%） | 被读那台约 0.3 万，另外 3 台 16–21 万 |
+| IWk10 / IWk5 | +25% / +27% | 6–8 万 |
+| IWk1 | +18%（三次 17.7–18.4%） | 被写那台约 0.6 万，另外 3 台 14–18 万 |
+| IWk1g | +13% | 2.4–2.7 万 |
+| IWk / IRk | +10.5% / +12.5% | 4.4–5.0 万 |
+| IWk10c4 / IWk10c2 | +11.0% / +6.7%（EP16 上 2 MB 已经没有影响） | 5.0–5.5 万 / 3.2–3.9 万 |
+| IWkS / IWk1S | +3.3% / +1.3% | 约 2 万 |
+| IWkT0 / IWk1T0 / IRkT0 | +0.3% / +0.3% / +0.3% | 和 base 一样 |
+
+**看结果：**
+
+```bash
+python3 tools/ep32_win.py results/e2e/e1m_$J    # 每个窗口：IO 开着对前后关着的步时，以及每台 decode 每秒收到的 CNP
+```
+
+`summary.md` 里还有 profiler 采到的 EP 内核时间：base 时 dispatch / combine 约 1,550 / 1,100 µs，IWk1 时都 +37%，IRk1 时 +70% / +48%。
+
+**注意：**
+- 如果 decode 挂死，会看到 4 台 decode 的 `fab_*.tsv` 发送字节同时不再增长，`load/live.jsonl` 的 `gaps` 变成 0。
+  这时窗口会卡在 profiler 的 stop 请求上，最多 600 秒，下一个窗口检测到 stalled 才退出。可以直接结束这次运行，它退出时会清理节点：
+  `kill $(pgrep -f "e2e/.snap_${J}_e1m_e1.sh" | head -1)`（启动器跑的是 `e1.sh` 的快照）。
+- 每轮 profiler 的 trace 有约 2 GB，`e1_analyze.py` 已经改成并行解析，约 20 秒。
+
+## E2. EP32 真实 PD（作业 7006，进行中）
+
+- `pd32a`（6 台）：2 台 prefill、4 台 decode，AgentX 并发 256，只看自然流量。代理和客户端放在第一台 prefill 上。
+- `pd32` / `pd32t0`（6 台）：1 台 prefill、4 台 decode、1 台 C，512 条合成负载（输入、输出都是 2k）。`pd32` 先看 15 分钟自然流量再注入，`pd32t0` 是 KV 放进 TC 0 的对照。
+  pd32 的环境文件要设 `export PRE_RECV=1`。
+- 结果出来后补到这里。
 
 ## F. 读结果，以及可以调的旋钮
 
@@ -281,3 +341,6 @@ for i in 0 1 2 3 4 5 6 7; do cat /sys/class/infiniband/ionic_$i/ports/1/hw_count
 8. **srtctl 加 vllm-router 的 PD 在 decode 是 DP2 时卡在交接上。** router 是自动发现模式，只认到一个 decode。所以这里不用它，用自己写的代理。
 9. **profiler 导出 trace 时引擎会停几秒，** 统计窗口时要剔掉采集前后的点。`e1_analyze.py` 和 `pd_analyze.py` 都已经剔了。
 10. **AgentX 跑的时间长，又会占满 prefill。** 测注入时，用合成负载（case A、B）更干净。
+11. **EP32 挂死过一次，就在注入脚本往 decode 上起 io_inject 接收进程之后几秒。** 当时 C 还没开始发 IO，所有 rank 停在 EP 内核里，没有恢复。
+    之后用 `PRE_RECV=1` 把写入的接收进程提前到 decode 启动前，没再挂。运行中新起进程（`IWk0`、每次 `IRk1`）也没再复现，触发条件没确认。读类窗口（`IRk*`）的发起端还是在窗口里新起，建议排在后面。
+12. **EP32 用默认的 8k 输出，后段的比较会被 prefill 干扰。** 见 case E，用 `OSL=64000`。看 p90 时尤其要注意：后段有请求结束以后，没有 IO 的 p90 也会涨到约 720 ms。

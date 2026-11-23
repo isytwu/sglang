@@ -17,6 +17,7 @@ import datetime as dt
 import glob
 import gzip
 import json
+import multiprocessing
 import os
 import re
 import statistics
@@ -83,6 +84,21 @@ def load_gaps(path):
     return np.array(ts), np.array(gs)
 
 
+def load_live(path):
+    """loadgen's 10 s records of the in-flight streams' chunk gaps: (t, gap median ms, gap p90 ms)"""
+    out = []
+    if not os.path.exists(path):
+        return np.zeros((0, 3))
+    for line in open(path):
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("gap_med_ms") is not None:
+            out.append((r["t"], r["gap_med_ms"], r.get("gap_p90_ms") or float("nan")))
+    return np.array(out).reshape(-1, 3)
+
+
 def load_fab(path):
     rows = []
     hdr = None
@@ -142,6 +158,13 @@ def trace_kernels(path):
     return res
 
 
+def _trace_kernels_safe(path):
+    try:
+        return trace_kernels(path)
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run")
@@ -151,6 +174,7 @@ def main():
     ev = load_events(os.path.join(R, "events.tsv"))
     wins, cuts = windows(ev)
     ts, gs = load_gaps(os.path.join(R, "load", "requests.jsonl"))
+    live = load_live(os.path.join(R, "load", "live.jsonl"))
     fabs = {os.path.basename(p)[4:-4]: load_fab(p) for p in sorted(glob.glob(os.path.join(R, "fab_*.tsv")))}
     year = dt.datetime.fromtimestamp(ev[0][0], dt.timezone.utc).year if ev else 2026
     # E1: serve_<node>.log; E2 (srtctl): logs/<host>_decode_*.out
@@ -165,6 +189,18 @@ def main():
         x["step_med"] = float(np.median(g)) if len(g) else float("nan")
         x["step_p90"] = float(np.percentile(g, 90)) if len(g) else float("nan")
         x["step_p99"] = float(np.percentile(g, 99)) if len(g) else float("nan")
+        # requests longer than the run (EP32: ~1400 s for OSL 8000) never complete inside a window; fall back to the
+        # in-flight gaps loadgen logs every 10 s (median of the 10 s medians / p90s; n = number of 10 s records)
+        if len(g) < 200 and len(live):
+            s = (live[:, 0] >= x["t0"] + 10) & (live[:, 0] <= x["t1"])
+            for a, b in cuts:
+                s &= ~((live[:, 0] >= a) & (live[:, 0] <= b + 10))
+            if s.any():
+                x["n_gaps"] = int(s.sum())
+                x["step_med"] = float(np.median(live[s, 1]))
+                x["step_p90"] = float(np.median(live[s, 2]))
+                x["step_p99"] = float(np.max(live[s, 2]))
+                x["step_src"] = "live"
         x["nic"] = {n: fab_rate(f, x["t0"], x["t1"]) for n, f in fabs.items()}
         L = [l for l in logs if x["t0"] <= l[0] <= x["t1"] and not any(a <= l[0] <= b for a, b in cuts)]
         by_t = {}
@@ -189,14 +225,17 @@ def main():
                     + glob.glob(os.path.join(R, "logs", "prof", "**", "*.json*"), recursive=True), key=os.path.getmtime)
     cap_res = {}
     if not args.no_traces:
-        for name, a, b in caps:
-            files = [p for p in traces if a <= os.path.getmtime(p) <= b + 5]
+        # an EP32 run leaves ~32 traces per capture (2 GB in all): parse them in parallel
+        todo = {name: [p for p in traces if a <= os.path.getmtime(p) <= b + 5] for name, a, b in caps}
+        flat = sorted({p for v in todo.values() for p in v})
+        with multiprocessing.Pool(min(24, max(1, len(flat)))) as pool:
+            parsed = dict(zip(flat, pool.map(_trace_kernels_safe, flat)))
+        for name, files in todo.items():
             per = []
             for p in files:
-                try:
-                    k = trace_kernels(p)
-                except Exception as e:  # noqa: BLE001
-                    print(f"skip {p}: {e}")
+                k = parsed[p]
+                if isinstance(k, str):
+                    print(f"skip {p}: {k}")
                     continue
                 if k["dispatch"]:
                     per.append({"file": os.path.basename(p), **{f"{kk}_med": float(np.median(v)) for kk, v in k.items() if v},

@@ -37,14 +37,21 @@ cleanup() {
     iob_stop "${DN[@]}" "$C"
     for p in "${PIDS[@]}"; do kill "$p" 2> /dev/null; done
     sleep 10
+    for p in "${INJ_PRE_PIDS[@]}"; do kill "$p" 2> /dev/null; done
     for n in "${ALL[@]}"; do
-        hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[V]LLM::|[p]d_proxy.py|[a]gentx profile|[a]iperf'; true"
+        hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[V]LLM::|[p]d_proxy.py|[a]gentx profile|[a]iperf|[i]o_inject.py'; true"
     done
     fab_stop "$OUT" "${ALL[@]}"
 }
 trap cleanup EXIT
 wait_idle 180 "${ALL[@]}" || exit 1
 fab_start "$OUT" "${ALL[@]}"
+# PRE_RECV=1: the IO windows' write receivers come up on the targets before the decode does (mb/lib.sh inj_prerecv)
+if [ -n "${PRE_RECV:-}" ]; then
+    inj_prerecv "$OUT/prerecv" "$IOTC" ${TARGETS:-$DECODE}
+    sleep 40
+    ev prerecv "${TARGETS:-$DECODE}"
+fi
 
 # kvcfg <role> <node> <http port> <port base>: the MoRIIO config of one server. The connector needs its HTTP port,
 # a handshake port and a notify port (it adds the DP / TP rank offsets) and the address it advertises (the control
@@ -84,7 +91,8 @@ for try in $(seq 1 "${SERVE_TRIES:-2}"); do
     sleep 10
     for n in "${DN[@]}" "${PN[@]}"; do hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[V]LLM::'; true"; done
     for f in "$OUT"/serve_*.log "$OUT"/prefill_*.log; do case $f in *.try*) ;; *) mv "$f" "${f%.log}.try$try.log" ;; esac; done
-    wait_idle 300 "${DN[@]}" "${PN[@]}" || exit 1
+    # the pre-started receivers hold the decode GPUs too, so wait_idle (no KFD process) would never pass there
+    if [ -n "${PRE_RECV:-}" ]; then sleep 60; wait_idle 300 "${PN[@]}" || exit 1; else wait_idle 300 "${DN[@]}" "${PN[@]}" || exit 1; fi
 done
 ev serve_ready "$(( $(date +%s) - t0 ))s"
 

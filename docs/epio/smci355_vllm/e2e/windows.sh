@@ -66,6 +66,12 @@ window() {
     alive || { ev stalled "no streamed chunks in the last minute before $name"; exit 3; }
     ev "$name" start
     case "$name" in
+        IWk1T0) tc=0 tg=("${tg[0]}") ;;
+        IWk1S) mb=1 tg=("${tg[0]}") ;;
+        IWk1p20) per=0.8 tg=("${tg[0]}") ;;
+        IWk1p10) per=1.6 tg=("${tg[0]}") ;;
+        IWk1p5) per=3.2 tg=("${tg[0]}") ;;
+        IWk1p2) per=8 tg=("${tg[0]}") ;;
         IWk10|IRk10) per=1.6 ;;
         IRk5|IWk5) per=3.2 ;;
         IWk2) per=8 ;;
@@ -86,7 +92,7 @@ window() {
         IWk1|IRk1|IRb1|IWb1) tg=("${tg[0]}") ;;
     esac
     case "$name" in
-        IWk|IWk10|IWkT0|IWk1|IWk5|IWk2|IWk1g|IWk1gS|IWk1gB|IWk10S|IWk5S|IWkS|IWk10c2|IWk10c4|IWk10c8|IWkSi4|IWkSi16|IWkR16|IWkR64)
+        IWk|IWk10|IWkT0|IWk1|IWk1T0|IWk1S|IWk1p20|IWk1p10|IWk1p5|IWk1p2|IWk5|IWk2|IWk1g|IWk1gS|IWk1gB|IWk10S|IWk5S|IWkS|IWk10c2|IWk10c4|IWk10c8|IWkSi4|IWkSi16|IWkR16|IWkR64)
             for t in "${tg[@]}"; do
                 inj_start "$OUT/inj_${name}_$cyc/$t" "$tc" write "$C" "$t" --chunk-mb $mb --period-ms $per --inflight $inf --duration $((WIN + 120))
             done ;;
@@ -95,8 +101,9 @@ window() {
                 INJ_PMEM="--mem host --numa remote" inj_start "$OUT/inj_${name}_$cyc/$t" "$tc" write "$C" "$t" --chunk-mb 16 --period-ms 0 --duration $((WIN + 120))
             done ;;
         IWk0)
+            # fresh receivers even when PRE_RECV pre-started others: GPU memory allocated and registered mid-run
             for t in "${tg[@]}"; do
-                inj_start "$OUT/inj_${name}_$cyc/$t" "$tc" write "$C" "$t" --chunk-mb 16 --period-ms 3600000 --duration $((WIN + 120))
+                INJ_NOPRE=1 inj_start "$OUT/inj_${name}_$cyc/$t" "$tc" write "$C" "$t" --chunk-mb 16 --period-ms 3600000 --duration $((WIN + 120))
             done ;;
         IWkN1)
             for t in "${tg[@]}"; do
