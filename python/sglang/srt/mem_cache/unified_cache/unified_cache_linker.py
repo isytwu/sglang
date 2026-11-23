@@ -356,6 +356,9 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # Radix-key end of a finished request's prompt during its insert; the
+        # states past it end the request's output. 0 outside such an insert.
+        self.offload_prompt_end = 0
         # Node -> the device Mamba slot whose state is in the store.
         self._offload_states = ComponentType.MAMBA in cache.components
         self._state_offloaded: dict[NodeId, int] = {}
@@ -878,16 +881,25 @@ class UnifiedCacheLinkerWrapper:
             for info in path[:-1]
             if info.path_end >= page
         ]
-        self.cache_linker.note_state_path(key, bounds, replaceable)
+        if getattr(self.cache_linker, "tracks_output_states", False):
+            # A state past a finished request's prompt ends its output, which a
+            # later prompt may or may not continue from.
+            output = 0 < self.offload_prompt_end < path[-1].path_end
+            self.cache_linker.note_state_path(key, bounds, replaceable, output=output)
+        else:
+            self.cache_linker.note_state_path(key, bounds, replaceable)
 
     @contextmanager
-    def skip_offload_prefix(self, length: int):
-        """Skip offloading the first ``length`` radix-key units during an insert."""
+    def skip_offload_prefix(self, length: int, prompt_end: int = 0):
+        """Skip offloading the first ``length`` radix-key units during an insert;
+        ``prompt_end`` is a finished request's prompt end (0: not finished)."""
         self.offload_skip_prefix_len = length
+        self.offload_prompt_end = prompt_end
         try:
             yield
         finally:
             self.offload_skip_prefix_len = 0
+            self.offload_prompt_end = 0
 
     def _drop_offload_skip_prefix(
         self, node_id: NodeId, transfers: list[PoolTransfer]
