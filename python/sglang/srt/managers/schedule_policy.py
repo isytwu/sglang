@@ -358,7 +358,7 @@ class SchedulePolicy:
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                match_kv_cache(r, self.tree_cache)
+                match_kv_cache(r, self.tree_cache, probe=True)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -599,7 +599,7 @@ class SchedulePolicy:
         candidates = []
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
-            match_kv_cache(r, self.tree_cache, prefix_ids)
+            match_kv_cache(r, self.tree_cache, prefix_ids, probe=True)
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
                 key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
@@ -962,7 +962,7 @@ class SchedulePolicy:
             # (new or retracted: last_node is None); its count may go stale.
             for r in waiting_queue:
                 if r.last_node is None:
-                    match_kv_cache(r, self.tree_cache)
+                    match_kv_cache(r, self.tree_cache, probe=True)
             waiting_queue.sort(key=phi)
         window = waiting_queue[:UNIBOOST_MATCH_WINDOW_SIZE]
         deprioritized = self._compute_prefix_matches(window, CacheAwarePolicy.UNIBOOST)
