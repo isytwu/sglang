@@ -12,7 +12,7 @@
 | C | 真实 PD 加 AgentX（并发 128） | 5 | 60–80 分钟 | **不能** | decode 每个 rank 只有 10–40 条在解码，EP 占比太小，自然 KV 和注入的影响都在约 14% 的噪声以内 |
 | D | 单测：只跑 mori EP 内核，加 IO | 3 | 20–50 分钟 | **能，但只在内核层面** | 大批量 READ 让 EP 内核慢 10–40 倍；KV 形状的 IO 只慢 5–20%，会低估端到端的影响 |
 | E | **EP32（Moonshot 那个 case），只有 decode，加注入**（每个 rank 128 条，全局 512，qlen 8） | 5 | 60–90 分钟 | **能** | 1 台 decode 线速读 +28%，4 台各收每股 5–10 GB/s 的突发 +25–27%，线速写进 1 台 +18%；TC 0 没有影响，拆成 1–2 MB 一批还剩 +1–7% |
-| E2 | EP32 真实 PD（AgentX；合成负载加注入） | 6 | — | 进行中 | 结果出来后补 |
+| E2 | EP32 真实 PD（MoRIIO READ）加合成负载 512 条，再加注入；AgentX | 6 | 每段 30–55 分钟 | **注入部分能**；自然 KV 不能；AgentX 那次挂死了 | 注入：1 台线速读 +25%，每股 10 GB/s +22%，TC 0 +0.3%。自然 KV：TC 104 对 TC 0 差 0.06% |
 
 **推荐顺序：**
 1. **先跑 A。** 它能确认环境和复现都正常，之后试缓解配置也主要用它：信号大（+66%），每个窗口 3 分钟，一次作业能比较十来种配置。
@@ -287,12 +287,34 @@ python3 tools/ep32_win.py results/e2e/e1m_$J    # 每个窗口：IO 开着对前
   `kill $(pgrep -f "e2e/.snap_${J}_e1m_e1.sh" | head -1)`（启动器跑的是 `e1.sh` 的快照）。
 - 每轮 profiler 的 trace 有约 2 GB，`e1_analyze.py` 已经改成并行解析，约 20 秒。
 
-## E2. EP32 真实 PD（作业 7006，进行中）
+## E2. EP32 真实 PD
 
-- `pd32a`（6 台）：2 台 prefill、4 台 decode，AgentX 并发 256，只看自然流量。代理和客户端放在第一台 prefill 上。
-- `pd32` / `pd32t0`（6 台）：1 台 prefill、4 台 decode、1 台 C，512 条合成负载（输入、输出都是 2k）。`pd32` 先看 15 分钟自然流量再注入，`pd32t0` 是 KV 放进 TC 0 的对照。
-  pd32 的环境文件要设 `export PRE_RECV=1`。
-- 结果出来后补到这里。
+**用途：** 在 Moonshot 的配置上走真实的 PD KV 路径，看自然 KV 和注入 IO 的影响。
+
+- **节点：** 6 台（整个集群）。
+- **阶段：**
+  - `pd32` / `pd32t0`：1 台 prefill、4 台 decode、1 台 C，512 条合成负载，decode 每个 rank 一直 128 条。`pd32` 先看 15 分钟自然流量再注入，`pd32t0` 是 KV 放进 TC 0 的对照，只看自然流量。
+  - `pd32a`：2 台 prefill、4 台 decode，AgentX 并发 256，只看自然流量。代理和客户端放在第一台 prefill 上。
+
+```bash
+J=$(sbatch --parsable --nodes=6 --time=04:00:00 tools/holder.sbatch)
+echo "setup pd32 pd32t0" > logs/phases_$J.txt
+printf 'export PRE_RECV=1\nexport ISL=2048\nexport OSL=512\n' > logs/env_pd32_$J.txt     # 输出 512：新请求多，自然 KV 多
+printf 'export ISL=2048\nexport OSL=512\n' > logs/env_pd32t0_$J.txt
+echo "IWkR64 IWk1g IWk10 IWk1 IWk1T0 IWkS IRk1" > logs/windows_pd32_$J.txt
+cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J.sh $J >> logs/nohup_launch_$J.out 2>&1 < /dev/null &
+```
+
+**预期**（pd32_7006、pd32t0_7006）：
+- 自然 KV：KV 平均 3.6 GB/s、p99 9 GB/s，TC 104 和 TC 0 的步时是 545.3 对 545.0 ms，看不出影响。
+- 注入：IRk1 +25%，IWk10 +22%，IWk1 +17%，IWk1g +10%，IWkS +2%，IWk1T0 +0.3%，比只有 decode（case E）低 1.5–3 个百分点。
+- `pd32a`（AgentX）在 7006 上预热 3 分钟后 decode 挂死，没有数据，见“坑”第 11 条。
+
+**看结果：**
+
+```bash
+python3 e2e/pd_analyze.py results/e2e/pd32_$J results/e2e/pd32t0_$J
+```
 
 ## F. 读结果，以及可以调的旋钮
 
@@ -343,4 +365,6 @@ for i in 0 1 2 3 4 5 6 7; do cat /sys/class/infiniband/ionic_$i/ports/1/hw_count
 10. **AgentX 跑的时间长，又会占满 prefill。** 测注入时，用合成负载（case A、B）更干净。
 11. **EP32 挂死过一次，就在注入脚本往 decode 上起 io_inject 接收进程之后几秒。** 当时 C 还没开始发 IO，所有 rank 停在 EP 内核里，没有恢复。
     之后用 `PRE_RECV=1` 把写入的接收进程提前到 decode 启动前，没再挂。运行中新起进程（`IWk0`、每次 `IRk1`）也没再复现，触发条件没确认。读类窗口（`IRk*`）的发起端还是在窗口里新起，建议排在后面。
+    EP32 真实 PD 加 AgentX（`pd32a`）也挂过一次：预热 3 分钟后所有 rank 停住，10 分钟后 RCCL watchdog 杀掉进程。那台 decode 有进程到作业结束都没杀掉，节点被 Slurm 置成 drain（`Kill task failed`），要管理员 resume。
+    挂死时 `load/live.jsonl` 里 `open` 不变、`gaps` 一直是 0，可以早点结束运行，不用等 watchdog。
 12. **EP32 用默认的 8k 输出，后段的比较会被 prefill 干扰。** 见 case E，用 `OSL=64000`。看 p90 时尤其要注意：后段有请求结束以后，没有 IO 的 p90 也会涨到约 720 ms。
