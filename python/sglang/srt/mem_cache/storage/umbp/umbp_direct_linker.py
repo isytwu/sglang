@@ -21,6 +21,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.unified_cache.mamba_storage_retention import (
+    MambaStateRemover,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     TransferReady,
@@ -92,7 +95,8 @@ class _PoolRangePlan:
 
 
 # One queued offload: the pools it resolved to, and the events gating the read.
-_OffloadTask = tuple[list[PoolTransfer], TransferReady]
+# The superseded Mamba state keys an offload removes once it persists, if any.
+_OffloadTask = tuple[list[PoolTransfer], TransferReady, list[str] | None]
 
 
 def _offload_task_pages(expanded: list[PoolTransfer]) -> int:
@@ -132,6 +136,8 @@ def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
 
 
 class UMBPDirectLinker(UnifiedCacheLinker):
+    removes_superseded_states = True
+
     def __init__(
         self,
         server_args,
@@ -346,6 +352,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
+        self.mamba_remover: MambaStateRemover | None = None
         self._stats = {
             "lookup": 0,
             "load": 0,
@@ -839,14 +846,22 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ]
 
     def offload(
-        self, transfers: list[PoolTransfer], session_id: str | None = None
+        self,
+        transfers: list[PoolTransfer],
+        session_id: str | None = None,
+        superseded_mamba_keys: list[str] | None = None,
     ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
+        # Only a stored newer state supersedes the old ones.
+        if superseded_mamba_keys and not any(
+            t.name == PoolName.MAMBA for t in expanded
+        ):
+            superseded_mamba_keys = None
         self._freeze_gc_once()
         ready = self.record_transfer_ready()
-        self._offload_queue.put((expanded, ready))
+        self._offload_queue.put((expanded, ready, superseded_mamba_keys))
         return True
 
     def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
@@ -898,9 +913,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # pool stops the rest, leaving every task in it incomplete.
             for _ in tasks:
                 self._offload_results.put(success)
+        if success:
+            for _, _, superseded_mamba_keys in tasks:
+                if superseded_mamba_keys:
+                    if self.mamba_remover is None:
+                        self.mamba_remover = MambaStateRemover(self._stats)
+                    self.mamba_remover.submit(self.storage, superseded_mamba_keys)
 
     def _run_offload(self, tasks: list[_OffloadTask]) -> bool:
-        for _, ready in tasks:
+        for _, ready, _ in tasks:
             ready.synchronize()
         next_slot = 0
 
@@ -911,7 +932,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return self._materialize_offload_indices(indices, slot)
 
         plans = self._build_load_plans(
-            [expanded for expanded, _ in tasks],
+            [expanded for expanded, _, _ in tasks],
             materialize_indices=materialize_indices,
         )
         # Over plans, not transfers: a plan already carries every task's keys
@@ -1001,6 +1022,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if thread.is_alive():
                 queue.put(None)
                 thread.join()
+        if self.mamba_remover is not None:
+            self.mamba_remover.close()
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until

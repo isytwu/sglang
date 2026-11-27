@@ -493,6 +493,9 @@ class UMBPStore(HiCacheStorage):
         standalone_address = standalone_extra_address or standalone_env_address
         # Verify the client did not silently fall back to local mode.
         self._standalone_process_expected = bool(standalone_address)
+        # Object placement lives in the master's index, which a client cannot
+        # remove from.
+        self._master_led = bool(master_address)
         if master_address and standalone_address:
             raise ValueError(
                 "master_address and standalone_address are mutually exclusive "
@@ -1462,6 +1465,21 @@ class UMBPStore(HiCacheStorage):
             final_pages = min(final_pages, boundary)
 
         return PoolTransferResult(final_pages, hit_count)
+
+    def batch_remove_pool_keys(
+        self, pool_name: PoolName, page_keys: List[str]
+    ) -> Optional[List[int]]:
+        # mori's batch_remove frees only what a master-less pool owns. It keeps
+        # an object under a read lease (a lookup takes one), pinned or moving
+        # between tiers, and counts what it freed without saying why it kept
+        # the rest, so each object is removed on its own and a kept one
+        # reports Mooncake's "leased" (-706), which the caller retries once.
+        remove = getattr(self.client, "batch_remove", None)
+        if remove is None or self._master_led:
+            return None
+        transfer = PoolTransfer(name=pool_name, keys=list(page_keys))
+        object_keys, _ = self._get_hybrid_page_component_keys(list(page_keys), transfer)
+        return [0 if remove([key]) else -706 for key in object_keys]
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool) -> dict:
         """Unified per-pool zero-copy I/O. Returns {pool_name: per-page bools}."""

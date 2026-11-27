@@ -140,6 +140,51 @@ class TestEveryRankWrites(CustomTestCase):
         self.assertEqual(linker._offload_queue.qsize(), 0)
 
 
+class TestSupersededMambaStates(CustomTestCase):
+    """An offload carrying a newer Mamba state removes the states it supersedes,
+    and only once it persists."""
+
+    def _linker(self, run_offload=True):
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker._offload_results = Queue()
+        linker._offload_queue = Queue()
+        linker._gc_frozen = True
+        linker._run_offload = lambda _tasks: run_offload
+        linker.mamba_remover = mock.MagicMock()
+        linker.storage = object()
+        return linker
+
+    def _offload(self, linker, names, superseded):
+        transfers = [SimpleNamespace(name=name) for name in names]
+        linker.pool_group = SimpleNamespace(
+            resolve_transfers=lambda _transfers, allow_partial: transfers
+        )
+        fake_device = SimpleNamespace(
+            Event=lambda: SimpleNamespace(record=lambda: None)
+        )
+        with mock.patch.object(unified_cache_linker, "device_module", fake_device):
+            self.assertTrue(linker.offload(["t"], superseded_mamba_keys=superseded))
+        return linker._offload_queue.get_nowait()
+
+    def test_only_a_stored_state_supersedes(self):
+        linker = self._linker()
+        task = self._offload(linker, [PoolName.KV, PoolName.MAMBA], ["old"])
+        self.assertEqual(task[2], ["old"])
+        task = self._offload(linker, [PoolName.KV], ["old"])
+        self.assertIsNone(task[2])
+
+    def test_removes_after_the_batch_persists(self):
+        linker = self._linker()
+        linker._offload_batch([([], None, ["old"]), ([], None, None)])
+        linker.mamba_remover.submit.assert_called_once_with(linker.storage, ["old"])
+        self.assertEqual(linker._offload_results.qsize(), 2)
+
+    def test_failed_batch_removes_nothing(self):
+        linker = self._linker(run_offload=False)
+        linker._offload_batch([([], None, ["old"])])
+        linker.mamba_remover.submit.assert_not_called()
+
+
 class TestLoadReadyEvents(CustomTestCase):
     def test_load_thread_waits_on_every_event(self):
         linker = UMBPDirectLinker.__new__(UMBPDirectLinker)

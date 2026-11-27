@@ -534,6 +534,37 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
 
         self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [False, False])
 
+    def test_batch_remove_pool_keys_reports_each_object(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        store = self._make_v2_store()
+        store._master_led = False
+        freed = {f"page0__{PoolName.DEEPSEEK_V4_C4}"}
+        store.client.batch_remove.side_effect = lambda keys: int(keys[0] in freed)
+
+        codes = store.batch_remove_pool_keys(
+            PoolName.DEEPSEEK_V4_C4, ["page0", "page1"]
+        )
+
+        # A kept object (leased, pinned or moving) reports "leased" for a retry.
+        self.assertEqual(codes, [0, -706])
+        self.assertEqual(
+            [call.args[0] for call in store.client.batch_remove.call_args_list],
+            [[f"page{i}__{PoolName.DEEPSEEK_V4_C4}"] for i in range(2)],
+        )
+
+    def test_batch_remove_pool_keys_unsupported(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        store = self._make_v2_store()
+        store._master_led = True
+        self.assertIsNone(store.batch_remove_pool_keys(PoolName.DEEPSEEK_V4_C4, ["p"]))
+        store.client.batch_remove.assert_not_called()
+
+        store._master_led = False
+        del store.client.batch_remove
+        self.assertIsNone(store.batch_remove_pool_keys(PoolName.DEEPSEEK_V4_C4, ["p"]))
+
 
 if __name__ == "__main__":
     unittest.main()
